@@ -5,7 +5,8 @@ members = [
     "crates/decompiler",
     "crates/cli",
     "crates/gui",
-    "crates/indexing"
+    "crates/indexing",
+    "crates/hl-analyze"
 ]
 resolver = "2"
 
