@@ -253,8 +253,11 @@ fn write_variant(enum_name: &Ident, v: &Variant, i: u8) -> TokenStream {
             "RefBytes" => quote! {
                 write_var(w, #fname.0 as i32)?;
             },
-            "ValBool" => quote! {
-                write_var(w, if #fname.0 { 1 } else { 0 })?;
+            "InlineBool" | "bool" => quote! {
+                write_var(w, if *#fname { 1 } else { 0 })?;
+            },
+            "InlineInt" => quote! {
+                write_var(w, *#fname)?;
             },
             "RefEnumConstruct" => quote! {
                 write_var(w, #fname.0 as i32)?;

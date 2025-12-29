@@ -57,6 +57,8 @@ pub enum Command {
     RefTo(ElementRef),
     DecompType(usize),
     Decomp(usize),
+    /// Dump type information with optional prefix filter
+    DumpTypes(Option<Str>),
 }
 
 // Used a default max values for index ranges
@@ -147,7 +149,7 @@ pub fn command_parser(ctx: &ParseContext) -> impl Parser<char, Command, Error = 
                 .map(|v| InFile(FileOrIndex::File(v.into_iter().collect()))),
         ))),
         cmd!("fileof"; num() => FileOf),
-        cmd!("saveto"; string => SaveTo),
+        cmd!("saveto"; string.clone() => SaveTo),
         cmd!("callgraph")
             .ignore_then(num())
             .then(num().padded())
@@ -161,6 +163,9 @@ pub fn command_parser(ctx: &ParseContext) -> impl Parser<char, Command, Error = 
             .map(RefTo),
         cmd!("decomp"; num() => Decomp),
         cmd!("decompt"; num() => DecompType),
+        cmd!("dump-types")
+            .ignore_then(string.clone().or_not())
+            .map(|s| Command::DumpTypes(s.filter(|s| !s.is_empty()))),
     ))
 }
 

@@ -1669,6 +1669,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hl-substitute"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hlbc",
+]
+
+[[package]]
 name = "hlbc"
 version = "0.8.0"
 dependencies = [

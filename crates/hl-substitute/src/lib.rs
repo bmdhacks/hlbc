@@ -1,0 +1,469 @@
+pub mod matching;
+pub mod merge;
+pub mod remap;
+
+use hlbc::opcodes::Opcode;
+use hlbc::types::{Function, RefType};
+use hlbc::Bytecode;
+
+use matching::{matches_pattern, FunctionIndex};
+use merge::PoolMerger;
+
+/// Get the source file path for a function (from its first opcode's debug info)
+pub fn get_function_source_file<'a>(code: &'a Bytecode, func: &Function) -> Option<&'a str> {
+    let debug_info = func.debug_info.as_ref()?;
+    let debug_files = code.debug_files.as_ref()?;
+    let (file_idx, _line) = debug_info.first()?;
+    debug_files.get(*file_idx).map(|s| s.as_ref())
+}
+
+/// Check if a source file path matches any of the given prefixes
+pub fn matches_source_prefix(source_file: Option<&str>, prefixes: &[&str]) -> bool {
+    match source_file {
+        Some(path) => prefixes.iter().any(|prefix| path.starts_with(prefix)),
+        None => false, // No debug info means we can't verify, so exclude
+    }
+}
+
+/// Check if ANY opcode in the function has a source file matching the given prefixes
+/// This handles cases where the first opcode is from inline code (like Debug.hx)
+pub fn function_has_source_prefix(code: &Bytecode, func: &Function, prefixes: &[&str]) -> bool {
+    let Some(debug_info) = func.debug_info.as_ref() else {
+        return false;
+    };
+    let Some(debug_files) = code.debug_files.as_ref() else {
+        return false;
+    };
+
+    for (file_idx, _line) in debug_info {
+        if let Some(path) = debug_files.get(*file_idx) {
+            if prefixes.iter().any(|prefix| path.starts_with(prefix)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Result of the substitution operation
+#[derive(Debug, Default)]
+pub struct SubstitutionResult {
+    /// Functions successfully replaced
+    pub replaced: Vec<String>,
+    /// Functions from source not found in target
+    pub not_found: Vec<String>,
+    /// Errors encountered during replacement
+    pub errors: Vec<String>,
+    /// Warnings (non-fatal issues)
+    pub warnings: Vec<String>,
+    /// Functions injected as dependencies
+    pub injected_functions: Vec<String>,
+    /// Native functions that couldn't be resolved (can't inject natives)
+    pub unresolvable_natives: Vec<String>,
+    /// Functions skipped due to type layout mismatches (func_name, reason)
+    pub skipped_type_mismatch: Vec<(String, String)>,
+    /// Type layout mismatches detected
+    pub type_mismatches: Vec<TypeMismatchInfo>,
+}
+
+/// Information about a type layout mismatch
+#[derive(Debug, Clone)]
+pub struct TypeMismatchInfo {
+    pub type_name: String,
+    pub target_fields: usize,
+    pub source_fields: usize,
+    pub missing_fields: Vec<String>,
+}
+
+/// Substitute functions from source bytecode into target bytecode
+///
+/// # Arguments
+/// * `target` - The bytecode to modify
+/// * `source` - The bytecode containing replacement functions
+/// * `function_names` - Optional list of specific function names to replace.
+///                      If None, all matching functions are replaced.
+/// * `source_prefixes` - Optional list of source file prefixes to filter by.
+///                       Only functions from matching source files are replaced.
+/// * `inject_deps` - If true, inject missing function dependencies from source.
+///                   If false, log warnings for missing functions (legacy behavior).
+///
+/// # Returns
+/// A result containing lists of replaced, not found, and error functions
+pub fn substitute_functions(
+    target: &mut Bytecode,
+    source: &Bytecode,
+    function_names: Option<&[String]>,
+    source_prefixes: Option<&[&str]>,
+    inject_deps: bool,
+) -> SubstitutionResult {
+    let mut result = SubstitutionResult::default();
+
+    // Build indexes
+    let target_index = FunctionIndex::build(target);
+    let source_index = FunctionIndex::build(source);
+
+    // Determine which functions to replace
+    let to_replace: Vec<(String, usize)> = if let Some(names) = function_names {
+        names
+            .iter()
+            .filter_map(|name| source_index.find(name).map(|idx| (name.clone(), idx)))
+            .collect()
+    } else {
+        source_index
+            .iter()
+            .filter(|(_name, idx)| {
+                // If source prefixes specified, filter by source file
+                // Use function_has_source_prefix to check ANY opcode, not just first
+                // (handles cases where first opcode is from inline code like Debug.hx)
+                if let Some(prefixes) = source_prefixes {
+                    let func = &source.functions[*idx];
+                    function_has_source_prefix(source, func, prefixes)
+                } else {
+                    true
+                }
+            })
+            .map(|(name, idx)| (name.to_string(), idx))
+            .collect()
+    };
+
+    // Resolve target function indices and filter out not-found functions
+    let to_replace: Vec<(String, usize, usize)> = to_replace
+        .into_iter()
+        .filter_map(|(name, src_func_idx)| {
+            match target_index.find(&name) {
+                Some(target_func_idx) => Some((name, src_func_idx, target_func_idx)),
+                None => {
+                    result.not_found.push(name);
+                    None
+                }
+            }
+        })
+        .collect();
+
+    // Create a single pool merger for all substitutions to share type/global mappings
+    let mut merger = PoolMerger::new(target, source, inject_deps);
+
+    // First pass: scan all functions to build complete remap
+    for (_name, src_func_idx, _target_func_idx) in &to_replace {
+        let src_func = &source.functions[*src_func_idx];
+        scan_and_ensure_refs(&mut merger, src_func);
+    }
+
+    // Get the remap and collect results
+    let remap = merger.remap.clone();
+    let warnings = std::mem::take(&mut merger.warnings);
+    let injected_functions = std::mem::take(&mut merger.injected_functions);
+    let unresolvable_natives = std::mem::take(&mut merger.unresolvable_natives);
+    result.warnings.extend(warnings);
+    result.injected_functions.extend(injected_functions);
+    result.unresolvable_natives.extend(unresolvable_natives);
+
+    // Collect type mismatches
+    let type_mismatches = std::mem::take(&mut merger.type_mismatches);
+    for (_src_type_idx, mismatch) in &type_mismatches {
+        result.type_mismatches.push(TypeMismatchInfo {
+            type_name: mismatch.type_name.clone(),
+            target_fields: mismatch.target_field_count,
+            source_fields: mismatch.source_field_count,
+            missing_fields: mismatch.missing_in_target.clone(),
+        });
+    }
+
+    // Drop the merger to release the mutable borrow on target
+    drop(merger);
+
+    // Second pass: apply remaps to each function
+    for (name, src_func_idx, target_func_idx) in to_replace {
+        let src_func = &source.functions[src_func_idx];
+
+        // Remap the function opcodes (with field index remapping based on register types)
+        let remapped_ops: Vec<Opcode> = src_func
+            .ops
+            .iter()
+            .map(|op| remap.remap_opcode_with_regs(op, &src_func.regs))
+            .collect();
+
+        let remapped_regs: Vec<RefType> = src_func
+            .regs
+            .iter()
+            .map(|&r| remap.remap_type(r))
+            .collect();
+
+        let remapped_assigns = src_func.assigns.as_ref().map(|assigns| {
+            assigns
+                .iter()
+                .map(|(s, p)| (remap.remap_string(*s), *p))
+                .collect()
+        });
+
+        // Get mutable reference to target function and update it
+        let target_func = &mut target.functions[target_func_idx];
+
+        // Keep original findex, name, parent - just replace the body
+        target_func.t = remap.remap_type(src_func.t);
+        target_func.regs = remapped_regs;
+        // Create dummy debug_info - source file indices aren't valid in target
+        // Each opcode needs an entry (file_idx, line_num), use (0, 0) as placeholder
+        // TODO: remap debug file indices properly
+        target_func.debug_info = Some(vec![(0, 0); remapped_ops.len()]);
+        target_func.ops = remapped_ops;
+        target_func.assigns = remapped_assigns;
+
+        result.replaced.push(name);
+    }
+
+    result
+}
+
+/// Scan a function for all pool references and ensure they exist in target
+fn scan_and_ensure_refs(merger: &mut PoolMerger, func: &Function) {
+    // Ensure function type exists
+    merger.ensure_type(func.t);
+
+    // Ensure all register types exist
+    for &reg_type in &func.regs {
+        merger.ensure_type(reg_type);
+    }
+
+    // Ensure all opcode references exist
+    for op in &func.ops {
+        scan_opcode_refs(merger, op);
+    }
+
+    // Ensure assign string references exist
+    if let Some(assigns) = &func.assigns {
+        for (s, _) in assigns {
+            merger.ensure_string(*s);
+        }
+    }
+}
+
+/// Scan an opcode for pool references and ensure they exist in target
+fn scan_opcode_refs(merger: &mut PoolMerger, op: &Opcode) {
+    match op {
+        // Constant pool references
+        Opcode::Int { ptr, .. } => {
+            merger.ensure_int(*ptr);
+        }
+        Opcode::Float { ptr, .. } => {
+            merger.ensure_float(*ptr);
+        }
+        Opcode::Bytes { ptr, .. } => {
+            merger.ensure_bytes(*ptr);
+        }
+        Opcode::String { ptr, .. } => {
+            merger.ensure_string(*ptr);
+        }
+
+        // Function references
+        Opcode::Call0 { fun, .. }
+        | Opcode::Call1 { fun, .. }
+        | Opcode::Call2 { fun, .. }
+        | Opcode::Call3 { fun, .. }
+        | Opcode::Call4 { fun, .. }
+        | Opcode::CallN { fun, .. }
+        | Opcode::StaticClosure { fun, .. }
+        | Opcode::InstanceClosure { fun, .. } => {
+            merger.ensure_fun(*fun);
+        }
+
+        // Global references
+        Opcode::GetGlobal { global, .. } | Opcode::SetGlobal { global, .. } => {
+            merger.ensure_global(*global);
+        }
+
+        // Type references
+        Opcode::Type { ty, .. } => {
+            merger.ensure_type(*ty);
+        }
+
+        // Dynamic field access uses strings
+        Opcode::DynGet { field, .. } | Opcode::DynSet { field, .. } => {
+            merger.ensure_string(*field);
+        }
+
+        // Enum construction - enum constructs reference is local to enum type
+        // No global pool reference needed for RefEnumConstruct
+        Opcode::MakeEnum { .. } | Opcode::EnumAlloc { .. } | Opcode::EnumField { .. } => {
+            // These use RefEnumConstruct which is relative to the enum type
+            // The type should already be ensured elsewhere
+        }
+
+        // All other opcodes don't reference global pools
+        _ => {}
+    }
+}
+
+/// List functions that exist in source and could potentially be substituted
+#[deprecated(note = "Use list_matching_functions with patterns instead")]
+pub fn list_substitutable_functions(
+    target: &Bytecode,
+    source: &Bytecode,
+    source_prefixes: Option<&[&str]>,
+) -> Vec<(String, bool)> {
+    let target_index = FunctionIndex::build(target);
+    let source_index = FunctionIndex::build(source);
+
+    source_index
+        .iter()
+        .filter(|(_name, idx)| {
+            // If source prefixes specified, filter by source file
+            // Use function_has_source_prefix to check ANY opcode, not just first
+            if let Some(prefixes) = source_prefixes {
+                let func = &source.functions[*idx];
+                function_has_source_prefix(source, func, prefixes)
+            } else {
+                true
+            }
+        })
+        .map(|(name, _)| {
+            let exists_in_target = target_index.find(name).is_some();
+            (name.to_string(), exists_in_target)
+        })
+        .collect()
+}
+
+/// List functions in source that match any of the given patterns
+///
+/// Returns a list of (function_name, exists_in_target) pairs.
+/// If patterns is empty, lists all functions in source.
+pub fn list_matching_functions(
+    target: &Bytecode,
+    source: &Bytecode,
+    patterns: &[&str],
+) -> Vec<(String, bool)> {
+    let target_index = FunctionIndex::build(target);
+    let source_index = FunctionIndex::build(source);
+
+    source_index
+        .iter()
+        .filter(|(name, _)| {
+            // If no patterns, match all (for --list without patterns)
+            if patterns.is_empty() {
+                // Skip anonymous closures
+                *name != "<none>" && !name.is_empty()
+            } else {
+                patterns.iter().any(|pattern| matches_pattern(name, pattern))
+            }
+        })
+        .map(|(name, _)| {
+            let exists_in_target = target_index.find(name).is_some();
+            (name.to_string(), exists_in_target)
+        })
+        .collect()
+}
+
+/// Substitute functions from source bytecode into target bytecode using pattern matching
+///
+/// # Arguments
+/// * `target` - The bytecode to modify
+/// * `source` - The bytecode containing replacement functions
+/// * `patterns` - List of patterns to match function names against (supports * and ** wildcards)
+/// * `inject_deps` - If true, inject missing function dependencies from source
+///
+/// # Returns
+/// A result containing lists of replaced, not found, and error functions
+pub fn substitute_functions_by_pattern(
+    target: &mut Bytecode,
+    source: &Bytecode,
+    patterns: &[&str],
+    inject_deps: bool,
+) -> SubstitutionResult {
+    let mut result = SubstitutionResult::default();
+
+    // Build indexes
+    let target_index = FunctionIndex::build(target);
+    let source_index = FunctionIndex::build(source);
+
+    // Find functions matching any pattern
+    let to_replace: Vec<(String, usize)> = source_index
+        .iter()
+        .filter(|(name, _)| patterns.iter().any(|pattern| matches_pattern(name, pattern)))
+        .map(|(name, idx)| (name.to_string(), idx))
+        .collect();
+
+    // Resolve target function indices and filter out not-found functions
+    let to_replace: Vec<(String, usize, usize)> = to_replace
+        .into_iter()
+        .filter_map(|(name, src_func_idx)| match target_index.find(&name) {
+            Some(target_func_idx) => Some((name, src_func_idx, target_func_idx)),
+            None => {
+                result.not_found.push(name);
+                None
+            }
+        })
+        .collect();
+
+    // Create a single pool merger for all substitutions to share type/global mappings
+    let mut merger = PoolMerger::new(target, source, inject_deps);
+
+    // First pass: scan all functions to build complete remap
+    for (_name, src_func_idx, _target_func_idx) in &to_replace {
+        let src_func = &source.functions[*src_func_idx];
+        scan_and_ensure_refs(&mut merger, src_func);
+    }
+
+    // Get the remap and collect results
+    let remap = merger.remap.clone();
+    let warnings = std::mem::take(&mut merger.warnings);
+    let injected_functions = std::mem::take(&mut merger.injected_functions);
+    let unresolvable_natives = std::mem::take(&mut merger.unresolvable_natives);
+    result.warnings.extend(warnings);
+    result.injected_functions.extend(injected_functions);
+    result.unresolvable_natives.extend(unresolvable_natives);
+
+    // Collect type mismatches
+    let type_mismatches = std::mem::take(&mut merger.type_mismatches);
+    for (_src_type_idx, mismatch) in &type_mismatches {
+        result.type_mismatches.push(TypeMismatchInfo {
+            type_name: mismatch.type_name.clone(),
+            target_fields: mismatch.target_field_count,
+            source_fields: mismatch.source_field_count,
+            missing_fields: mismatch.missing_in_target.clone(),
+        });
+    }
+
+    // Drop the merger to release the mutable borrow on target
+    drop(merger);
+
+    // Second pass: apply remaps to each function
+    for (name, src_func_idx, target_func_idx) in to_replace {
+        let src_func = &source.functions[src_func_idx];
+
+        // Remap the function opcodes (with field index remapping based on register types)
+        let remapped_ops: Vec<Opcode> = src_func
+            .ops
+            .iter()
+            .map(|op| remap.remap_opcode_with_regs(op, &src_func.regs))
+            .collect();
+
+        let remapped_regs: Vec<RefType> = src_func
+            .regs
+            .iter()
+            .map(|&r| remap.remap_type(r))
+            .collect();
+
+        let remapped_assigns = src_func.assigns.as_ref().map(|assigns| {
+            assigns
+                .iter()
+                .map(|(s, p)| (remap.remap_string(*s), *p))
+                .collect()
+        });
+
+        // Get mutable reference to target function and update it
+        let target_func = &mut target.functions[target_func_idx];
+
+        // Keep original findex, name, parent - just replace the body
+        target_func.t = remap.remap_type(src_func.t);
+        target_func.regs = remapped_regs;
+        // Create dummy debug_info - source file indices aren't valid in target
+        // Each opcode needs an entry (file_idx, line_num), use (0, 0) as placeholder
+        target_func.debug_info = Some(vec![(0, 0); remapped_ops.len()]);
+        target_func.ops = remapped_ops;
+        target_func.assigns = remapped_assigns;
+
+        result.replaced.push(name);
+    }
+
+    result
+}

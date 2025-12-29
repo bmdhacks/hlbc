@@ -22,20 +22,28 @@ impl Bytecode {
     }
 
     /// Load the bytecode from any source. This method will skip bytes until the magic header is found.
-    /// This also means it will read bytes indefinitely if it can't find the magic header.
+    /// Returns an error if EOF is reached without finding the header.
     pub fn deserialize(mut r: impl BufRead) -> Result<Self> {
         // Search for the magic header
         let finder = memchr::memmem::Finder::new("HLB");
         loop {
             let buffer = r.fill_buf()?;
+            let len = buffer.len();
+            // EOF reached without finding magic header
+            if len == 0 {
+                return Err(Error::MalformedBytecode(
+                    "Could not find HLB magic header in file".to_string(),
+                ));
+            }
             if let Some(index) = finder.find(buffer) {
                 r.consume(index);
                 return Self::deserialize_exact(&mut r);
             }
-            let len = buffer.len();
             // Edge case is when this buffer ends with 'HL', we must not consume
             // the last 2 bytes, so they can be used for the next search.
-            r.consume(len - 2);
+            // But if the buffer is too small, consume what we can.
+            let consume = if len > 2 { len - 2 } else { len };
+            r.consume(consume);
         }
     }
 

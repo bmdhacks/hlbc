@@ -20,15 +20,41 @@ use crate::command::{commands_parser, Command, ElementRef, FileOrIndex, ParseCon
 mod command;
 
 #[derive(ClapParser, Debug)]
-#[clap(author, version, about)]
+#[clap(
+    author,
+    version,
+    about = "Interactive explorer for Hashlink bytecode (.hl / hlboot.dat files)",
+    long_about = "HLBC is an interactive tool for exploring, analyzing, and decompiling Hashlink \
+bytecode. Hashlink is a VM for the Haxe language, used by games like Northgard, \
+Dead Cells, and Wartales.\n\n\
+Once loaded, you'll get an interactive prompt where you can inspect functions, \
+types, strings, and other bytecode elements. Type 'help' at the prompt for a \
+full list of commands.",
+    after_help = "INTERACTIVE COMMANDS (type 'help' after loading for full list):
+  info              Show bytecode overview
+  fn <idx>          Show function with opcodes
+  sfn <pattern>     Search for functions by name
+  decomp <idx>      Decompile a function
+  refto <type@idx>  Find references to an element
+  type <idx>        Show type definition
+
+EXAMPLES:
+  hlbc game.hl                     Open bytecode interactively
+  hlbc game.hl -c 'help'           Show all interactive commands
+  hlbc game.hl -c 'info'           Show info and exit
+  hlbc game.hl -c 'sfn update'     Search for 'update' functions
+  hlbc game.hl -w 'decomp 42'      Watch file and re-decompile on change"
+)]
 struct Args {
-    /// The file to open, can be Hashlink bytecode or Haxe source file
+    /// Hashlink bytecode file (.hl) or Haxe source file (.hx) to analyze
     file: PathBuf,
-    /// Execute the command each time the file changes
-    #[clap(short, long)]
+
+    /// Re-run command whenever the file changes (requires 'watch' feature)
+    #[clap(short, long, value_name = "CMD")]
     watch: Option<String>,
-    /// Execute the command at startup
-    #[clap(short, long)]
+
+    /// Run command immediately after loading, then exit
+    #[clap(short, long, value_name = "CMD")]
     command: Option<String>,
 }
 
@@ -113,9 +139,10 @@ fn main() -> anyhow::Result<()> {
         };
     }
 
-    // Execute the -c
+    // Execute the -c and exit
     if let Some(initial_cmd) = args.command {
         execute_commands!(&code, parser.parse(initial_cmd.as_str()).expect("Error while parsing command."); return Ok(()));
+        return Ok(());
     }
 
     #[cfg(feature = "watch")]
@@ -213,37 +240,73 @@ fn process_command(
         Command::Exit => unreachable!(),
         Command::Help => {
             println!(
-                r#"Commands :
-exit                         | Exit hlbc-cli
-help                         | This message
-explain     <opcode>         | Get information about an opcode
-wiki                         | Open the bytecode wiki in a browser
-info                         | General information about the bytecode
-entrypoint                   | Get the bytecode entrypoint
-i,int       <idx>            | Get the int at index
-f,float     <idx>            | Get the float at index
-s,string    <idx>            | Get the string at index
-sstr        <str>            | Find a string
-file,debugfile <idx>         | Get the debug file name at index
-sfile       <str>            | Find the debug file named
-t,type      <idx>            | Get the type at index
-g,global    <idx>            | Get global at index
-c,constant  <idx>            | Get constant at index
-n,native    <idx>            | Get native at index
-fnh         <findex>         | Get header of function at index
-fn          <findex>         | Get a function by findex
-fnn,fnamed  <str>            | Get a function by name
-sfn         <str>            | Find a function by name
-infile      <idx|str>        | Find functions in file
-fileof      <findex>         | Get the file where findex is defined
-refto       <any@idx>        | Find references to a given bytecode element
-saveto      <filename>       | Serialize the bytecode to a file
-callgraph   <findex> <depth> | Create a dot call graph from a function and a max depth
-decomp      <findex>         | Decompile a function
-decompt     <idx>            | Decompile a type
+                r#"HLBC - Hashlink Bytecode Explorer
+==================================
 
-Remember you can use the range notation in place of an index to navigate through data : a..b
-This is the same range notation as Rust and is supported with most commands."#
+GENERAL
+  help                          Show this help message
+  info                          Display bytecode overview (version, counts, entry point)
+  entrypoint                    Show the main entry point function
+  wiki                          Open the bytecode wiki in your browser
+  exit                          Exit hlbc-cli
+
+DATA INSPECTION
+  i, int       <idx>            Show integer constant at index
+  f, float     <idx>            Show float constant at index
+  s, string    <idx>            Show string at index
+  t, type      <idx>            Show type definition at index
+  g, global    <idx>            Show global variable at index
+  c, constant  <idx>            Show constant at index
+  n, native    <idx>            Show native function binding at index
+  file         <idx>            Show debug source file name at index
+
+FUNCTIONS
+  fn           <findex>         Show full function with opcodes
+  fnh          <findex>         Show function header only (signature, no body)
+  fnn, fnamed  <name>           Look up function by exact name
+  infile       <idx|name>       List all functions defined in a source file
+  fileof       <findex>         Show which source file defines a function
+
+SEARCH
+  sfn          <pattern>        Search for functions matching pattern
+  sstr         <pattern>        Search for strings matching pattern
+  sfile        <pattern>        Search for debug file names matching pattern
+
+ANALYSIS
+  explain      <opcode>         Show documentation for a bytecode opcode
+  refto        <type@idx>       Find all references to a bytecode element
+  callgraph    <findex> <depth> Generate DOT call graph from function
+  decomp       <findex>         Decompile function to Haxe-like source
+  decompt      <idx>            Decompile entire type (class/enum) to source
+  dump-types   [prefix]         Dump all types (optionally filtered by prefix)
+
+OUTPUT
+  saveto       <filename>       Write bytecode to file (for round-trip testing)
+
+RANGE NOTATION
+  Most commands accepting <idx> support Rust-style ranges:
+    string 0..10     First 10 strings (indices 0-9)
+    type ..5         First 5 types
+    int 100..        All ints from index 100 onward
+    global ..        All globals
+
+ELEMENT REFERENCES (for refto)
+  Format: <type>@<index>
+    fun@42           Function with findex 42
+    type@10          Type at index 10
+    global@5         Global at index 5
+    string@100       String at index 100
+    native@3         Native function at index 3
+
+EXAMPLES
+  > info                        Show bytecode summary
+  > sfn update                  Find functions containing "update"
+  > fn 42                       Show function at findex 42
+  > decomp 42                   Decompile that function
+  > refto fun@42                Find all calls to function 42
+  > callgraph 42 3              Show call graph 3 levels deep
+  > string ..20                 Show first 20 strings
+  > type 0..5; global 0..3      Run multiple commands (semicolon-separated)"#
             );
         }
         Command::Explain(s) => {
@@ -604,8 +667,111 @@ This is the same range notation as Rust and is supported with most commands."#
                 _ => println!("Type {idx} is not an obj"),
             }
         }
+        Command::DumpTypes(prefix) => {
+            dump_types(code, prefix.as_deref());
+        }
     }
     Ok(())
+}
+
+/// Check if a type name matches any of the given prefixes
+fn matches_prefix(name: &str, prefix: Option<&str>) -> bool {
+    match prefix {
+        Some(p) => name.starts_with(p),
+        None => true, // No filter means match all
+    }
+}
+
+/// Dump type information from bytecode
+///
+/// If prefix is provided, only types matching that prefix are shown.
+/// Output format is designed for comparison and hxml generation.
+fn dump_types(code: &Bytecode, prefix: Option<&str>) {
+    use std::collections::BTreeMap;
+
+    // Collect types with their field info
+    let mut types_info: BTreeMap<String, (usize, Vec<String>, &'static str)> = BTreeMap::new();
+
+    for ty in code.types.iter() {
+        match ty {
+            Type::Obj(obj) => {
+                let name = obj.name(code).to_string();
+                if matches_prefix(&name, prefix) {
+                    let fields: Vec<String> = obj
+                        .fields
+                        .iter()
+                        .map(|f| code.get(f.name).to_string())
+                        .collect();
+                    types_info.insert(name, (fields.len(), fields, "class"));
+                }
+            }
+            Type::Struct(obj) => {
+                let name = obj.name(code).to_string();
+                if matches_prefix(&name, prefix) {
+                    let fields: Vec<String> = obj
+                        .fields
+                        .iter()
+                        .map(|f| code.get(f.name).to_string())
+                        .collect();
+                    types_info.insert(name, (fields.len(), fields, "struct"));
+                }
+            }
+            Type::Enum { name, constructs, .. } => {
+                let name_str = code.get(*name).to_string();
+                if matches_prefix(&name_str, prefix) {
+                    let constructs_info: Vec<String> = constructs
+                        .iter()
+                        .map(|c| c.name(code).to_string())
+                        .collect();
+                    types_info.insert(name_str, (constructs.len(), constructs_info, "enum"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Collect functions
+    let mut functions: Vec<String> = Vec::new();
+
+    for func in &code.functions {
+        let method_name = code.get(func.name).to_string();
+        let parent_name = func.parent.and_then(|p| {
+            match &code.types[p.0] {
+                Type::Obj(obj) | Type::Struct(obj) => Some(obj.name(code).to_string()),
+                _ => None,
+            }
+        });
+
+        let qualified_name = match parent_name {
+            Some(ref p) => format!("{}.{}", p, method_name),
+            None => method_name,
+        };
+
+        if matches_prefix(&qualified_name, prefix) {
+            functions.push(qualified_name);
+        }
+    }
+
+    // Output results
+    let filter_desc = prefix.unwrap_or("all");
+    println!("# Type Analysis (filter: {})", filter_desc);
+    println!("# Types: {}, Functions: {}", types_info.len(), functions.len());
+    println!();
+
+    println!("[types]");
+    for (name, (count, fields, kind)) in &types_info {
+        if fields.len() <= 5 {
+            println!("{} ({}) = {} ({})", name, kind, count, fields.join(", "));
+        } else {
+            println!("{} ({}) = {}", name, kind, count);
+        }
+    }
+
+    println!();
+    println!("[functions]");
+    for name in &functions {
+        println!("{}", name);
+    }
 }
 
 /// Compile a Haxe source file to Hashlink bytecode by directly calling the Haxe compiler.

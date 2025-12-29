@@ -1,0 +1,12 @@
+[package]
+name = "hl-substitute"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Substitute functions in HashLink bytecode with replacements from another bytecode file"
+
+[dependencies]
+hlbc.workspace = true
+clap.workspace = true
+anyhow.workspace = true
