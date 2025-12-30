@@ -71,22 +71,18 @@ struct Args {
     #[arg(long, value_name = "PREFIX")]
     compare_types: Option<Option<String>>,
 
-    /// Generate an hxml file that compiles source library to match target's type layouts.
-    /// Analyzes both files and outputs hxml with --macro keep() for matching types.
+    /// Generate Haxe extern definitions from target bytecode.
+    /// These can be used to compile mod code against the game's types.
     #[arg(long)]
-    gen_hxml: bool,
+    gen_externs: bool,
 
-    /// Library name for generated hxml (default: heaps)
-    #[arg(long, default_value = "heaps")]
-    hxml_lib: String,
-
-    /// Output .hl filename for generated hxml (default: library.hl)
+    /// Output directory for generated extern files (used with --gen-externs or --gen-hxml)
     #[arg(long)]
-    hxml_output: Option<String>,
+    externs_output: Option<PathBuf>,
 
-    /// Output path for generated Dummy.hx file (used with --gen-hxml)
-    #[arg(long)]
-    dummy_output: Option<PathBuf>,
+    /// Filter extern generation to specific type patterns (e.g., "h3d.**")
+    #[arg(long = "extern-type", value_name = "PATTERN")]
+    extern_types: Vec<String>,
 
     /// Disable automatic injection of missing function dependencies.
     /// By default, functions called by substituted code are automatically injected
@@ -127,17 +123,39 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Handle --gen-hxml (requires source)
-    if args.gen_hxml {
-        let source_path = args.source.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("--gen-hxml requires a source file"))?;
-        let source_data = fs::read(source_path)
-            .with_context(|| format!("Failed to read source file: {}", source_path.display()))?;
-        let source = Bytecode::deserialize(&mut source_data.as_slice())
-            .with_context(|| "Failed to parse source bytecode")?;
+    // Handle --gen-externs (generates extern files from target)
+    if args.gen_externs {
+        use hlbc::extern_gen::{ExternGenOptions, generate_all_externs, write_externs_to_dir};
 
-        let hl_output = args.hxml_output.unwrap_or_else(|| format!("{}.hl", args.hxml_lib));
-        generate_hxml(&target, &source, &args.hxml_lib, &hl_output, args.dummy_output.as_ref())?;
+        let options = ExternGenOptions {
+            type_filter: if args.extern_types.is_empty() {
+                None
+            } else {
+                Some(args.extern_types.clone())
+            },
+            include_internal: false,
+            generate_native_meta: true,
+        };
+
+        let result = generate_all_externs(&target, &options);
+
+        println!("Generated {} extern files:", result.files.len());
+        println!("  Classes: {}", result.class_count);
+        println!("  Enums: {}", result.enum_count);
+        println!("  Abstracts: {}", result.abstract_count);
+
+        if let Some(output_dir) = &args.externs_output {
+            write_externs_to_dir(&result, output_dir)?;
+            println!("\nWritten to: {}", output_dir.display());
+        } else {
+            // Print to stdout if no output directory specified
+            for (path, content) in &result.files {
+                println!("\n=== {} ===", path);
+                println!("{}", content);
+            }
+            eprintln!("\nTip: Use --externs-output <dir> to write files to disk");
+        }
+
         return Ok(());
     }
 
@@ -380,44 +398,6 @@ fn get_field_names(code: &Bytecode, ty: &Type) -> Vec<String> {
     }
 }
 
-/// Check if a type name is likely to be publicly accessible
-/// Used to filter Dummy.hx generation to avoid compilation errors
-fn is_public_type(name: &str) -> bool {
-    // Skip inner classes like h3d.impl._GlDriver.CompiledProgram
-    if name.contains("._") {
-        return false;
-    }
-
-    // Skip abstract implementations like h2d.col._Point.Point_Impl_
-    if name.contains("_Impl_") {
-        return false;
-    }
-
-    // Get the class name (last segment)
-    let class_name = name.rsplit('.').next().unwrap_or(name);
-
-    // Skip classes starting with underscore
-    if class_name.starts_with('_') {
-        return false;
-    }
-
-    // Known internal/problematic types in heaps that aren't publicly accessible
-    // These are typically structs, typedefs, or private inner types
-    const KNOWN_INTERNAL: &[&str] = &[
-        "h2d.FontChar",
-        "h2d.Kerning",
-        "h3d.anim.LinearFrame",
-        "h3d.prim.UV",
-        "hxd.clipper.Rect",
-    ];
-
-    if KNOWN_INTERNAL.contains(&name) {
-        return false;
-    }
-
-    true
-}
-
 /// Dump types from bytecode with optional prefix filter
 fn dump_types(code: &Bytecode, prefix: Option<&str>) {
     let mut types_info: BTreeMap<String, (usize, Vec<String>, &'static str)> = BTreeMap::new();
@@ -456,158 +436,6 @@ fn dump_types(code: &Bytecode, prefix: Option<&str>) {
             println!("{} ({}) = {}", name, kind, count);
         }
     }
-}
-
-/// Generate an hxml file that compiles source library to match target's type layouts
-fn generate_hxml(target: &Bytecode, source: &Bytecode, lib_name: &str, hl_output: &str, dummy_output: Option<&PathBuf>) -> Result<()> {
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::io::Write;
-
-    // Collect types from target (what we need to match)
-    let mut target_types: BTreeMap<String, usize> = BTreeMap::new();
-    for ty in target.types.iter() {
-        if let Some(name) = get_type_name(target, ty) {
-            // Skip internal/compiler-generated types
-            if name.starts_with("$") || name.contains("$") || name.starts_with("_") {
-                continue;
-            }
-            target_types.insert(name, get_field_count(ty));
-        }
-    }
-
-    // Collect types from source
-    let mut source_types: BTreeMap<String, usize> = BTreeMap::new();
-    for ty in source.types.iter() {
-        if let Some(name) = get_type_name(source, ty) {
-            if name.starts_with("$") || name.contains("$") || name.starts_with("_") {
-                continue;
-            }
-            source_types.insert(name, get_field_count(ty));
-        }
-    }
-
-    // Find types that exist in both (these are what we want to keep)
-    let mut matching_types: BTreeSet<String> = BTreeSet::new();
-    let mut mismatched_types: Vec<(String, usize, usize)> = Vec::new();
-
-    for (name, target_fields) in &target_types {
-        if let Some(&source_fields) = source_types.get(name) {
-            matching_types.insert(name.clone());
-            if *target_fields != source_fields {
-                mismatched_types.push((name.clone(), *target_fields, source_fields));
-            }
-        }
-    }
-
-    // Filter to only library types (h3d, h2d, hxsl, hxd for heaps)
-    let lib_prefixes: Vec<&str> = if lib_name == "heaps" {
-        vec!["h3d.", "h2d.", "hxsl.", "hxd."]
-    } else {
-        vec![] // For other libs, include all
-    };
-
-    let lib_types: BTreeSet<String> = if lib_prefixes.is_empty() {
-        matching_types.clone()
-    } else {
-        matching_types
-            .iter()
-            .filter(|name| lib_prefixes.iter().any(|p| name.starts_with(p)))
-            .cloned()
-            .collect()
-    };
-
-    // Generate hxml header
-    println!("# Generated hxml for matching target type layouts");
-    println!("# Target: {} types, Source: {} types", target_types.len(), source_types.len());
-    println!("# Library types to reference: {}", lib_types.len());
-    if !mismatched_types.is_empty() {
-        let lib_mismatches: Vec<_> = mismatched_types
-            .iter()
-            .filter(|(name, _, _)| lib_prefixes.is_empty() || lib_prefixes.iter().any(|p| name.starts_with(p)))
-            .collect();
-        if !lib_mismatches.is_empty() {
-            println!("# WARNING: {} library types have field count mismatches", lib_mismatches.len());
-            println!("# These indicate the source was compiled differently than target:");
-            for (name, target_fields, source_fields) in lib_mismatches {
-                println!("#   {} (target: {}, source: {})", name, target_fields, source_fields);
-            }
-        }
-    }
-    println!();
-
-    // Library dependencies
-    println!("-lib {}", lib_name);
-    if lib_name == "heaps" {
-        println!("-lib hlsdl");
-        println!("-lib hlopenal");
-    }
-    println!();
-    println!("-D hl-ver=1.15.0");
-    println!();
-
-    // Main class that references all the types
-    println!("# Compile the dummy file that references all needed types");
-    println!("Dummy");
-    println!();
-    println!("-hl {}", hl_output);
-
-    // Print summary to stderr
-    eprintln!();
-    eprintln!("Generated hxml referencing {} library types", lib_types.len());
-
-    // Build Dummy.hx content
-    let mut dummy_content = String::new();
-    dummy_content.push_str("// Auto-generated file to reference types from target bytecode\n");
-    dummy_content.push_str("// This ensures the compiled library has matching type layouts\n");
-    dummy_content.push_str("// Using Class<T> references forces compile-time type inclusion\n");
-    dummy_content.push('\n');
-    dummy_content.push_str("class Dummy {\n");
-
-    // Reference each type using Class<T> to force compile-time inclusion
-    let mut idx = 0;
-    let mut skipped = Vec::new();
-    for name in &lib_types {
-        if !is_public_type(name) {
-            skipped.push(name.clone());
-            continue;
-        }
-        // Use Class<T> which forces compile-time type resolution
-        dummy_content.push_str(&format!("    static var _{}: Class<{}>;\n", idx, name));
-        idx += 1;
-    }
-
-    if !skipped.is_empty() {
-        dummy_content.push('\n');
-        dummy_content.push_str(&format!("    // Skipped {} types (internal/private):\n", skipped.len()));
-        for name in skipped.iter().take(10) {
-            dummy_content.push_str(&format!("    // - {}\n", name));
-        }
-        if skipped.len() > 10 {
-            dummy_content.push_str(&format!("    // ... and {} more\n", skipped.len() - 10));
-        }
-    }
-    dummy_content.push('\n');
-    dummy_content.push_str("    public static function main() {}\n");
-    dummy_content.push_str("}\n");
-
-    // Write Dummy.hx to file or print to stderr
-    if let Some(path) = dummy_output {
-        let mut file = fs::File::create(path)
-            .with_context(|| format!("Failed to create Dummy.hx file: {}", path.display()))?;
-        file.write_all(dummy_content.as_bytes())
-            .with_context(|| format!("Failed to write Dummy.hx file: {}", path.display()))?;
-        eprintln!("Written Dummy.hx to: {}", path.display());
-    } else {
-        eprintln!();
-        eprintln!("=== Dummy.hx ===");
-        eprint!("{}", dummy_content);
-        eprintln!("=== End Dummy.hx ===");
-        eprintln!();
-        eprintln!("Save the Dummy.hx content above to your library directory, then run:");
-        eprintln!("  haxe <generated.hxml>");
-    }
-
-    Ok(())
 }
 
 /// Compare types between target and source bytecode

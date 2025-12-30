@@ -20,6 +20,60 @@ fn get_global_string_value<'a>(code: &'a Bytecode, global: RefGlobal) -> Option<
     code.strings.get(string_idx).map(|s| s.as_ref())
 }
 
+/// Get the enum construct index for an enum-type global, if any
+/// Falls back to position-based matching if not in constants table
+fn get_global_enum_construct(code: &Bytecode, global: RefGlobal, enum_type: RefType) -> Option<usize> {
+    // First try: check if global has a constant initializer
+    if let Some(&const_idx) = code.globals_initializers.get(&global) {
+        if let Some(constants) = code.constants.as_ref() {
+            if let Some(constant_def) = constants.get(const_idx) {
+                // For enums, fields[0] is the construct index
+                if let Some(&construct) = constant_def.fields.first() {
+                    return Some(construct);
+                }
+            }
+        }
+    }
+
+    // Second try: determine position among all globals of this enum type
+    // This assumes globals are created in construct order
+    let mut enum_globals: Vec<usize> = code
+        .globals
+        .iter()
+        .enumerate()
+        .filter(|(_, &t)| t == enum_type)
+        .map(|(i, _)| i)
+        .collect();
+    enum_globals.sort();
+
+    // Find position of this global in the sorted list
+    enum_globals.iter().position(|&g| g == global.0)
+}
+
+/// Get the construct name for an enum global given its construct index
+fn get_enum_construct_name(
+    code: &Bytecode,
+    enum_type: RefType,
+    construct_idx: usize,
+) -> Option<String> {
+    if let Type::Enum { constructs, .. } = code.get(enum_type) {
+        constructs
+            .get(construct_idx)
+            .map(|c| code.get(c.name).to_string())
+    } else {
+        None
+    }
+}
+
+/// Find construct index by name in an enum type
+fn find_construct_index_by_name(code: &Bytecode, enum_type: RefType, name: &str) -> Option<usize> {
+    if let Type::Enum { constructs, .. } = code.get(enum_type) {
+        constructs.iter().position(|c| code.get(c.name) == name)
+    } else {
+        None
+    }
+}
+
 /// Information about type layout mismatches between source and target
 #[derive(Debug, Clone)]
 pub struct TypeMismatch {
@@ -722,7 +776,86 @@ impl<'a> PoolMerger<'a> {
             }
         }
 
-        // Non-String globals: match by type (original behavior)
+        // Special handling for Enum-type globals - match by construct NAME
+        if let Type::Enum { name, .. } = self.source.get(src_type) {
+            let enum_name = self.source.get(*name).to_string();
+            if let Some(src_construct) = get_global_enum_construct(self.source, src_ref, src_type) {
+                let remapped_type = self.ensure_type(src_type);
+
+                // Get the source construct NAME - this is stable across compilations
+                if let Some(src_construct_name) =
+                    get_enum_construct_name(self.source, src_type, src_construct)
+                {
+                    // Find the target construct index with the same NAME
+                    if let Some(target_construct_idx) =
+                        find_construct_index_by_name(self.target, remapped_type, &src_construct_name)
+                    {
+                        // Now find target global with this construct index
+                        for (i, &target_type) in self.target.globals.iter().enumerate() {
+                            if target_type == remapped_type {
+                                if let Some(actual_target_construct) =
+                                    get_global_enum_construct(self.target, RefGlobal(i), remapped_type)
+                                {
+                                    if actual_target_construct == target_construct_idx {
+                                        self.remap.globals.insert(src_ref.0, i);
+                                        return RefGlobal(i);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Not found with matching construct - warn and try fallback
+                self.warnings.push(format!(
+                    "Enum global {} ({} construct {}) not found in target",
+                    src_ref.0, enum_name, src_construct
+                ));
+                // Not found in target - create a new global with the enum value
+                // This is unusual for enums since they should exist in both
+                let new_global_idx = self.target.globals.len();
+                self.target.globals.push(remapped_type);
+                self.remap.globals.insert(src_ref.0, new_global_idx);
+
+                // Also need to copy the constant definition to initialize the enum
+                if let Some(&src_const_idx) = self.source.globals_initializers.get(&src_ref) {
+                    if let Some(constants) = self.source.constants.as_ref() {
+                        if let Some(src_const) = constants.get(src_const_idx) {
+                            // Create a new constant for this global
+                            let new_const = ConstantDef {
+                                global: RefGlobal(new_global_idx),
+                                fields: src_const.fields.clone(),
+                            };
+                            let new_const_idx = self
+                                .target
+                                .constants
+                                .get_or_insert_with(Vec::new)
+                                .len();
+                            self.target
+                                .constants
+                                .get_or_insert_with(Vec::new)
+                                .push(new_const);
+                            self.target
+                                .globals_initializers
+                                .insert(RefGlobal(new_global_idx), new_const_idx);
+                        }
+                    }
+                }
+
+                let type_name = match self.target.get(remapped_type) {
+                    Type::Enum { name, .. } => self.target.get(*name).to_string(),
+                    _ => format!("type@{}", remapped_type.0),
+                };
+                self.warnings.push(format!(
+                    "Created enum global {} for type '{}' construct {} (was source global {})",
+                    new_global_idx, type_name, src_construct, src_ref.0
+                ));
+
+                return RefGlobal(new_global_idx);
+            }
+        }
+
+        // Non-String/Enum globals: match by type (original behavior)
         let remapped_type = self.ensure_type(src_type);
 
         // Try to find a matching global in target with the same type

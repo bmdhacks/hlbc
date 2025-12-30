@@ -43,7 +43,8 @@ EXAMPLES:
   hlbc game.hl -c 'help'           Show all interactive commands
   hlbc game.hl -c 'info'           Show info and exit
   hlbc game.hl -c 'sfn update'     Search for 'update' functions
-  hlbc game.hl -w 'decomp 42'      Watch file and re-decompile on change"
+  hlbc game.hl -w 'decomp 42'      Watch file and re-decompile on change
+  hlbc game.hl --gen-externs -o externs/    Generate Haxe extern definitions"
 )]
 struct Args {
     /// Hashlink bytecode file (.hl) or Haxe source file (.hx) to analyze
@@ -56,6 +57,22 @@ struct Args {
     /// Run command immediately after loading, then exit
     #[clap(short, long, value_name = "CMD")]
     command: Option<String>,
+
+    /// Generate Haxe extern definitions from bytecode
+    #[clap(long)]
+    gen_externs: bool,
+
+    /// Output directory for generated extern files (used with --gen-externs)
+    #[clap(short, long, value_name = "DIR")]
+    output: Option<PathBuf>,
+
+    /// Filter types by pattern (e.g., "h3d.**", "game.Player") - can be specified multiple times
+    #[clap(long = "type", value_name = "PATTERN")]
+    type_filter: Vec<String>,
+
+    /// Include internal/private types (starting with _ or containing $)
+    #[clap(long)]
+    include_internal: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -106,6 +123,47 @@ fn main() -> anyhow::Result<()> {
 
     if tty {
         println!("Loaded ! ({} ms)", start.elapsed().as_millis());
+    }
+
+    // Handle --gen-externs mode
+    if args.gen_externs {
+        use hlbc::extern_gen::{ExternGenOptions, generate_all_externs, write_externs_to_dir};
+
+        let options = ExternGenOptions {
+            type_filter: if args.type_filter.is_empty() {
+                None
+            } else {
+                Some(args.type_filter.clone())
+            },
+            include_internal: args.include_internal,
+            generate_native_meta: true,
+        };
+
+        let result = generate_all_externs(&code, &options);
+
+        // Print summary
+        println!("Generated {} extern files:", result.files.len());
+        println!("  Classes: {}", result.class_count);
+        println!("  Enums: {}", result.enum_count);
+        println!("  Abstracts: {}", result.abstract_count);
+
+        if !result.skipped.is_empty() && tty {
+            println!("  Skipped: {}", result.skipped.len());
+        }
+
+        // Write to output directory
+        if let Some(output_dir) = &args.output {
+            write_externs_to_dir(&result, output_dir)?;
+            println!("\nWritten to: {}", output_dir.display());
+        } else {
+            // Print to stdout if no output directory specified
+            for (path, content) in &result.files {
+                println!("\n=== {} ===", path);
+                println!("{}", content);
+            }
+        }
+
+        return Ok(());
     }
 
     let parse_ctx = ParseContext {

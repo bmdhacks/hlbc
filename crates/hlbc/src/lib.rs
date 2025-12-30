@@ -18,6 +18,8 @@ use crate::types::{
 };
 
 pub mod analysis;
+/// Generate Haxe extern definitions from bytecode.
+pub mod extern_gen;
 pub mod fmt;
 /// Opcodes definitions.
 pub mod opcodes;
