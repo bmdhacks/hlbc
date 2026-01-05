@@ -21,6 +21,9 @@ pub mod analysis;
 /// Generate Haxe extern definitions from bytecode.
 pub mod extern_gen;
 pub mod fmt;
+/// Bytecode injection and patching.
+/// Provides tools for injecting functions from source bytecode and inserting calls.
+pub mod inject;
 /// Opcodes definitions.
 pub mod opcodes;
 /// All about reading bytecode
@@ -189,8 +192,15 @@ impl Resolve<RefString> for Bytecode {
     type Output<'a> = Str;
 
     fn get(&self, index: RefString) -> Self::Output<'_> {
-        if index.0 > 0 {
-            self.strings[index.0].clone()
+        // String 0 can be valid in some bytecode files (e.g., "String" type name)
+        // Only return "<none>" if the string at this index is actually empty
+        if index.0 < self.strings.len() {
+            let s = &self.strings[index.0];
+            if s.is_empty() {
+                Str::from_static("<none>")
+            } else {
+                s.clone()
+            }
         } else {
             Str::from_static("<none>")
         }

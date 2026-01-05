@@ -19,6 +19,8 @@ pub struct ExternGenOptions {
     pub include_internal: bool,
     /// Generate @:native metadata for renamed types
     pub generate_native_meta: bool,
+    /// Exclude Haxe standard library types that conflict with the compiler's stdlib
+    pub exclude_stdlib: bool,
 }
 
 impl Default for ExternGenOptions {
@@ -27,9 +29,41 @@ impl Default for ExternGenOptions {
             type_filter: None,
             include_internal: false,
             generate_native_meta: true,
+            exclude_stdlib: true, // Enabled by default to avoid conflicts
         }
     }
 }
+
+/// Standard library packages that should be excluded from extern generation
+/// These conflict with Haxe's built-in types and standard library
+const STDLIB_PACKAGES: &[&str] = &[
+    "haxe",    // haxe.* (Timer, Int64, etc.)
+    "hl",      // hl.* (HashLink runtime types)
+    "sys",     // sys.* (system types)
+    "hxd",     // hxd.* (Heaps core - should come from heaps lib)
+    "hxsl",    // hxsl.* (Heaps shader language - should come from heaps lib)
+    "format",  // format.* (format library)
+];
+
+/// Individual types that should be excluded even if not in a package
+const STDLIB_TYPES: &[&str] = &[
+    "String",
+    "StringBuf",
+    "StringTools",
+    "Std",
+    "Math",
+    "Date",
+    "DateTools",
+    "EReg",
+    "Lambda",
+    "Reflect",
+    "Sys",
+    "Type",
+    "ValueType",
+    "Xml",
+    "IntIterator",
+    "ereg",  // lowercase variant
+];
 
 /// Result of extern generation
 #[derive(Debug, Default)]
@@ -179,6 +213,24 @@ fn should_include_type(name: &str, options: &ExternGenOptions) -> bool {
         }
         // Skip abstract implementations
         if name.contains("_Impl_") {
+            return false;
+        }
+    }
+
+    // Skip standard library types to avoid conflicts
+    if options.exclude_stdlib {
+        // Check if type is in an excluded package
+        for pkg in STDLIB_PACKAGES {
+            if name.starts_with(pkg) && (name.len() == pkg.len() || name.chars().nth(pkg.len()) == Some('.')) {
+                return false;
+            }
+        }
+        // Check if type is an excluded individual type (no package)
+        if !name.contains('.') && STDLIB_TYPES.contains(&name) {
+            return false;
+        }
+        // Also exclude lowercase hl_* types (HashLink internal types)
+        if name.starts_with("hl_") {
             return false;
         }
     }

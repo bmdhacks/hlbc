@@ -1,13 +1,13 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use hlbc::opcodes::Opcode;
-use hlbc::types::{
+use crate::opcodes::Opcode;
+use crate::types::{
     ConstantDef, Function, ObjField, RefBytes, RefFloat, RefFun, RefGlobal, RefInt, RefString,
     RefType, Type,
 };
-use hlbc::{Bytecode, Resolve};
+use crate::{Bytecode, Resolve};
 
-use crate::remap::IndexRemap;
+use super::remap::IndexRemap;
 
 /// Get the initialized string value for a String-type global, if any
 fn get_global_string_value<'a>(code: &'a Bytecode, global: RefGlobal) -> Option<&'a str> {
@@ -471,14 +471,14 @@ impl<'a> PoolMerger<'a> {
                 };
 
                 // Remap enum constructs
-                let new_constructs: Vec<hlbc::types::EnumConstruct> = constructs
+                let new_constructs: Vec<crate::types::EnumConstruct> = constructs
                     .iter()
                     .map(|c| {
                         let construct_name =
                             RefString(self.ensure_string_value(self.source.get(c.name).as_ref()));
                         let params: Vec<RefType> =
                             c.params.iter().map(|&p| self.ensure_type(p)).collect();
-                        hlbc::types::EnumConstruct {
+                        crate::types::EnumConstruct {
                             name: construct_name,
                             params,
                         }
@@ -543,7 +543,7 @@ impl<'a> PoolMerger<'a> {
                 let remapped_ret = self.ensure_type(ret);
 
                 // Create the new function type
-                let new_fun = hlbc::types::TypeFun {
+                let new_fun = crate::types::TypeFun {
                     args: remapped_args,
                     ret: remapped_ret,
                 };
@@ -770,7 +770,7 @@ impl<'a> PoolMerger<'a> {
     }
 
     /// Ensure a string value exists in target pool, return the index
-    fn ensure_string_value(&mut self, value: &str) -> usize {
+    pub fn ensure_string_value(&mut self, value: &str) -> usize {
         // Check if string already exists
         if let Some(idx) = self.target.strings.iter().position(|s| s.as_ref() == value) {
             return idx;
@@ -982,7 +982,7 @@ impl<'a> PoolMerger<'a> {
         let src_fun_ptr = self.source.get(src_ref);
 
         match src_fun_ptr {
-            hlbc::types::FunPtr::Fun(src_func) => {
+            crate::types::FunPtr::Fun(src_func) => {
                 // Get source function's qualified name
                 let src_name = self.source.get(src_func.name).to_string();
                 let src_parent_name = src_func.parent.map(|p| {
@@ -1021,7 +1021,7 @@ impl<'a> PoolMerger<'a> {
                     ));
                 }
             }
-            hlbc::types::FunPtr::Native(src_native) => {
+            crate::types::FunPtr::Native(src_native) => {
                 // Match native by lib + name
                 let src_name = self.source.get(src_native.name).to_string();
                 let src_lib = self.source.get(src_native.lib).to_string();
@@ -1066,8 +1066,8 @@ impl<'a> PoolMerger<'a> {
     ) -> RefFun {
         // Get the source function (we already know it's a Fun, not Native)
         let src_func = match self.source.get(src_ref) {
-            hlbc::types::FunPtr::Fun(f) => f,
-            hlbc::types::FunPtr::Native(_) => unreachable!("inject_function called with native"),
+            crate::types::FunPtr::Fun(f) => f,
+            crate::types::FunPtr::Native(_) => unreachable!("inject_function called with native"),
         };
 
         // Allocate new findex BEFORE doing anything else
@@ -1192,7 +1192,7 @@ impl<'a> PoolMerger<'a> {
         let new_lib = RefString(self.ensure_string_value(native_lib));
 
         // Create the new native declaration
-        let new_native = hlbc::types::Native {
+        let new_native = crate::types::Native {
             name: new_name,
             lib: new_lib,
             t: new_type,
@@ -1363,8 +1363,8 @@ impl<'a> PoolMerger<'a> {
     fn enum_constructs_match(
         &self,
         enum_name: &str,
-        src_constructs: &[hlbc::types::EnumConstruct],
-        target_constructs: &[hlbc::types::EnumConstruct],
+        src_constructs: &[crate::types::EnumConstruct],
+        target_constructs: &[crate::types::EnumConstruct],
     ) -> bool {
         // Anonymous enums (closures) need exact structural matching
         if enum_name == "<none>" {
@@ -1378,8 +1378,8 @@ impl<'a> PoolMerger<'a> {
     /// Exact structural matching for anonymous enums (closures)
     fn enum_constructs_match_exact(
         &self,
-        src_constructs: &[hlbc::types::EnumConstruct],
-        target_constructs: &[hlbc::types::EnumConstruct],
+        src_constructs: &[crate::types::EnumConstruct],
+        target_constructs: &[crate::types::EnumConstruct],
     ) -> bool {
         // Must have same number of constructs
         if src_constructs.len() != target_constructs.len() {
@@ -1415,8 +1415,8 @@ impl<'a> PoolMerger<'a> {
     /// Source can have additional constructs that will be injected into target
     fn enum_constructs_match_relaxed(
         &self,
-        src_constructs: &[hlbc::types::EnumConstruct],
-        target_constructs: &[hlbc::types::EnumConstruct],
+        src_constructs: &[crate::types::EnumConstruct],
+        target_constructs: &[crate::types::EnumConstruct],
     ) -> bool {
         // For each target construct, find a matching source construct by name
         for target_c in target_constructs {
@@ -1675,7 +1675,7 @@ impl<'a> PoolMerger<'a> {
 
         // Create the actual type
         let new_type = if is_struct {
-            Type::Struct(hlbc::types::TypeObj {
+            Type::Struct(crate::types::TypeObj {
                 name: name_ref,
                 super_: super_ref,
                 global: RefGlobal(0), // No global for created types
@@ -1685,7 +1685,7 @@ impl<'a> PoolMerger<'a> {
                 fields: flattened_fields.into(),
             })
         } else {
-            Type::Obj(hlbc::types::TypeObj {
+            Type::Obj(crate::types::TypeObj {
                 name: name_ref,
                 super_: super_ref,
                 global: RefGlobal(0), // No global for created types
@@ -1842,7 +1842,7 @@ impl<'a> PoolMerger<'a> {
         };
 
         // Collect new constructs to add
-        let mut new_constructs: Vec<hlbc::types::EnumConstruct> = Vec::new();
+        let mut new_constructs: Vec<crate::types::EnumConstruct> = Vec::new();
         let mut injected_names: Vec<String> = Vec::new();
 
         for (src_idx, construct_name, src_params) in missing {
@@ -1857,7 +1857,7 @@ impl<'a> PoolMerger<'a> {
             let new_idx = target_construct_count + new_constructs.len();
             construct_map.insert(*src_idx, new_idx);
 
-            new_constructs.push(hlbc::types::EnumConstruct {
+            new_constructs.push(crate::types::EnumConstruct {
                 name: name_ref,
                 params: target_params,
             });

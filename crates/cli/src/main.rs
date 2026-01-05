@@ -73,6 +73,10 @@ struct Args {
     /// Include internal/private types (starting with _ or containing $)
     #[clap(long)]
     include_internal: bool,
+
+    /// Include standard library types (haxe.*, hl.*, sys.*, etc.) that normally conflict with Haxe stdlib
+    #[clap(long)]
+    include_stdlib: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -137,6 +141,7 @@ fn main() -> anyhow::Result<()> {
             },
             include_internal: args.include_internal,
             generate_native_meta: true,
+            exclude_stdlib: !args.include_stdlib, // Exclude stdlib by default
         };
 
         let result = generate_all_externs(&code, &options);

@@ -6,7 +6,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use hlbc::{Bytecode, Resolve};
 
-use hl_substitute::{list_matching_functions, substitute_functions_by_pattern};
+use hl_substitute::merge::format_type;
+use hl_substitute::{list_matching_functions, substitute_functions_by_pattern_with_options};
 
 #[derive(Parser, Debug)]
 #[command(name = "hl-substitute")]
@@ -90,6 +91,11 @@ struct Args {
     #[arg(long)]
     no_inject_deps: bool,
 
+    /// Disable automatic injection of missing native function declarations.
+    /// By default, SDL/GL natives from source that don't exist in target are injected.
+    #[arg(long)]
+    no_inject_natives: bool,
+
     /// Verbose output - show warnings and additional details
     #[arg(short, long)]
     verbose: bool,
@@ -135,6 +141,7 @@ fn main() -> Result<()> {
             },
             include_internal: false,
             generate_native_meta: true,
+            exclude_stdlib: true, // Exclude stdlib types by default
         };
 
         let result = generate_all_externs(&target, &options);
@@ -239,9 +246,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Perform substitution (injection is enabled by default)
+    // Perform substitution (both function and native injection enabled by default)
     let inject_deps = !args.no_inject_deps;
-    let result = substitute_functions_by_pattern(&mut target, &source, &patterns, inject_deps);
+    let inject_natives = !args.no_inject_natives;
+    let result = substitute_functions_by_pattern_with_options(
+        &mut target, &source, &patterns, inject_deps, inject_natives
+    );
 
     // Report results
     println!("Substitution Results:");
@@ -272,6 +282,21 @@ fn main() -> Result<()> {
         }
     }
 
+    if !result.injected_natives.is_empty() {
+        println!();
+        println!("  Injected natives: {}", result.injected_natives.len());
+        if args.verbose || result.injected_natives.len() <= 20 {
+            for name in &result.injected_natives {
+                println!("    @ {}", name);
+            }
+        } else {
+            for name in result.injected_natives.iter().take(20) {
+                println!("    @ {}", name);
+            }
+            println!("    ... and {} more", result.injected_natives.len() - 20);
+        }
+    }
+
     if !result.not_found.is_empty() {
         println!();
         println!("  Not found in target: {}", result.not_found.len());
@@ -286,7 +311,7 @@ fn main() -> Result<()> {
         for name in &result.unresolvable_natives {
             println!("    ! {}", name);
         }
-        println!("    (natives are external bindings and cannot be injected)");
+        println!("    (native injection was disabled via --no-inject-natives)");
     }
 
     if !result.type_mismatches.is_empty() {
@@ -297,6 +322,11 @@ fn main() -> Result<()> {
                      tm.type_name, tm.source_fields, tm.target_fields);
             if args.verbose && !tm.missing_fields.is_empty() {
                 println!("      missing: {}", tm.missing_fields.join(", "));
+            }
+            // Always show field type mismatches - these can cause runtime crashes
+            for ftm in &tm.field_type_mismatches {
+                println!("      ! {}: source={}, target={}",
+                         ftm.field_name, ftm.source_type, ftm.target_type);
             }
         }
         println!("    NOTE: Type mismatches may cause runtime errors.");
@@ -398,6 +428,18 @@ fn get_field_names(code: &Bytecode, ty: &Type) -> Vec<String> {
     }
 }
 
+/// Get field names with their types for a type (for type comparison)
+fn get_field_types(code: &Bytecode, ty: &Type) -> Vec<(String, String)> {
+    match ty {
+        Type::Obj(obj) | Type::Struct(obj) => {
+            obj.fields.iter().map(|f| {
+                (code.get(f.name).to_string(), format_type(code, f.t))
+            }).collect()
+        }
+        _ => vec![],
+    }
+}
+
 /// Dump types from bytecode with optional prefix filter
 fn dump_types(code: &Bytecode, prefix: Option<&str>) {
     let mut types_info: BTreeMap<String, (usize, Vec<String>, &'static str)> = BTreeMap::new();
@@ -441,13 +483,15 @@ fn dump_types(code: &Bytecode, prefix: Option<&str>) {
 /// Compare types between target and source bytecode
 fn compare_types(target: &Bytecode, source: &Bytecode, prefix: Option<&str>) {
     // Build type info maps for both
-    let mut target_types: BTreeMap<String, (usize, Vec<String>)> = BTreeMap::new();
-    let mut source_types: BTreeMap<String, (usize, Vec<String>)> = BTreeMap::new();
+    // (field_count, field_names, field_types_map)
+    let mut target_types: BTreeMap<String, (usize, Vec<String>, std::collections::HashMap<String, String>)> = BTreeMap::new();
+    let mut source_types: BTreeMap<String, (usize, Vec<String>, std::collections::HashMap<String, String>)> = BTreeMap::new();
 
     for ty in target.types.iter() {
         if let Some(name) = get_type_name(target, ty) {
             if matches_prefix(&name, prefix) {
-                target_types.insert(name, (get_field_count(ty), get_field_names(target, ty)));
+                let field_types: std::collections::HashMap<_, _> = get_field_types(target, ty).into_iter().collect();
+                target_types.insert(name, (get_field_count(ty), get_field_names(target, ty), field_types));
             }
         }
     }
@@ -455,7 +499,8 @@ fn compare_types(target: &Bytecode, source: &Bytecode, prefix: Option<&str>) {
     for ty in source.types.iter() {
         if let Some(name) = get_type_name(source, ty) {
             if matches_prefix(&name, prefix) {
-                source_types.insert(name, (get_field_count(ty), get_field_names(source, ty)));
+                let field_types: std::collections::HashMap<_, _> = get_field_types(source, ty).into_iter().collect();
+                source_types.insert(name, (get_field_count(ty), get_field_names(source, ty), field_types));
             }
         }
     }
@@ -466,29 +511,60 @@ fn compare_types(target: &Bytecode, source: &Bytecode, prefix: Option<&str>) {
     println!();
 
     let mut mismatches = 0;
+    let mut field_type_mismatches = 0;
     let mut missing_in_source = 0;
     let mut extra_in_source = 0;
 
     // Check for mismatches and missing types
-    for (name, (target_count, target_fields)) in &target_types {
+    for (name, (target_count, target_fields, target_field_types)) in &target_types {
         match source_types.get(name) {
-            Some((source_count, source_fields)) => {
+            Some((source_count, source_fields, source_field_types)) => {
+                let mut has_field_count_mismatch = false;
+                let mut field_type_diffs: Vec<(String, String, String)> = Vec::new();
+
                 if target_count != source_count {
-                    println!("MISMATCH: {} - target has {} fields, source has {}",
-                             name, target_count, source_count);
+                    has_field_count_mismatch = true;
+                }
 
-                    // Show field differences
-                    let target_set: std::collections::HashSet<_> = target_fields.iter().collect();
-                    let source_set: std::collections::HashSet<_> = source_fields.iter().collect();
-
-                    for f in source_set.difference(&target_set) {
-                        println!("  + source has: {}", f);
+                // Check for field type mismatches on matching field names
+                for field_name in target_fields.iter() {
+                    if let (Some(target_type), Some(source_type)) =
+                        (target_field_types.get(field_name), source_field_types.get(field_name))
+                    {
+                        if target_type != source_type {
+                            field_type_diffs.push((field_name.clone(), target_type.clone(), source_type.clone()));
+                        }
                     }
-                    for f in target_set.difference(&source_set) {
-                        println!("  - target has: {}", f);
+                }
+
+                if has_field_count_mismatch || !field_type_diffs.is_empty() {
+                    if has_field_count_mismatch {
+                        println!("MISMATCH: {} - target has {} fields, source has {}",
+                                 name, target_count, source_count);
+                        mismatches += 1;
+                    } else {
+                        println!("FIELD TYPE MISMATCH: {} ({} fields)", name, target_count);
+                    }
+
+                    if has_field_count_mismatch {
+                        // Show field name differences
+                        let target_set: std::collections::HashSet<_> = target_fields.iter().collect();
+                        let source_set: std::collections::HashSet<_> = source_fields.iter().collect();
+
+                        for f in source_set.difference(&target_set) {
+                            println!("  + source has: {}", f);
+                        }
+                        for f in target_set.difference(&source_set) {
+                            println!("  - target has: {}", f);
+                        }
+                    }
+
+                    // Show field type differences
+                    for (field_name, target_type, source_type) in &field_type_diffs {
+                        println!("  ! {}: target={}, source={}", field_name, target_type, source_type);
+                        field_type_mismatches += 1;
                     }
                     println!();
-                    mismatches += 1;
                 }
             }
             None => {
@@ -499,7 +575,7 @@ fn compare_types(target: &Bytecode, source: &Bytecode, prefix: Option<&str>) {
     }
 
     // Check for types only in source
-    for (name, (source_count, _)) in &source_types {
+    for (name, (source_count, _, _)) in &source_types {
         if !target_types.contains_key(name) {
             println!("EXTRA IN SOURCE: {} ({} fields)", name, source_count);
             extra_in_source += 1;
@@ -508,11 +584,12 @@ fn compare_types(target: &Bytecode, source: &Bytecode, prefix: Option<&str>) {
 
     println!();
     println!("Summary:");
-    println!("  Mismatches: {}", mismatches);
+    println!("  Field count mismatches: {}", mismatches);
+    println!("  Field type mismatches: {}", field_type_mismatches);
     println!("  Missing in source: {}", missing_in_source);
     println!("  Extra in source: {}", extra_in_source);
 
-    if mismatches > 0 {
+    if mismatches > 0 || field_type_mismatches > 0 {
         println!();
         println!("WARNING: Type mismatches will cause substitution failures!");
         println!("Recompile your source library with matching type layouts.");

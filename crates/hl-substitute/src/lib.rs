@@ -58,12 +58,22 @@ pub struct SubstitutionResult {
     pub warnings: Vec<String>,
     /// Functions injected as dependencies
     pub injected_functions: Vec<String>,
+    /// Native functions that were injected into target
+    pub injected_natives: Vec<String>,
     /// Native functions that couldn't be resolved (can't inject natives)
     pub unresolvable_natives: Vec<String>,
     /// Functions skipped due to type layout mismatches (func_name, reason)
     pub skipped_type_mismatch: Vec<(String, String)>,
     /// Type layout mismatches detected
     pub type_mismatches: Vec<TypeMismatchInfo>,
+}
+
+/// Information about a field type mismatch (same name, different type)
+#[derive(Debug, Clone)]
+pub struct FieldTypeMismatchInfo {
+    pub field_name: String,
+    pub source_type: String, // e.g. "null(f64)"
+    pub target_type: String, // e.g. "f64"
 }
 
 /// Information about a type layout mismatch
@@ -73,6 +83,7 @@ pub struct TypeMismatchInfo {
     pub target_fields: usize,
     pub source_fields: usize,
     pub missing_fields: Vec<String>,
+    pub field_type_mismatches: Vec<FieldTypeMismatchInfo>,
 }
 
 /// Substitute functions from source bytecode into target bytecode
@@ -166,6 +177,15 @@ pub fn substitute_functions(
             target_fields: mismatch.target_field_count,
             source_fields: mismatch.source_field_count,
             missing_fields: mismatch.missing_in_target.clone(),
+            field_type_mismatches: mismatch
+                .field_type_mismatches
+                .iter()
+                .map(|ftm| FieldTypeMismatchInfo {
+                    field_name: ftm.field_name.clone(),
+                    source_type: ftm.source_type.clone(),
+                    target_type: ftm.target_type.clone(),
+                })
+                .collect(),
         });
     }
 
@@ -369,6 +389,27 @@ pub fn substitute_functions_by_pattern(
     patterns: &[&str],
     inject_deps: bool,
 ) -> SubstitutionResult {
+    substitute_functions_by_pattern_with_options(target, source, patterns, inject_deps, false)
+}
+
+/// Substitute functions from source bytecode into target bytecode using pattern matching
+///
+/// # Arguments
+/// * `target` - The bytecode to modify
+/// * `source` - The bytecode containing replacement functions
+/// * `patterns` - List of patterns to match function names against (supports * and ** wildcards)
+/// * `inject_deps` - If true, inject missing function dependencies from source
+/// * `inject_natives` - If true, inject missing native declarations into target
+///
+/// # Returns
+/// A result containing lists of replaced, not found, and error functions
+pub fn substitute_functions_by_pattern_with_options(
+    target: &mut Bytecode,
+    source: &Bytecode,
+    patterns: &[&str],
+    inject_deps: bool,
+    inject_natives: bool,
+) -> SubstitutionResult {
     let mut result = SubstitutionResult::default();
 
     // Build indexes
@@ -395,7 +436,11 @@ pub fn substitute_functions_by_pattern(
         .collect();
 
     // Create a single pool merger for all substitutions to share type/global mappings
-    let mut merger = PoolMerger::new(target, source, inject_deps);
+    let mut merger = if inject_natives {
+        PoolMerger::with_native_injection(target, source, inject_deps)
+    } else {
+        PoolMerger::new(target, source, inject_deps)
+    };
 
     // First pass: scan all functions to build complete remap
     for (_name, src_func_idx, _target_func_idx) in &to_replace {
@@ -407,9 +452,11 @@ pub fn substitute_functions_by_pattern(
     let remap = merger.remap.clone();
     let warnings = std::mem::take(&mut merger.warnings);
     let injected_functions = std::mem::take(&mut merger.injected_functions);
+    let injected_natives = std::mem::take(&mut merger.injected_natives);
     let unresolvable_natives = std::mem::take(&mut merger.unresolvable_natives);
     result.warnings.extend(warnings);
     result.injected_functions.extend(injected_functions);
+    result.injected_natives.extend(injected_natives);
     result.unresolvable_natives.extend(unresolvable_natives);
 
     // Collect type mismatches
@@ -420,6 +467,15 @@ pub fn substitute_functions_by_pattern(
             target_fields: mismatch.target_field_count,
             source_fields: mismatch.source_field_count,
             missing_fields: mismatch.missing_in_target.clone(),
+            field_type_mismatches: mismatch
+                .field_type_mismatches
+                .iter()
+                .map(|ftm| FieldTypeMismatchInfo {
+                    field_name: ftm.field_name.clone(),
+                    source_type: ftm.source_type.clone(),
+                    target_type: ftm.target_type.clone(),
+                })
+                .collect(),
         });
     }
 
@@ -450,7 +506,7 @@ pub fn substitute_functions_by_pattern(
                 .collect()
         });
 
-        // Get mutable reference to target function and update it
+        // Get mutable reference to target function - target_func_idx IS the correct array index
         let target_func = &mut target.functions[target_func_idx];
 
         // Keep original findex, name, parent - just replace the body

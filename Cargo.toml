@@ -4,7 +4,7 @@ members = [
     "crates/hlbc",
     "crates/decompiler",
     "crates/cli",
-    "crates/gui",
+    # "crates/gui",  # Temporarily disabled - missing egui_ui_refresh
     "crates/indexing",
     "crates/hl-analyze",
     "crates/hl-substitute"

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use hlbc::opcodes::Opcode;
-use hlbc::types::{
+use crate::opcodes::Opcode;
+use crate::types::{
     RefBytes, RefEnumConstruct, RefField, RefFloat, RefFun, RefGlobal, RefInt, RefString, RefType,
 };
 
