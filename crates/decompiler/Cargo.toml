@@ -18,8 +18,12 @@ fmtools = { workspace = true }
 hlbc = { workspace = true }
 # Graph utilities
 petgraph = { workspace = true, optional = true }
+# Serialization for index files
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
 
 [features]
 default = []
 alt = []
 alt-graph = ["alt", "petgraph"]
+batch = ["serde", "serde_json"]

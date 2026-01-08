@@ -14,6 +14,14 @@ const INDENT: &str = "                                                          
 pub struct FormatOptions {
     indent: &'static str,
     inc_indent: usize,
+    /// Show type indices as comments (e.g., type@309)
+    pub show_type_indices: bool,
+    /// Show function indices as comments (e.g., fun@1409)
+    pub show_fun_indices: bool,
+    /// Show field indices as comments (e.g., F0, F1)
+    pub show_field_indices: bool,
+    /// Show string literal indices as comments (e.g., str@1234)
+    pub show_string_indices: bool,
 }
 
 impl FormatOptions {
@@ -21,6 +29,22 @@ impl FormatOptions {
         Self {
             indent: "",
             inc_indent,
+            show_type_indices: false,
+            show_fun_indices: false,
+            show_field_indices: false,
+            show_string_indices: false,
+        }
+    }
+
+    /// Create format options with all index annotations enabled
+    pub fn with_indices(inc_indent: usize) -> Self {
+        Self {
+            indent: "",
+            inc_indent,
+            show_type_indices: true,
+            show_fun_indices: true,
+            show_field_indices: true,
+            show_string_indices: true,
         }
     }
 
@@ -54,12 +78,38 @@ fn to_haxe_type<'a>(ty: &Type, ctx: &'a Bytecode) -> impl Display + 'a {
 }
 
 impl Class {
+    /// Display without type index (for backward compatibility)
     pub fn display<'a>(&'a self, ctx: &'a Bytecode, opts: &'a FormatOptions) -> impl Display + 'a {
+        self.display_with_index(ctx, opts, None)
+    }
+
+    /// Display with optional type index annotation
+    pub fn display_with_index<'a>(
+        &'a self,
+        ctx: &'a Bytecode,
+        opts: &'a FormatOptions,
+        type_idx: Option<usize>,
+    ) -> impl Display + 'a {
         let new_opts = opts.inc_nesting();
         fmtools::fmt! { move
-            {opts}"class "{self.name} if let Some(parent) = self.parent.as_ref() { " extends "{parent} } " {\n"
-            for f in &self.fields {
-                {new_opts} if f.static_ { "static " } "var "{f.name}": "{to_haxe_type(&ctx[f.ty], ctx)}";\n"
+            // Type header with index
+            if opts.show_type_indices {
+                if let Some(idx) = type_idx {
+                    "// Type: "{self.name}" (type@"{idx}")\n"
+                }
+            }
+            {opts}"class "{self.name}
+            if let Some(parent) = self.parent.as_ref() {
+                " extends "{parent}
+            }
+            " {\n"
+            // Fields with indices
+            for (i, f) in self.fields.iter().enumerate() {
+                {new_opts} if f.static_ { "static " } "var "{f.name}": "{to_haxe_type(&ctx[f.ty], ctx)}";"
+                if opts.show_field_indices {
+                    "  // F"{i}", type@"{f.ty.0}
+                }
+                "\n"
             }
             for m in &self.methods {
                 "\n"
@@ -74,7 +124,13 @@ impl Method {
     pub fn display<'a>(&'a self, ctx: &'a Bytecode, opts: &'a FormatOptions) -> impl Display + 'a {
         let new_opts = opts.inc_nesting();
         let fun = self.fun.as_fn(ctx).unwrap();
+        let fun_idx = self.fun.0;
+        let nops = fun.ops.len();
         fmtools::fmt! { move
+            // Function header comment with index
+            if opts.show_fun_indices {
+                {opts}"// fun@"{fun_idx}" ("{nops}" ops)\n"
+            }
             {opts} if self.static_ { "static " } if self.dynamic { "dynamic " }
             "function "{fun.name(ctx)}"("
             {fmtools::join(", ", fun.args(ctx).iter().enumerate().skip(if self.static_ { 0 } else { 1 })
@@ -98,18 +154,46 @@ impl Method {
 }
 
 impl Constant {
+    #[allow(dead_code)]
     fn fmt(&self, f: &mut Formatter, code: &Bytecode) -> fmt::Result {
+        self.fmt_with_opts(f, code, false)
+    }
+
+    fn fmt_with_opts(&self, f: &mut Formatter, code: &Bytecode, show_indices: bool) -> fmt::Result {
         use Constant::*;
         match *self {
             InlineInt(c) => Display::fmt(&c, f),
-            Int(c) => EnhancedFmt.fmt_refint(f, code, c),
-            Float(c) => EnhancedFmt.fmt_reffloat(f, code, c),
+            Int(c) => {
+                EnhancedFmt.fmt_refint(f, code, c)?;
+                if show_indices {
+                    write!(f, " /* int@{} */", c.0)?;
+                }
+                Ok(())
+            }
+            Float(c) => {
+                EnhancedFmt.fmt_reffloat(f, code, c)?;
+                if show_indices {
+                    write!(f, " /* float@{} */", c.0)?;
+                }
+                Ok(())
+            }
             String(c) => {
-                write!(f, "\"{}\"", code[c])
+                write!(f, "\"{}\"", code[c])?;
+                if show_indices {
+                    write!(f, " /* str@{} */", c.0)?;
+                }
+                Ok(())
             }
             Bool(c) => Display::fmt(&c, f),
             Null => f.write_str("null"),
             This => f.write_str("this"),
+            TypeRef(ty) => {
+                write!(f, "{}", ty.display::<EnhancedFmt>(code))?;
+                if show_indices {
+                    write!(f, " /* type@{} */", ty.0)?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -173,10 +257,13 @@ impl Expr {
                         "{"{ fmtools::join(", ", fields
                             .iter()
                             .enumerate()
-                            .map(|(i, f)| {
-                                fmtools::fmt! { move
-                                    {f.name(code)}": "{disp!(values.get(&RefField(i)).unwrap())}
-                                }
+                            .filter_map(|(i, f)| {
+                                // Only include fields that have values
+                                values.get(&RefField(i)).map(|v| {
+                                    fmtools::fmt! { move
+                                        {f.name(code)}": "{disp!(v)}
+                                    }
+                                })
                             })) }"}"
                     }
                     _ => "[invalid anonymous type]",
@@ -186,8 +273,14 @@ impl Expr {
                 }
                 Expr::Call(call) => {
                     {disp!(call.fun)}"("{fmtools::join(", ", call.args.iter().map(|e| disp!(e)))}")"
+                    // Add function index comment if the callee is a FunRef
+                    if indent.show_fun_indices {
+                        if let Expr::FunRef(fun_ref) = &call.fun {
+                            " /* fun@"{fun_ref.0}" */"
+                        }
+                    }
                 }
-                Expr::Constant(c) => {|f| c.fmt(f, code)?;},
+                Expr::Constant(c) => {|f| c.fmt_with_opts(f, code, indent.show_string_indices)?;},
                 Expr::Constructor(ConstructorCall { ty, args }) => {
                     "new "{ty.display::<EnhancedFmt>(code)}"("{fmtools::join(", ", args.iter().map(|e| disp!(e)))}")"
                 }
@@ -233,6 +326,9 @@ impl Expr {
                     } else {
                         Str::from(x.to_string())
                     }
+                }}
+                Expr::Ident(name) => {{
+                    name.clone()
                 }}
             }
         }
@@ -316,24 +412,28 @@ impl Statement {
                 Statement::Throw(exc) => {
                     "throw "{disp!(exc)}
                 }
-                Statement::Try { stmts } => {
+                Statement::TryCatch { try_stmts, catch_var, catch_stmts } => {
                     "try {\n"
                     let indent2 = indent.inc_nesting();
-                    for stmt in stmts {
+                    for stmt in try_stmts {
                         {indent2}{stmt.display(&indent2, code, f)}"\n"
                     }
-                    {indent}"}"
-                }
-                Statement::Catch { stmts } => {
-                    "catch () {\n"
-                    let indent2 = indent.inc_nesting();
-                    for stmt in stmts {
+                    {indent}"} catch ("{catch_var}") {\n"
+                    for stmt in catch_stmts {
                         {indent2}{stmt.display(&indent2, code, f)}"\n"
                     }
                     {indent}"}"
                 }
                 Statement::Comment(comment) => {
                     "// "{comment}
+                }
+                Statement::Block { stmts } => {
+                    "{\n"
+                    let indent2 = indent.inc_nesting();
+                    for stmt in stmts {
+                        {indent2}{stmt.display(&indent2, code, f)}"\n"
+                    }
+                    {indent}"}"
                 }
             }
         }

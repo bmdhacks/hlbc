@@ -4,8 +4,8 @@ use crate::ast::{add, ConstructorCall, Expr, Operation, Statement};
 use crate::call_fun;
 
 pub(crate) trait AstVisitor {
-    fn visit_stmt(&mut self, code: &Bytecode, stmt: &mut Statement) {}
-    fn visit_expr(&mut self, code: &Bytecode, expr: &mut Expr) {}
+    fn visit_stmt(&mut self, _code: &Bytecode, _stmt: &mut Statement) {}
+    fn visit_expr(&mut self, _code: &Bytecode, _expr: &mut Expr) {}
 }
 
 /// Visit everything depth-first
@@ -66,13 +66,14 @@ pub(crate) fn visit(
             Statement::Throw(e) => {
                 v!(e);
             }
-            Statement::Try { stmts } => {
-                rec!(stmts);
-            }
-            Statement::Catch { stmts } => {
-                rec!(stmts);
+            Statement::TryCatch { try_stmts, catch_stmts, .. } => {
+                rec!(try_stmts);
+                rec!(catch_stmts);
             }
             Statement::Comment(_) => {}
+            Statement::Block { stmts } => {
+                rec!(stmts);
+            }
         }
         for visitor in visitors.iter_mut() {
             visitor.visit_stmt(code, stmt);
@@ -213,6 +214,7 @@ pub(crate) fn visit_expr(code: &Bytecode, expr: &mut Expr, visitors: &mut [Box<d
         },
         Expr::Unknown(_) => {}
         Expr::Variable(_, _) => {}
+        Expr::Ident(_) => {}
     }
     for visitor in visitors.iter_mut() {
         visitor.visit_expr(code, expr);

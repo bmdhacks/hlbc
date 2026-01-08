@@ -62,13 +62,21 @@ struct Args {
     #[clap(long)]
     gen_externs: bool,
 
-    /// Output directory for generated extern files (used with --gen-externs)
+    /// Decompile all types to a directory of Haxe source files
+    #[clap(long)]
+    decompile_all: bool,
+
+    /// Output directory for generated extern files (used with --gen-externs or --decompile-all)
     #[clap(short, long, value_name = "DIR")]
     output: Option<PathBuf>,
 
     /// Filter types by pattern (e.g., "h3d.**", "game.Player") - can be specified multiple times
     #[clap(long = "type", value_name = "PATTERN")]
     type_filter: Vec<String>,
+
+    /// Exclude types matching pattern (e.g., "haxe.**") - can be specified multiple times
+    #[clap(long = "exclude", value_name = "PATTERN")]
+    exclude_filter: Vec<String>,
 
     /// Include internal/private types (starting with _ or containing $)
     #[clap(long)]
@@ -77,6 +85,10 @@ struct Args {
     /// Include standard library types (haxe.*, hl.*, sys.*, etc.) that normally conflict with Haxe stdlib
     #[clap(long)]
     include_stdlib: bool,
+
+    /// Show verbose progress during decompilation
+    #[clap(short, long)]
+    verbose: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -171,6 +183,34 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Handle --decompile-all mode
+    #[cfg(feature = "batch")]
+    if args.decompile_all {
+        use hlbc_decompiler::batch::{BatchDecompiler, BatchOptions};
+
+        let output_dir = args.output.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("--decompile-all requires --output <DIR> to specify output directory")
+        })?;
+
+        let batch_opts = BatchOptions {
+            include: args.type_filter.clone(),
+            exclude: args.exclude_filter.clone(),
+            verbose: args.verbose,
+        };
+
+        let decompiler = BatchDecompiler::with_options(&code, batch_opts);
+        let index = decompiler.decompile_all(output_dir)?;
+
+        println!("Decompilation complete!");
+        println!("  Types: {}", index.types.len());
+        println!("  Functions: {}", index.functions.len());
+        println!("  Globals: {}", index.globals.len());
+        println!("\nOutput written to: {}", output_dir.display());
+        println!("Index file: {}/_index.json", output_dir.display());
+
+        return Ok(());
+    }
+
     let parse_ctx = ParseContext {
         int_max: code.ints.len(),
         float_max: code.floats.len(),
@@ -232,7 +272,7 @@ fn main() -> anyhow::Result<()> {
         'watch: loop {
             match rx.recv() {
                 Ok(Ok(events)) => {
-                    for e in events {
+                    for _e in events {
                         if is_source {
                             compile(&args.file, &file)?;
                         }

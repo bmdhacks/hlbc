@@ -42,6 +42,8 @@ pub enum Constant {
     Null,
     /// 'this' instance
     This,
+    /// Type reference (for alloc_array, typeof, etc.)
+    TypeRef(RefType),
 }
 
 #[derive(Debug, Clone)]
@@ -155,6 +157,8 @@ pub enum Expr {
     Unknown(String),
     /// Variable identifier
     Variable(Reg, Option<Str>),
+    /// Simple identifier (super, this, etc.)
+    Ident(Str),
 }
 
 pub const fn cst_int(cst: RefInt) -> Expr {
@@ -179,6 +183,10 @@ pub const fn cst_null() -> Expr {
 
 pub const fn cst_this() -> Expr {
     Expr::Constant(Constant::This)
+}
+
+pub const fn cst_type(ty: RefType) -> Expr {
+    Expr::Constant(Constant::TypeRef(ty))
 }
 
 /// Create a shorthand function to create an expression from an operator
@@ -295,13 +303,16 @@ pub enum Statement {
     Break,
     Continue,
     Throw(Expr),
-    Try {
-        stmts: Vec<Statement>,
-    },
-    Catch {
-        stmts: Vec<Statement>,
+    TryCatch {
+        try_stmts: Vec<Statement>,
+        catch_var: String,
+        catch_stmts: Vec<Statement>,
     },
     Comment(String),
+    /// A block of statements (used for orphan scopes)
+    Block {
+        stmts: Vec<Statement>,
+    },
 }
 
 /// Create an expression statement

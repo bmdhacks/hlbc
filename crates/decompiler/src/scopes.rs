@@ -1,3 +1,5 @@
+use hlbc::types::Reg;
+
 use crate::ast::{Constant, Expr, Statement};
 
 #[derive(Debug)]
@@ -28,8 +30,21 @@ pub(crate) enum ScopeData {
         start: usize,
         cond: Expr,
     },
-    Try,
-    Catch,
+    /// Try scope - opened by OTrap, closed by OEndTrap
+    Try {
+        /// Exception register from OTrap (will hold caught exception)
+        exc: Reg,
+        /// Absolute opcode index where catch block starts
+        catch_start: usize,
+    },
+    /// Catch scope - opened when we reach catch_start address
+    Catch {
+        /// Exception register (same as Try's exc) - stored for debugging
+        #[allow(dead_code)]
+        exc: Reg,
+        /// Statements from the closed Try scope
+        try_stmts: Vec<Statement>,
+    },
 }
 
 #[derive(Debug)]
@@ -70,10 +85,23 @@ impl Scope {
                 cond,
                 stmts: self.stmts,
             },
-            ScopeData::Try => Statement::Try { stmts: self.stmts },
-            ScopeData::Catch => Statement::Catch { stmts: self.stmts },
-            _ => {
-                unreachable!()
+            ScopeData::Try { .. } => {
+                // Try scope should be closed via close_try(), not make_stmt()
+                // If we get here, emit try block as a comment (unclosed try)
+                Statement::Comment(format!("unclosed try block with {} statements", self.stmts.len()))
+            }
+            ScopeData::Catch { try_stmts, .. } => Statement::TryCatch {
+                try_stmts,
+                catch_var: "e".to_string(),
+                catch_stmts: self.stmts,
+            },
+            ScopeData::Root => {
+                // Root scope shouldn't be converted to statement - wrap in a block
+                Statement::Block { stmts: self.stmts }
+            }
+            ScopeData::SwitchCase { pattern } => {
+                // SwitchCase should be merged into parent Switch, not standalone
+                Statement::Comment(format!("orphan switch case: {:?}", pattern))
             }
         }
     }
@@ -98,47 +126,101 @@ impl Scopes {
 
     pub(crate) fn advance(&mut self) {
         let mut stmt = None;
+
+        // Phase 1: Identify scopes that need to close (len == 1)
+        // and decrement others, but don't modify the vector yet
+        let mut to_close: Vec<usize> = Vec::new();
         for i in (0..self.scopes.len()).rev() {
             if matches!(self.scopes[i].ty, ScopeType::Len(len) if len == 1) {
-                let mut scope = self.scopes.remove(i);
-                if let Some(stmt) = stmt.take() {
-                    scope.stmts.push(stmt);
-                }
-                // Exception for Switch where a switch scope can be closed with a switch case open
-                if let ScopeData::Switch { cases, .. } = &mut scope.data {
-                    let case = self.scopes.remove(i);
-                    if let ScopeData::SwitchCase { pattern } = case.data {
-                        cases.push((pattern, case.stmts));
+                to_close.push(i);
+            } else if let ScopeType::Len(ref mut len) = self.scopes[i].ty {
+                *len -= 1;
+            }
+        }
+
+        // Phase 2: Process closures from highest index to lowest (safe removal order)
+        // Note: to_close is already in descending order from the rev() iteration
+        for i in to_close {
+            // Safety check: ensure index is still valid after previous removals
+            if i >= self.scopes.len() {
+                continue;
+            }
+
+            let mut scope = self.scopes.remove(i);
+            if let Some(s) = stmt.take() {
+                scope.stmts.push(s);
+            }
+
+            // Exception for Switch: close any remaining nested scopes and SwitchCase
+            // After removing the Switch at i, all scopes that were above it are now at index >= i
+            // We need to close them and collect the final SwitchCase
+            if let ScopeData::Switch { cases, .. } = &mut scope.data {
+                // Close all scopes above where Switch was, from highest index to lowest
+                while self.scopes.len() > i {
+                    let inner_scope = self.scopes.pop().unwrap();
+                    match inner_scope.data {
+                        ScopeData::SwitchCase { pattern } => {
+                            // Found the last case - add it to the switch's cases
+                            cases.push((pattern, inner_scope.stmts));
+                        }
+                        _ => {
+                            // It's a nested scope - convert to statement
+                            // and add to the scope below (which might be the SwitchCase)
+                            let inner_stmt = inner_scope.make_stmt();
+                            if self.scopes.len() > i {
+                                self.scopes.last_mut().unwrap().stmts.push(inner_stmt);
+                            } else {
+                                // No more scopes above - add to switch's default
+                                scope.stmts.push(inner_stmt);
+                            }
+                        }
                     }
                 }
-                stmt = Some(scope.make_stmt());
-            } else {
-                let scope = &mut self.scopes[i];
-                if let Some(stmt) = stmt.take() {
-                    scope.stmts.push(stmt);
-                }
-                match &mut scope.ty {
-                    ScopeType::Len(len) => {
-                        *len -= 1;
-                    }
-                    ScopeType::Manual => {}
-                }
+            }
+
+            stmt = Some(scope.make_stmt());
+        }
+
+        // Phase 3: Push any remaining statement to the current scope
+        if let Some(s) = stmt {
+            if let Some(scope) = self.scopes.last_mut() {
+                scope.stmts.push(s);
             }
         }
     }
 
     pub(crate) fn statements(mut self) -> Vec<Statement> {
+        // Gracefully handle unclosed scopes by folding them into the result
+        let mut result = Vec::new();
+
+        // If there are remaining scopes beyond root, try to close them gracefully
+        while self.scopes.len() > 1 {
+            let scope = self.scopes.pop().unwrap();
+            // Add a comment about the unclosed scope
+            result.push(Statement::Comment(format!(
+                "unclosed scope: {:?}",
+                std::mem::discriminant(&scope.data)
+            )));
+            // Try to include statements from the unclosed scope
+            result.extend(scope.stmts);
+        }
+
+        // Now get the root scope
         if let Some(Scope { stmts, data, .. }) = self.scopes.pop() {
             if matches!(data, ScopeData::Root) {
-                stmts
+                // Prepend root statements, then add any from unclosed scopes
+                let mut final_result = stmts;
+                final_result.extend(result);
+                final_result
             } else {
-                panic!(
-                    "Remaining scopes other than the root scope :\n{:#?}",
-                    self.scopes
-                );
+                // Even the last scope isn't Root - unusual but handle it
+                result.push(Statement::Comment("unexpected final scope (not Root)".to_string()));
+                result.extend(stmts);
+                result
             }
         } else {
-            panic!("No remaining scopes ? Not even the root scope ?");
+            // No scopes at all - return empty with a comment
+            vec![Statement::Comment("no scopes found".to_string())]
         }
     }
 
@@ -148,22 +230,34 @@ impl Scopes {
     }
 
     pub(crate) fn push_else(&mut self, len: i32) {
-        let (if_cond, stmts) = self
+        // Try to find the matching If scope
+        let if_data = self
             .scopes
             .pop()
             .and_then(|s| match s.data {
                 ScopeData::If { cond } => Some((cond, s.stmts)),
-                _ => None,
-            })
-            .expect("Else without If ?");
+                _ => {
+                    // Not an If - put it back
+                    self.scopes.push(s);
+                    None
+                }
+            });
 
-        self.scopes.push(Scope::new(
-            ScopeType::Len(len),
-            ScopeData::Else {
-                if_cond,
-                if_stmts: stmts,
-            },
-        ));
+        if let Some((if_cond, stmts)) = if_data {
+            self.scopes.push(Scope::new(
+                ScopeType::Len(len),
+                ScopeData::Else {
+                    if_cond,
+                    if_stmts: stmts,
+                },
+            ));
+        } else {
+            // No matching If - emit a comment instead
+            self.last_mut().stmts.push(Statement::Comment(format!(
+                "else block (len={}) without matching if",
+                len
+            )));
+        }
     }
 
     pub(crate) fn push_switch(&mut self, len: i32, arg: Expr, offsets: Vec<usize>) {
@@ -178,36 +272,54 @@ impl Scopes {
     }
 
     pub(crate) fn push_switch_case(&mut self, cst: usize) {
-        // End the previous switch case scope
-        let previous = {
-            let scope = self.scopes.pop().unwrap();
-            match scope.data {
-                ScopeData::SwitchCase { pattern } => Some((pattern, scope.stmts)),
-                _ => {
-                    self.scopes.push(scope);
-                    None
-                }
-            }
+        // Find the Switch scope in the stack
+        let switch_idx = self.scopes.iter().rposition(|s| {
+            matches!(s.data, ScopeData::Switch { .. })
+        });
+
+        let Some(switch_idx) = switch_idx else {
+            // No switch context found - emit a comment
+            self.last_mut().stmts.push(Statement::Comment(format!(
+                "switch case {} (no outer switch context)",
+                cst
+            )));
+            return;
         };
 
-        let scope = self.scopes.last_mut().unwrap();
-        match &mut scope.data {
-            ScopeData::Switch { cases, .. } => {
-                if let Some(previous) = previous {
-                    cases.push(previous);
+        // Close all scopes above the switch (nested loops, ifs, etc.) and merge into current case
+        // These are scopes that were opened inside the previous case and haven't closed yet
+        while self.scopes.len() > switch_idx + 1 {
+            let inner_scope = self.scopes.pop().unwrap();
+            match inner_scope.data {
+                ScopeData::SwitchCase { pattern } => {
+                    // Found the previous case - add it to the switch's cases
+                    if let ScopeData::Switch { cases, .. } = &mut self.scopes[switch_idx].data {
+                        cases.push((pattern, inner_scope.stmts));
+                    }
                 }
-
-                self.scopes.push(Scope::new(
-                    ScopeType::Manual,
-                    ScopeData::SwitchCase {
-                        pattern: Expr::Constant(Constant::InlineInt(cst)),
-                    },
-                ));
-            }
-            _ => {
-                panic!("Pushing a switch case with no outer switch !");
+                _ => {
+                    // It's a nested scope (loop, if, etc.) - convert to statement
+                    // and add to whatever is now on top
+                    let stmt = inner_scope.make_stmt();
+                    if self.scopes.len() > switch_idx + 1 {
+                        // Add to the scope below (which might be the SwitchCase)
+                        self.scopes.last_mut().unwrap().stmts.push(stmt);
+                    } else {
+                        // We're at the switch level - this shouldn't happen often,
+                        // but if it does, add to default case
+                        self.scopes[switch_idx].stmts.push(stmt);
+                    }
+                }
             }
         }
+
+        // Now push the new SwitchCase
+        self.scopes.push(Scope::new(
+            ScopeType::Manual,
+            ScopeData::SwitchCase {
+                pattern: Expr::Constant(Constant::InlineInt(cst)),
+            },
+        ));
     }
 
     pub(crate) fn push_loop(&mut self, start: usize) {
@@ -215,19 +327,49 @@ impl Scopes {
             ScopeType::Manual,
             ScopeData::Loop {
                 start,
-                cond: Expr::Unknown("no condition".to_owned()),
+                cond: Expr::Constant(Constant::Bool(true)),
             },
         ))
     }
 
-    pub(crate) fn push_try(&mut self, len: i32) {
-        self.scopes
-            .push(Scope::new(ScopeType::Len(len), ScopeData::Try))
+    /// Push a try scope. Closed explicitly by OEndTrap handler.
+    pub(crate) fn push_try(&mut self, exc: Reg, catch_start: usize) {
+        self.scopes.push(Scope::new(
+            ScopeType::Manual, // Don't use Len - we close explicitly on OEndTrap
+            ScopeData::Try { exc, catch_start },
+        ))
     }
 
-    pub(crate) fn push_catch(&mut self, len: i32) {
-        self.scopes
-            .push(Scope::new(ScopeType::Len(len), ScopeData::Catch))
+    /// Push a catch scope. Uses Len-based scope type since catch length is known.
+    pub(crate) fn push_catch(&mut self, exc: Reg, len: i32, try_stmts: Vec<Statement>) {
+        self.scopes.push(Scope::new(
+            ScopeType::Len(len),
+            ScopeData::Catch { exc, try_stmts },
+        ))
+    }
+
+    /// Find and close the innermost Try scope, returning its data.
+    /// Also closes any nested scopes inside the try.
+    pub(crate) fn close_try(&mut self) -> Option<(Reg, usize, Vec<Statement>)> {
+        // Find the innermost Try scope
+        let try_idx = self.scopes.iter().rposition(|s| {
+            matches!(s.data, ScopeData::Try { .. })
+        })?;
+
+        // Close any scopes nested inside the try
+        while self.scopes.len() > try_idx + 1 {
+            let inner = self.scopes.pop().unwrap();
+            let stmt = inner.make_stmt();
+            self.scopes[try_idx].stmts.push(stmt);
+        }
+
+        // Close the try scope itself
+        let try_scope = self.scopes.pop().unwrap();
+        if let ScopeData::Try { exc, catch_start } = try_scope.data {
+            Some((exc, catch_start, try_scope.stmts))
+        } else {
+            None
+        }
     }
 
     //region QUERIES
@@ -247,24 +389,72 @@ impl Scopes {
         })
     }
 
-    /// End the last scope if its a loop
+    /// End the innermost loop scope, closing any nested scopes inside it first.
+    /// This handles cases where there are If/Switch scopes inside the loop that
+    /// haven't been closed yet when we hit the backward JAlways.
     pub(crate) fn end_last_loop(&mut self) -> Option<Statement> {
-        self.scopes.pop().and_then(|s| match s.data {
-            ScopeData::Loop { .. } => Some(s.make_stmt()),
-            _ => None,
-        })
+        // Find the innermost loop scope
+        let loop_idx = self
+            .scopes
+            .iter()
+            .rposition(|s| matches!(s.data, ScopeData::Loop { .. }))?;
+
+        // Close all scopes that are inside the loop (on top of it in the stack)
+        // and collect them into the loop's body
+        while self.scopes.len() > loop_idx + 1 {
+            let inner_scope = self.scopes.pop().unwrap();
+
+            match inner_scope.data {
+                ScopeData::SwitchCase { pattern } => {
+                    // Find the parent Switch scope and merge this case into it
+                    let switch_idx = self.scopes[loop_idx..].iter().rposition(|s| {
+                        matches!(s.data, ScopeData::Switch { .. })
+                    }).map(|i| loop_idx + i);
+
+                    if let Some(switch_idx) = switch_idx {
+                        if let ScopeData::Switch { cases, .. } = &mut self.scopes[switch_idx].data {
+                            cases.push((pattern, inner_scope.stmts));
+                            continue;
+                        }
+                    }
+                    // No Switch found - emit as orphan comment
+                    self.scopes[loop_idx].stmts.push(Statement::Comment(
+                        format!("orphan switch case in loop: {:?}", pattern)
+                    ));
+                }
+                _ => {
+                    // Regular scope - convert to statement
+                    let inner_stmt = inner_scope.make_stmt();
+                    // Add to the scope that's now on top (might be another nested scope)
+                    if self.scopes.len() > loop_idx + 1 {
+                        self.scopes.last_mut().unwrap().stmts.push(inner_stmt);
+                    } else {
+                        self.scopes[loop_idx].stmts.push(inner_stmt);
+                    }
+                }
+            }
+        }
+
+        // Now the loop is at the top, pop and return it
+        self.scopes.pop().map(|s| s.make_stmt())
     }
 
-    /// Returns the switch jump offsets if the current scope is a switch (or a switch case)
+    /// Returns the switch jump offsets if we're currently inside a switch context
+    /// (either directly in a Switch scope, in a SwitchCase, or in nested scopes inside a switch)
     pub(crate) fn last_is_switch_ctx(&self) -> Option<&[usize]> {
-        self.scopes.last().and_then(|s| match &s.data {
-            ScopeData::Switch { offsets, .. } => Some(offsets.as_slice()),
-            ScopeData::SwitchCase { .. } => match &self.scopes[self.scopes.len() - 2].data {
-                ScopeData::Switch { offsets, .. } => Some(offsets.as_slice()),
-                _ => None,
-            },
-            _ => None,
-        })
+        // Search from innermost to outermost for a Switch context
+        for scope in self.scopes.iter().rev() {
+            match &scope.data {
+                ScopeData::Switch { offsets, .. } => return Some(offsets.as_slice()),
+                ScopeData::SwitchCase { .. } => {
+                    // Found a SwitchCase, the Switch should be right below it
+                    // Continue searching to find the parent Switch
+                    continue;
+                }
+                _ => continue,
+            }
+        }
+        None
     }
 
     pub(crate) fn last_is_if(&self) -> bool {
@@ -276,6 +466,11 @@ impl Scopes {
 
     pub(crate) fn has_scopes(&self) -> bool {
         self.scopes.len() > 1
+    }
+
+    /// Get a mutable reference to the last (innermost) scope
+    pub(crate) fn last_mut(&mut self) -> &mut Scope {
+        self.scopes.last_mut().expect("No scopes available")
     }
     //endregion
 }

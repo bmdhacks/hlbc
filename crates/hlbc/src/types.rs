@@ -68,7 +68,9 @@ pub struct ObjProto {
     pub name: RefString,
     /// Function bound to this method
     pub findex: RefFun,
-    /// Don't know what this is used for
+    /// Position in the runtime vtable (vobj_proto). Methods with the same pindex
+    /// across inheritance override each other. -1 means not in vtable (private/static).
+    /// CallMethod.p2 uses this index to lookup methods at runtime.
     pub pindex: i32,
 }
 
@@ -276,8 +278,27 @@ impl RefType {
         self.as_obj(ctx).map(|obj| &obj.fields[field.0])
     }
 
-    pub fn method<'a>(&self, meth: usize, ctx: &'a Bytecode) -> Option<&'a ObjProto> {
-        self.as_obj(ctx).map(|obj| &obj.protos[meth])
+    /// Resolve a method by vtable index (pindex), walking inheritance chain.
+    /// The method index from CallMethod.p2 is a pindex (position in runtime vtable),
+    /// not an array index into protos.
+    pub fn method<'a>(&self, vtable_idx: usize, ctx: &'a Bytecode) -> Option<&'a ObjProto> {
+        let mut current_type = Some(*self);
+
+        while let Some(type_ref) = current_type {
+            if let Some(obj) = type_ref.as_obj(ctx) {
+                // Search this type's protos for matching pindex
+                for proto in &obj.protos {
+                    if proto.pindex >= 0 && proto.pindex as usize == vtable_idx {
+                        return Some(proto);
+                    }
+                }
+                // Not found in this type, try parent
+                current_type = obj.super_;
+            } else {
+                break;
+            }
+        }
+        None
     }
 }
 

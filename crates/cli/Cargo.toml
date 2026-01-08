@@ -43,8 +43,10 @@ webbrowser = { workspace = true }
 winresource = { workspace = true }
 
 [features]
-default = ["graph", "watch"]
+default = ["graph", "watch", "batch"]
 # Generate a callgraph
 graph = ["hlbc/graph"]
 # Watch for file changes
 watch = ["notify", "notify-debouncer-mini"]
+# Batch decompilation
+batch = ["hlbc-decompiler/batch"]
