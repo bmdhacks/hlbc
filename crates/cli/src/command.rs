@@ -76,11 +76,13 @@ pub struct ParseContext {
 }
 
 /// Parse a command
+#[allow(dead_code)]
 pub fn parse_command(ctx: &ParseContext, line: &str) -> Result<Command, Vec<Simple<char>>> {
     command_parser(ctx).padded().parse(line)
 }
 
 /// Parse a list of command separated by ';'
+#[allow(dead_code)]
 pub fn parse_commands(ctx: &ParseContext, line: &str) -> Result<Vec<Command>, Vec<Simple<char>>> {
     commands_parser(ctx).parse(line)
 }
