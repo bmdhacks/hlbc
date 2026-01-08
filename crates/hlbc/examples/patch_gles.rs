@@ -4,12 +4,18 @@
 // Patches:
 // 1. glES = 3.1 (opcode 15: Float -1 -> 3.1)
 // 2. shaderVersion = 310 (opcode 168: Call math_round -> Int 310)
-// 3. CacheFile::load - skip shader cache entirely (opcodes 5 and 70: conditional -> unconditional jumps)
-// 4. CacheFile::compileRuntimeShader - force allowCompile = true (opcode 4: GetThis -> Bool true)
-// 5. GlDriver constructor - remove gl.enable(GL_TEXTURE_CUBE_MAP_SEAMLESS) (opcode 174: Call1 -> Nop)
-// 6. FileSystem::addPak - skip stampHash verification (opcode 12: JEq -> JAlways)
-// 7. Rename "sample" -> "_sample" (GLSL ES 3.10 reserved keyword)
-// 8. GlDriver::resetStream - reduce streamKeep retention 2->1 frame (opcode 21: Int 1 -> Int 0)
+// 3. GlDriver constructor - remove gl.enable(GL_TEXTURE_CUBE_MAP_SEAMLESS) (opcode 174: Call1 -> Nop)
+// 4. FileSystem::addPak - skip stampHash verification (opcode 12: JEq -> JAlways)
+// 5. Rename "sample" -> "_sample" (GLSL ES 3.10 reserved keyword) in string table
+// 6. GlDriver::resetStream - reduce streamKeep retention 2->1 frame (opcode 21: Int 1 -> Int 0)
+// 7. Patch "y6:sample" -> "y6:sampl_" in bytes constants (serialized shader AST data)
+//
+// Optional (disabled by default - enable BYPASS_SHADER_CACHE to use):
+// - CacheFile::load - skip shader cache entirely (forces runtime shader compilation)
+// - CacheFile::compileRuntimeShader - force allowCompile = true
+
+// Set to true to bypass shader cache and force runtime recompilation
+const BYPASS_SHADER_CACHE: bool = true;
 
 use hlbc::opcodes::Opcode;
 use hlbc::types::{RefFloat, RefInt, Reg};
@@ -57,12 +63,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gles_patched = false;
     let mut version_patched = false;
     let mut seamless_patched = false;
-    let mut cache_load_patched = false;
-    let mut cache_compile_patched = false;
     let mut stamphash_patched = false;
     let mut sample_patched = false;
     let mut precision_patched = false;
     let mut streamkeep_patched = false;
+    let mut shader_bytes_patched = 0usize;
+
+    // Shader cache bypass patches (only used when BYPASS_SHADER_CACHE is true)
+    let mut cache_load_patched = !BYPASS_SHADER_CACHE;  // Skip check if disabled
+    let mut cache_compile_patched = !BYPASS_SHADER_CACHE;  // Skip check if disabled
 
     // Patch 7: Rename "sample" to "_sample" - reserved keyword in GLSL ES 3.10
     // String S30125 = "sample" is used as a shader variable name
@@ -100,21 +109,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("String table too small, can't find index {}", precision_string_idx);
     }
 
+    // Patch 9: Replace "y6:sample" with "y6:sampl_" in serialized shader strings
+    // The shader AST is stored as Haxe-serialized strings (not bytes constants)
+    // Variable names are embedded as "y6:sample" (Haxe serialization format)
+    // Using "sampl_" (6 chars) keeps same length as "sample" for in-place replacement
+    let old_pattern = "y6:sample";
+    let new_pattern = "y6:sampl_";
+
+    for (idx, s) in code.strings.iter_mut().enumerate() {
+        if s.contains(old_pattern) {
+            let new_str = s.replace(old_pattern, new_pattern);
+            let count = s.matches(old_pattern).count();
+            *s = new_str.into();
+            println!("Patched string S{}: {} occurrence(s) of 'y6:sample' -> 'y6:sampl_'", idx, count);
+            shader_bytes_patched += count;
+        }
+    }
+    if shader_bytes_patched > 0 {
+        println!("Total: patched {} occurrences of 'y6:sample' in shader strings", shader_bytes_patched);
+    }
+
     // Target functions
     let gldriver_findex = 30349;  // GlDriver constructor
-    let cachefile_load_findex = 5996;  // CacheFile::load
-    let cachefile_compile_findex = 6012;  // CacheFile::compileRuntimeShader
     let filesystem_addpak_findex = 6318;  // FileSystem::addPak
     let resetstream_findex = 30328;  // GlDriver::resetStream
+    let cachefile_load_findex = 5996;  // CacheFile::load
+    let cachefile_compile_findex = 6012;  // CacheFile::compileRuntimeShader
 
     for fun in code.functions.iter_mut() {
-        // Patch 3: CacheFile::load - skip shader cache entirely
-        // Opcode 5: OJFalse 1, 63, 0 -> OJAlways 63, 0, 0  (skip loadShaders even if file exists)
-        // Opcode 70: OJTrue 1, 4, 0 -> OJAlways 4, 0, 0   (skip "Missing" throw)
-        if fun.findex.0 == cachefile_load_findex {
+        // Optional: CacheFile::load - skip shader cache entirely
+        // Only applied when BYPASS_SHADER_CACHE is true
+        if BYPASS_SHADER_CACHE && fun.findex.0 == cachefile_load_findex {
             println!("Found CacheFile::load at findex {}", cachefile_load_findex);
 
-            // Patch 3a: Skip loadShaders() - pretend file never exists
+            // Patch: Skip loadShaders() - pretend file never exists
+            // Opcode 5: OJFalse 1, 63, 0 -> OJAlways 63, 0, 0
             if fun.ops.len() > 5 {
                 match &fun.ops[5] {
                     Opcode::JFalse { cond, offset } => {
@@ -122,8 +151,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             "Opcode 5: JFalse cond={} offset={} (file exists check)",
                             cond.0, offset
                         );
-
-                        // Change conditional jump to unconditional - always skip cache loading
                         fun.ops[5] = Opcode::JAlways { offset: *offset };
                         println!("Patched opcode 5: JFalse -> JAlways (skip cache loading)");
                     }
@@ -134,7 +161,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // Patch 3b: Skip "Missing" throw - pretend allowCompile is always true
+            // Patch: Skip "Missing" throw - pretend allowCompile is always true
+            // Opcode 70: OJTrue 1, 4, 0 -> OJAlways 4, 0, 0
             if fun.ops.len() > 70 {
                 match &fun.ops[70] {
                     Opcode::JTrue { cond, offset } => {
@@ -142,8 +170,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             "Opcode 70: JTrue cond={} offset={} (allowCompile check)",
                             cond.0, offset
                         );
-
-                        // Change conditional jump to unconditional jump
                         fun.ops[70] = Opcode::JAlways { offset: *offset };
                         println!("Patched opcode 70: JTrue -> JAlways (skip Missing throw)");
                         cache_load_patched = true;
@@ -156,12 +182,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Patch 4: CacheFile::compileRuntimeShader - force allowCompile = true
-        // Opcode 4: OGetThis 3, 4, 0 -> OBool 3, 1, 0 (r3 = true instead of reading allowCompile)
-        // This prevents infinite recursion when allowCompile is false
-        if fun.findex.0 == cachefile_compile_findex {
+        // Optional: CacheFile::compileRuntimeShader - force allowCompile = true
+        // Only applied when BYPASS_SHADER_CACHE is true
+        if BYPASS_SHADER_CACHE && fun.findex.0 == cachefile_compile_findex {
             println!("Found CacheFile::compileRuntimeShader at findex {}", cachefile_compile_findex);
 
+            // Opcode 4: OGetThis 3, 4, 0 -> OBool 3, 1, 0 (r3 = true)
             if fun.ops.len() > 4 {
                 match &fun.ops[4] {
                     Opcode::GetThis { dst, field } => {
@@ -169,8 +195,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             "Opcode 4: GetThis dst={} field={} (reading allowCompile)",
                             dst.0, field.0
                         );
-
-                        // Change to: r3 = true (pretend allowCompile is always true)
                         fun.ops[4] = Opcode::Bool { dst: dst.clone(), value: true };
                         println!("Patched opcode 4: GetThis -> Bool true (allowCompile = true)");
                         cache_compile_patched = true;
@@ -183,7 +207,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Patch 6: FileSystem::addPak - skip stampHash verification
+        // Patch 4: FileSystem::addPak - skip stampHash verification
         // Opcode 12: OJEq 8, 9, 1 -> OJAlways 1, 0, 0 (always skip to continue loading)
         // This bypasses the res.pak stampHash check that ties pak files to specific game builds
         if fun.findex.0 == filesystem_addpak_findex {
@@ -210,7 +234,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Patch 8: GlDriver::resetStream - reduce streamKeep retention from 2 frames to 1 frame
+        // Patch 6: GlDriver::resetStream - reduce streamKeep retention from 2 frames to 1 frame
         // Original: streamKeep[0].f < frame - 1 (keep buffers for 2 frames)
         // Patched:  streamKeep[0].f < frame     (keep buffers for 1 frame)
         // Opcode 21: OInt 7, 13, 0 (r7 = 1) -> OInt 7, 1, 0 (r7 = 0)
@@ -333,7 +357,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Exit early once all function patches are applied
-        if gles_patched && version_patched && seamless_patched && cache_load_patched && cache_compile_patched && stamphash_patched && streamkeep_patched {
+        if gles_patched && version_patched && seamless_patched && stamphash_patched && streamkeep_patched && cache_load_patched && cache_compile_patched {
             break;
         }
     }
@@ -374,6 +398,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Failed to patch GlDriver::resetStream (streamKeep retention)");
         std::process::exit(1);
     }
+    if shader_bytes_patched == 0 {
+        eprintln!("Warning: No 'y6:sample' found in bytes constants (expected 2 in shader AST data)");
+    } else if shader_bytes_patched < 2 {
+        eprintln!("Warning: Only {} 'y6:sample' found in bytes (expected 2)", shader_bytes_patched);
+    }
 
     println!("\nWriting patched bytecode to {}...", output_path);
     let mut file = std::fs::File::create(output_path)?;
@@ -383,11 +412,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  - glES = 3.1 (forces GLES mode)");
     println!("  - shaderVersion = 310 (outputs '#version 310 es')");
     println!("  - gl.enable(GL_TEXTURE_CUBE_MAP_SEAMLESS) removed (not supported on GLES)");
-    println!("  - CacheFile::load skips cache entirely (forces runtime shader compilation)");
-    println!("  - CacheFile::compileRuntimeShader: allowCompile = true (prevents infinite recursion)");
     println!("  - FileSystem::addPak: stampHash bypass (allows modified res.pak files)");
-    println!("  - 'sample' -> '_sample' (GLSL ES 3.10 reserved keyword)");
+    println!("  - 'sample' -> '_sample' in string table (GLSL ES 3.10 reserved keyword)");
+    println!("  - 'y6:sample' -> 'y6:sampl_' in {} bytes constants (serialized shader AST)", shader_bytes_patched);
     println!("  - 'precision mediump float;' -> 'precision highp float;' (better accuracy)");
     println!("  - GlDriver::resetStream: streamKeep retention 2->1 frame (reduces memory)");
+    if BYPASS_SHADER_CACHE {
+        println!("  - CacheFile::load: shader cache bypassed (forces runtime compilation)");
+        println!("  - CacheFile::compileRuntimeShader: allowCompile forced true");
+    }
     Ok(())
 }
