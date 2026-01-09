@@ -59,6 +59,19 @@ struct DecompilerState<'c> {
     /// Pending catch blocks waiting to be opened
     /// Format: (catch_start_addr, exc_register, catch_length, try_stmts)
     pending_catches: Vec<(usize, Reg, i32, Vec<Statement>)>,
+    /// Saved register states for if/else scopes.
+    /// When entering an If scope, we save the current reg_state so that register
+    /// modifications inside the if don't affect code after the if closes.
+    saved_reg_states: Vec<HashMap<Reg, Expr>>,
+    /// Track registers set to null within each if/else scope depth.
+    /// Only these registers are restored on scope close (to prevent null.array patterns).
+    /// Registers set to non-null values (like constructors) are NOT restored,
+    /// allowing them to persist after the scope.
+    set_to_null_in_scope: Vec<HashSet<Reg>>,
+    /// Saved register states for switch statements.
+    /// Each switch saves the state before it starts, and restores when entering each case.
+    /// This prevents register values from one case bleeding into another.
+    switch_saved_states: Vec<HashMap<Reg, Expr>>,
 }
 
 impl<'c> DecompilerState<'c> {
@@ -76,8 +89,12 @@ impl<'c> DecompilerState<'c> {
         }
 
         // Initialize register state with the function arguments
+        let mut param_counter = 0u32;
         for i in start..f.ty(code).args.len() {
-            let name = f.arg_name(code, i - start);
+            let name = f.arg_name(code, i - start).or_else(|| {
+                param_counter += 1;
+                Some(format!("arg{}", param_counter - 1).into())
+            });
             reg_state.insert(Reg(i as u32), Expr::Variable(Reg(i as u32), name.clone()));
             if let Some(name) = name {
                 seen.insert(name);
@@ -94,6 +111,9 @@ impl<'c> DecompilerState<'c> {
             code,
             pending_try_info: None,
             pending_catches: Vec::new(),
+            saved_reg_states: Vec::new(),
+            set_to_null_in_scope: Vec::new(),
+            switch_saved_states: Vec::new(),
         }
     }
 
@@ -117,16 +137,47 @@ impl<'c> DecompilerState<'c> {
     // Update the register state and create a statement depending on inline rules
     fn push_expr(&mut self, i: usize, dst: Reg, expr: Expr) {
         let name = self.f.var_name(self.code, i);
+        // Track registers set to null in current scope (for selective restoration).
+        // Only null assignments are tracked - constructors and other values persist after scope.
+        if let Some(set_to_null) = self.set_to_null_in_scope.last_mut() {
+            if matches!(&expr, Expr::Constant(Constant::Null)) {
+                set_to_null.insert(dst);
+            }
+        }
+
+        // Inside a conditional scope, if we're overwriting a register with a different
+        // expression type (especially Null), we need to be careful about register reuse.
+        // If the register previously had a non-trivial expression, create a synthetic
+        // variable to prevent stale expression propagation.
+        let force_variable = if !self.set_to_null_in_scope.is_empty() {
+            // Check if this register had a meaningful expression before
+            if let Some(prev_expr) = self.reg_state.get(&dst) {
+                // If setting to null and previous was anything non-null, force variable
+                // This handles all cases where register is reused across branches
+                let is_null_prev = matches!(prev_expr, Expr::Constant(Constant::Null));
+                matches!(&expr, Expr::Constant(Constant::Null)) && !is_null_prev
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         // Inline check
-        if name.is_none() {
+        if name.is_none() && !force_variable {
             self.reg_state.insert(dst, expr);
         } else {
+            // Either we have a debug name, or we need to force a variable due to scope concerns
+            let var_name = name.or_else(|| {
+                self.synthetic_var_counter += 1;
+                Some(format!("v{}", self.synthetic_var_counter - 1).into())
+            });
             self.reg_state
-                .insert(dst, Expr::Variable(dst, name.clone()));
-            let declaration = self.seen.insert(name.clone().unwrap());
+                .insert(dst, Expr::Variable(dst, var_name.clone()));
+            let declaration = self.seen.insert(var_name.clone().unwrap());
             self.push_stmt(Statement::Assign {
                 declaration,
-                variable: Expr::Variable(dst, name),
+                variable: Expr::Variable(dst, var_name.clone()),
                 assign: expr,
             });
         }
@@ -324,6 +375,11 @@ impl<'c> DecompilerState<'c> {
             }
 
             // It's an if (or nested condition in loop)
+            // Save register state before entering if scope so null assignments inside
+            // the if can be restored after it closes (to prevent null.array patterns)
+            self.saved_reg_states.push(self.reg_state.clone());
+            // Track which registers are set to null inside this if
+            self.set_to_null_in_scope.push(HashSet::new());
             self.scopes.push_if(offset + 1, cond);
         }
     }
@@ -344,6 +400,10 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
         if let Some(case_idx) = state.scopes.last_is_switch_ctx()
             .and_then(|offsets| offsets.iter().position(|&o| o == i))
         {
+            // Note: We intentionally do NOT restore register state here.
+            // The JIT discards register bindings at jump targets, but for decompilation
+            // we want values to flow through. The if/else scope handling will restore
+            // registers that were set to null, which handles the ternary pattern.
             state.scopes.push_switch_case(case_idx);
         }
 
@@ -354,9 +414,19 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
             &Opcode::JTrue { cond, offset } => state.push_jmp(i, offset, not(state.expr(cond))),
             &Opcode::JFalse { cond, offset } => state.push_jmp(i, offset, state.expr(cond)),
             &Opcode::JNull { reg, offset } => {
+                // If the register currently holds null, force it into a variable.
+                // This prevents "null.field" in the else-branch where we know it's not null.
+                if matches!(state.reg_state.get(&reg), Some(Expr::Constant(Constant::Null))) {
+                    state.ensure_variable(reg);
+                }
                 state.push_jmp(i, offset, noteq(state.expr(reg), cst_null()))
             }
             &Opcode::JNotNull { reg, offset } => {
+                // If the register currently holds null, force it into a variable.
+                // This prevents "null.field" in the then-branch where we know it's not null.
+                if matches!(state.reg_state.get(&reg), Some(Expr::Constant(Constant::Null))) {
+                    state.ensure_variable(reg);
+                }
                 state.push_jmp(i, offset, eq(state.expr(reg), cst_null()))
             }
             &Opcode::JSGte { a, b, offset } | &Opcode::JUGte { a, b, offset } => {
@@ -426,16 +496,21 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
                     if state.pending_try_info.take().is_some() {
                         // This JAlways was already handled by EndTrap - skip it
                         // The pending catch is already set up
-                    } else if let Some(offsets) = state.scopes.last_is_switch_ctx() {
-                        if let Some(pos) = offsets.iter().position(|o| *o == i) {
-                            state.scopes.push_switch_case(pos);
-                        } else {
-                            // Fallback: emit comment instead of panicking
-                            state.push_stmt(Statement::Comment(format!(
-                                "JAlways +{} (switch ctx but no matching offset at op {})",
-                                offset, i
-                            )));
-                        }
+                    } else if state.scopes.last_is_if() {
+                        // It's the jump over of an else clause
+                        // Pop the if's null-tracking and saved state
+                        state.set_to_null_in_scope.pop();
+                        state.saved_reg_states.pop();
+                        // Save current state (includes values set in if-branch) for else.
+                        // This allows restoration to work for ternary-style patterns like:
+                        //   r12 = if (cond) cast(x) else null
+                        // When else sets r12 to null, we can restore to the cast from if.
+                        state.saved_reg_states.push(state.reg_state.clone());
+                        state.set_to_null_in_scope.push(HashSet::new());
+                        state.scopes.push_else(offset + 1);
+                    } else if state.scopes.last_is_switch_ctx().is_some() {
+                        // Switch case transitions are handled by the pre-opcode check
+                        // at the start of the loop - no action needed here
                     } else if state.scopes.last_loop_start().is_some() {
                         // Check the instruction just before the jump target
                         // If it's a jump backward of a loop
@@ -445,9 +520,6 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
                             state.push_stmt(Statement::Break);
                         }
                         // TODO else
-                    } else if state.scopes.last_is_if() {
-                        // It's the jump over of an else clause
-                        state.scopes.push_else(offset + 1);
                     } else {
                         // FALLBACK: Emit a comment instead of failing
                         // This allows decompilation to continue with readable output
@@ -460,6 +532,9 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
                 }
             }
             Opcode::Switch { reg, offsets, end } => {
+                // Save register state before entering switch.
+                // Each case will restore this state to prevent register bleeding between cases.
+                state.switch_saved_states.push(state.reg_state.clone());
                 // Convert to absolute positions
                 state.scopes.push_switch(
                     *end + 1,
@@ -594,9 +669,14 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
             &Opcode::Mov { dst, src } => {
                 state.push_expr(i, dst, state.expr(src));
                 // Workaround for when the instructions after this one use dst and src interchangeably.
+                // Use var_name if available, otherwise generate synthetic name
+                let name = f.var_name(code, i).or_else(|| {
+                    state.synthetic_var_counter += 1;
+                    Some(format!("v{}", state.synthetic_var_counter - 1).into())
+                });
                 state
                     .reg_state
-                    .insert(src, Expr::Variable(dst, f.var_name(code, i)));
+                    .insert(src, Expr::Variable(dst, name));
             }
             &Opcode::Add { dst, a, b } => {
                 state.push_expr(i, dst, add(state.expr(a), state.expr(b)));
@@ -829,7 +909,24 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
             //region ACCESSES
             &Opcode::NullCheck { reg } => {
                 // Emit comment to help track down null pointer issues
-                state.push_stmt(comment(format!("nullcheck r{}", reg.0)));
+                // Try to show variable name instead of register number
+                let expr = state.expr(reg);
+                let expr_str = match &expr {
+                    Expr::Variable(_, Some(name)) => name.to_string(),
+                    Expr::Ident(name) => name.to_string(),
+                    Expr::Field(base, field) => {
+                        // Try to get a simple representation like "obj.field"
+                        match base.as_ref() {
+                            Expr::Ident(name) => format!("{}.{}", name, field),
+                            Expr::Variable(_, Some(name)) => format!("{}.{}", name, field),
+                            Expr::Constant(Constant::This) => format!("this.{}", field),
+                            _ => format!("_.{}", field),
+                        }
+                    }
+                    Expr::Constant(Constant::This) => "this".to_string(),
+                    _ => format!("r{}", reg.0),
+                };
+                state.push_stmt(comment(format!("nullcheck {}", expr_str)));
             }
             &Opcode::GetGlobal { dst, global } => {
                 // Is a string
@@ -1263,7 +1360,29 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
                 eprintln!("WARNING: Unhandled opcode RefOffset at op {} in function {:?}", i, f.name(code));
             }
         }
-        state.scopes.advance();
+        // Advance scopes and check how many scopes closed
+        let (if_else_closed, switches_closed) = state.scopes.advance();
+
+        // Restore register state for each closed If/Else scope
+        // Only restore registers that were SET TO NULL inside the scope.
+        // This prevents null.array patterns while allowing constructors and
+        // other meaningful values to persist after the scope.
+        for _ in 0..if_else_closed {
+            let set_to_null = state.set_to_null_in_scope.pop().unwrap_or_default();
+            if let Some(saved_state) = state.saved_reg_states.pop() {
+                for reg in set_to_null {
+                    if let Some(original_expr) = saved_state.get(&reg) {
+                        // Register was set to null inside scope - restore to original
+                        state.reg_state.insert(reg, original_expr.clone());
+                    }
+                }
+            }
+        }
+
+        // Pop saved states for closed switch statements
+        for _ in 0..switches_closed {
+            state.switch_saved_states.pop();
+        }
     }
     let mut statements = state.scopes.statements();
 

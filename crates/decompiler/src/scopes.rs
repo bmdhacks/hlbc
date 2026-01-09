@@ -124,8 +124,12 @@ impl Scopes {
         self.scopes.last_mut().unwrap().stmts.push(stmt);
     }
 
-    pub(crate) fn advance(&mut self) {
+    /// Advance the scope counters and close any scopes that have reached their end.
+    /// Returns (if_else_closed, switches_closed) for register state restoration.
+    pub(crate) fn advance(&mut self) -> (usize, usize) {
         let mut stmt = None;
+        let mut if_else_closed = 0;
+        let mut switches_closed = 0;
 
         // Phase 1: Identify scopes that need to close (len == 1)
         // and decrement others, but don't modify the vector yet
@@ -151,10 +155,16 @@ impl Scopes {
                 scope.stmts.push(s);
             }
 
+            // Track If/Else closures for register state restoration
+            if matches!(scope.data, ScopeData::If { .. } | ScopeData::Else { .. }) {
+                if_else_closed += 1;
+            }
+
             // Exception for Switch: close any remaining nested scopes and SwitchCase
             // After removing the Switch at i, all scopes that were above it are now at index >= i
             // We need to close them and collect the final SwitchCase
             if let ScopeData::Switch { cases, .. } = &mut scope.data {
+                switches_closed += 1;
                 // Close all scopes above where Switch was, from highest index to lowest
                 while self.scopes.len() > i {
                     let inner_scope = self.scopes.pop().unwrap();
@@ -162,6 +172,16 @@ impl Scopes {
                         ScopeData::SwitchCase { pattern } => {
                             // Found the last case - add it to the switch's cases
                             cases.push((pattern, inner_scope.stmts));
+                        }
+                        ScopeData::If { .. } | ScopeData::Else { .. } => {
+                            // Track nested If/Else closures too
+                            if_else_closed += 1;
+                            let inner_stmt = inner_scope.make_stmt();
+                            if self.scopes.len() > i {
+                                self.scopes.last_mut().unwrap().stmts.push(inner_stmt);
+                            } else {
+                                scope.stmts.push(inner_stmt);
+                            }
                         }
                         _ => {
                             // It's a nested scope - convert to statement
@@ -187,6 +207,8 @@ impl Scopes {
                 scope.stmts.push(s);
             }
         }
+
+        (if_else_closed, switches_closed)
     }
 
     pub(crate) fn statements(mut self) -> Vec<Statement> {

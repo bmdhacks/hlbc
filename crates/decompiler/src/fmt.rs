@@ -48,6 +48,18 @@ impl FormatOptions {
         }
     }
 
+    /// Create format options with only function indices (useful for cross-referencing)
+    pub fn with_fun_indices(inc_indent: usize) -> Self {
+        Self {
+            indent: "",
+            inc_indent,
+            show_type_indices: false,
+            show_fun_indices: true,
+            show_field_indices: false,
+            show_string_indices: false,
+        }
+    }
+
     pub fn inc_nesting(&self) -> Self {
         FormatOptions {
             indent: &INDENT[..self.indent.len() + self.inc_indent],
@@ -66,14 +78,24 @@ fn to_haxe_type<'a>(ty: &Type, ctx: &'a Bytecode) -> impl Display + 'a {
     use crate::Type::*;
     match ty {
         Void => Str::from_static("Void"),
+        UI8 => Str::from_static("hl.UI8"),
+        UI16 => Str::from_static("hl.UI16"),
         I32 => Str::from_static("Int"),
+        I64 => Str::from_static("hl.I64"),
+        F32 => Str::from_static("Single"),
         F64 => Str::from_static("Float"),
         Bool => Str::from_static("Bool"),
         Bytes => Str::from_static("hl.Bytes"),
-        Dyn => Str::from_static("Dynamic"),
-        Fun(_) => Str::from_static("Function"),
-        Obj(obj) => ctx.get(obj.name),
-        _ => Str::from_static("other"),
+        Dyn | DynObj | Virtual { .. } => Str::from_static("Dynamic"),
+        Fun(_) | Method(_) => Str::from_static("Function"),
+        Obj(obj) | Struct(obj) => ctx.get(obj.name),
+        Array => Str::from_static("Array<Dynamic>"),
+        Type => Str::from_static("Class<Dynamic>"),
+        Abstract { name } => ctx.get(*name),
+        Enum { name, .. } => ctx.get(*name),
+        Ref(_) => Str::from_static("hl.Ref"),
+        Null(_) => Str::from_static("Null"),
+        Packed(_) => Str::from_static("Dynamic"),
     }
 }
 

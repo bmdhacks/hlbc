@@ -102,7 +102,7 @@ impl<'a> BatchDecompiler<'a> {
     pub fn new(code: &'a Bytecode) -> Self {
         Self {
             code,
-            opts: FormatOptions::with_indices(2),
+            opts: FormatOptions::with_fun_indices(2),
             batch_opts: BatchOptions::default(),
         }
     }
@@ -111,7 +111,7 @@ impl<'a> BatchDecompiler<'a> {
     pub fn with_options(code: &'a Bytecode, batch_opts: BatchOptions) -> Self {
         Self {
             code,
-            opts: FormatOptions::with_indices(2),
+            opts: FormatOptions::with_fun_indices(2),
             batch_opts,
         }
     }
