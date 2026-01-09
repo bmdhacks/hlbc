@@ -669,10 +669,19 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
 
             //region OPERATORS
             &Opcode::Mov { dst, src } => {
-                state.push_expr(i, dst, state.expr(src));
-                // Note: Previously had a workaround that aliased src to dst, but this broke
-                // variable tracking when registers were reused (e.g., loop counter "count" in
-                // reg3 would get overwritten when doing Mov reg4 = reg3 for trace args).
+                let src_expr = state.expr(src);
+                state.push_expr(i, dst, src_expr.clone());
+                // Break expression chains to prevent stack overflow on drop.
+                // If src already has a Variable (like a named loop counter), don't overwrite it.
+                // Only create a synthetic variable for complex expressions.
+                if !matches!(&src_expr, Expr::Variable(_, _)) {
+                    let name = f.var_name(code, i).or_else(|| {
+                        state.synthetic_var_counter += 1;
+                        Some(format!("v{}", state.synthetic_var_counter - 1).into())
+                    });
+                    // Use src register index (not dst!) so the variable refers to the correct register
+                    state.reg_state.insert(src, Expr::Variable(src, name));
+                }
             }
             &Opcode::Add { dst, a, b } => {
                 state.push_expr(i, dst, add(state.expr(a), state.expr(b)));
