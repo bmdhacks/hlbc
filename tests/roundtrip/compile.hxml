@@ -1,0 +1,22 @@
+-cp src
+--main HelloWorld
+-hl bin/hello.hl
+--debug
+
+--next
+-cp src
+--main Arithmetic
+-hl bin/arithmetic.hl
+--debug
+
+--next
+-cp src
+--main Conditionals
+-hl bin/conditionals.hl
+--debug
+
+--next
+-cp src
+--main Loop
+-hl bin/loop.hl
+--debug

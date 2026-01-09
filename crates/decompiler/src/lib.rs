@@ -347,7 +347,9 @@ impl<'c> DecompilerState<'c> {
 
             if is_loop_exit {
                 if let Some(loop_cond) = self.scopes.last_loop_cond_mut() {
-                    if matches!(loop_cond, Expr::Unknown(_)) {
+                    // If the loop condition is still the default `true`, this exit condition
+                    // should become the actual loop condition
+                    if matches!(loop_cond, Expr::Constant(Constant::Bool(true))) {
                         *loop_cond = cond;
                         return; // Don't create an if scope - this IS the loop condition
                     }
@@ -668,15 +670,9 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
             //region OPERATORS
             &Opcode::Mov { dst, src } => {
                 state.push_expr(i, dst, state.expr(src));
-                // Workaround for when the instructions after this one use dst and src interchangeably.
-                // Use var_name if available, otherwise generate synthetic name
-                let name = f.var_name(code, i).or_else(|| {
-                    state.synthetic_var_counter += 1;
-                    Some(format!("v{}", state.synthetic_var_counter - 1).into())
-                });
-                state
-                    .reg_state
-                    .insert(src, Expr::Variable(dst, name));
+                // Note: Previously had a workaround that aliased src to dst, but this broke
+                // variable tracking when registers were reused (e.g., loop counter "count" in
+                // reg3 would get overwritten when doing Mov reg4 = reg3 for trace args).
             }
             &Opcode::Add { dst, a, b } => {
                 state.push_expr(i, dst, add(state.expr(a), state.expr(b)));

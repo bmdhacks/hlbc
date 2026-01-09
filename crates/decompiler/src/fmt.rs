@@ -2,13 +2,83 @@ use std::fmt;
 use std::fmt::{Display, Formatter};
 
 use hlbc::fmt::{BytecodeFmt, EnhancedFmt};
-use hlbc::types::{Function, RefField, Type};
+use hlbc::types::{Function, RefField, RefType, Type, TypeFun, TypeObj};
 use hlbc::Str;
 use hlbc::{Bytecode, Resolve};
 
 use crate::ast::{Class, Constant, ConstructorCall, Expr, Method, Operation, Statement};
 
-const INDENT: &str = "                                                                ";
+/// A formatter that produces clean Haxe-like output without index annotations.
+/// Unlike EnhancedFmt, this doesn't add @index suffixes to type names.
+#[derive(Copy, Clone, Default)]
+pub struct HaxeFmt;
+
+impl BytecodeFmt for HaxeFmt {
+    fn fmt_reftype(&self, f: &mut Formatter, ctx: &Bytecode, v: RefType) -> fmt::Result {
+        let ty = &ctx[v];
+        self.fmt_type(f, ctx, ty)
+        // Note: No @index suffix added
+    }
+
+    fn fmt_type(&self, f: &mut Formatter, ctx: &Bytecode, v: &Type) -> fmt::Result {
+        match v {
+            Type::Fun(fun) => self.fmt_typefun(f, ctx, fun),
+            Type::Obj(TypeObj { name, .. }) => write!(f, "{}", ctx.get(*name)),
+            Type::Ref(reftype) => {
+                write!(f, "ref<")?;
+                self.fmt_type(f, ctx, &ctx[*reftype])?;
+                write!(f, ">")
+            }
+            Type::Virtual { .. } => write!(f, "Dynamic"),
+            Type::Abstract { name } => {
+                // Map internal HL abstracts (lowercase names) to Dynamic
+                let name_str = ctx.get(*name);
+                let first_char = name_str.chars().next();
+                if first_char.map(|c| c.is_lowercase() || c == '_').unwrap_or(false) {
+                    write!(f, "Dynamic")
+                } else {
+                    write!(f, "{}", name_str)
+                }
+            }
+            Type::Enum { name, .. } => write!(f, "{}", ctx.get(*name)),
+            Type::Null(reftype) => {
+                write!(f, "Null<")?;
+                self.fmt_reftype(f, ctx, *reftype)?;
+                write!(f, ">")
+            }
+            Type::Method(fun) => self.fmt_typefun(f, ctx, fun),
+            Type::Struct(TypeObj { name, .. }) => write!(f, "{}", ctx.get(*name)),
+            Type::Packed(reftype) => self.fmt_reftype(f, ctx, *reftype),
+            // Simple types
+            Type::Void => write!(f, "Void"),
+            Type::UI8 => write!(f, "Int"),
+            Type::UI16 => write!(f, "Int"),
+            Type::I32 => write!(f, "Int"),
+            Type::I64 => write!(f, "haxe.Int64"),
+            Type::F32 => write!(f, "Single"),
+            Type::F64 => write!(f, "Float"),
+            Type::Bool => write!(f, "Bool"),
+            Type::Bytes => write!(f, "haxe.io.Bytes"),
+            Type::Dyn | Type::DynObj => write!(f, "Dynamic"),
+            Type::Array => write!(f, "Array<Dynamic>"),
+            Type::Type => write!(f, "Class<Dynamic>"),
+        }
+    }
+
+    fn fmt_typefun(&self, f: &mut Formatter, ctx: &Bytecode, v: &TypeFun) -> fmt::Result {
+        write!(f, "(")?;
+        for (i, arg) in v.args.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            self.fmt_type(f, ctx, &ctx[*arg])?;
+        }
+        write!(f, ") -> ")?;
+        self.fmt_type(f, ctx, &ctx[v.ret])
+    }
+}
+
+const INDENT: &str = "                                                                                                                                                                                                                                                                ";
 
 #[derive(Clone)]
 pub struct FormatOptions {
@@ -91,7 +161,16 @@ fn to_haxe_type<'a>(ty: &Type, ctx: &'a Bytecode) -> impl Display + 'a {
         Obj(obj) | Struct(obj) => ctx.get(obj.name),
         Array => Str::from_static("Array<Dynamic>"),
         Type => Str::from_static("Class<Dynamic>"),
-        Abstract { name } => ctx.get(*name),
+        Abstract { name } => {
+            // Map internal HL abstracts (lowercase names) to Dynamic
+            let name_str = ctx.get(*name);
+            let first_char = name_str.chars().next();
+            if first_char.map(|c| c.is_lowercase() || c == '_').unwrap_or(false) {
+                Str::from_static("Dynamic")
+            } else {
+                name_str
+            }
+        }
         Enum { name, .. } => ctx.get(*name),
         Ref(_) => Str::from_static("hl.Ref"),
         Null(_) => Str::from_static("Null"),
@@ -113,15 +192,33 @@ impl Class {
         type_idx: Option<usize>,
     ) -> impl Display + 'a {
         let new_opts = opts.inc_nesting();
+        // Split package and class name
+        let (package, simple_name) = if let Some(pos) = self.name.rfind('.') {
+            (Some(&self.name[..pos]), &self.name[pos + 1..])
+        } else {
+            (None, self.name.as_str())
+        };
+        // Also extract simple parent name
+        let simple_parent = self.parent.as_ref().map(|p| {
+            if let Some(pos) = p.rfind('.') {
+                &p[pos + 1..]
+            } else {
+                p.as_str()
+            }
+        });
         fmtools::fmt! { move
+            // Package declaration
+            if let Some(pkg) = package {
+                "package "{pkg}";\n\n"
+            }
             // Type header with index
             if opts.show_type_indices {
                 if let Some(idx) = type_idx {
                     "// Type: "{self.name}" (type@"{idx}")\n"
                 }
             }
-            {opts}"class "{self.name}
-            if let Some(parent) = self.parent.as_ref() {
+            {opts}"class "{simple_name}
+            if let Some(parent) = simple_parent {
                 " extends "{parent}
             }
             " {\n"
@@ -210,7 +307,7 @@ impl Constant {
             Null => f.write_str("null"),
             This => f.write_str("this"),
             TypeRef(ty) => {
-                write!(f, "{}", ty.display::<EnhancedFmt>(code))?;
+                write!(f, "{}", ty.display::<HaxeFmt>(code))?;
                 if show_indices {
                     write!(f, " /* type@{} */", ty.0)?;
                 }
@@ -294,17 +391,37 @@ impl Expr {
                     {disp!(array)}"["{disp!(index)}"]"
                 }
                 Expr::Call(call) => {
-                    {disp!(call.fun)}"("{fmtools::join(", ", call.args.iter().map(|e| disp!(e)))}")"
-                    // Add function index comment if the callee is a FunRef
-                    if indent.show_fun_indices {
-                        if let Expr::FunRef(fun_ref) = &call.fun {
-                            " /* fun@"{fun_ref.0}" */"
+                    // Check for builtin functions that should be elided
+                    let builtin_replacement = if let Expr::FunRef(fun_ref) = &call.fun {
+                        let name = fun_ref.name(code);
+                        match name.as_ref() {
+                            // itos/ftos convert numbers to string bytes - just use the value
+                            "itos" | "ftos" | "dtos" => call.args.first(),
+                            // __alloc__ creates a String from bytes - use the first arg
+                            "__alloc__" => call.args.first(),
+                            // thrown wraps an exception - use the argument
+                            "thrown" => call.args.first(),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+
+                    if let Some(replacement) = builtin_replacement {
+                        {disp!(replacement)}
+                    } else {
+                        {disp!(call.fun)}"("{fmtools::join(", ", call.args.iter().map(|e| disp!(e)))}")"
+                        // Add function index comment if the callee is a FunRef
+                        if indent.show_fun_indices {
+                            if let Expr::FunRef(fun_ref) = &call.fun {
+                                " /* fun@"{fun_ref.0}" */"
+                            }
                         }
                     }
                 }
                 Expr::Constant(c) => {|f| c.fmt_with_opts(f, code, indent.show_string_indices)?;},
                 Expr::Constructor(ConstructorCall { ty, args }) => {
-                    "new "{ty.display::<EnhancedFmt>(code)}"("{fmtools::join(", ", args.iter().map(|e| disp!(e)))}")"
+                    "new "{ty.display::<HaxeFmt>(code)}"("{fmtools::join(", ", args.iter().map(|e| disp!(e)))}")"
                 }
                 Expr::Closure(f, stmts) => {
                     let fun = f.as_fn(code).unwrap();
@@ -432,7 +549,7 @@ impl Statement {
                     "continue;"
                 }
                 Statement::Throw(exc) => {
-                    "throw "{disp!(exc)}
+                    "throw "{disp!(exc)}";"
                 }
                 Statement::TryCatch { try_stmts, catch_var, catch_stmts } => {
                     "try {\n"
