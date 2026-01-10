@@ -11,7 +11,7 @@ use std::panic;
 use std::path::Path;
 
 use hlbc::types::Type;
-use hlbc::Bytecode;
+use hlbc::{Bytecode, Resolve};
 
 use crate::fmt::FormatOptions;
 use crate::{decompile_class, decompile_function};
@@ -189,6 +189,9 @@ impl<'a> BatchDecompiler<'a> {
             }
         }
 
+        // Write enum types
+        self.write_enums(output_dir, &mut index)?;
+
         // Write standalone functions (not part of a class)
         self.write_standalone_functions(output_dir, &mut index)?;
 
@@ -266,6 +269,77 @@ impl<'a> BatchDecompiler<'a> {
 
         let path = output_dir.join("_natives.hx");
         fs::write(path, natives)?;
+        Ok(())
+    }
+
+    /// Write enum type definitions.
+    #[cfg(feature = "batch")]
+    fn write_enums(&self, output_dir: &Path, index: &mut IndexFile) -> io::Result<()> {
+        for (type_idx, ty) in self.code.types.iter().enumerate() {
+            if let Type::Enum { name, constructs, .. } = ty {
+                let enum_name = self.code.get(*name).to_string();
+
+                // Check if we should process this type
+                if !self.batch_opts.should_include(&enum_name) {
+                    continue;
+                }
+
+                // Skip anonymous closure enums (names starting with $)
+                if enum_name.starts_with('$') {
+                    continue;
+                }
+
+                let path = type_name_to_path(&enum_name);
+                let full_path = output_dir.join(&path);
+
+                // Create parent directories
+                if let Some(parent) = full_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+
+                // Generate enum content
+                let mut content = String::new();
+
+                // Package declaration
+                if let Some(pos) = enum_name.rfind('.') {
+                    content.push_str(&format!("package {};\n\n", &enum_name[..pos]));
+                }
+
+                // Type index comment
+                content.push_str(&format!("// type@{}\n", type_idx));
+
+                // Enum declaration
+                let simple_name = enum_name.rsplit('.').next().unwrap_or(&enum_name);
+                content.push_str(&format!("enum {} {{\n", simple_name));
+
+                // Enum constructors
+                for construct in constructs {
+                    let construct_name = self.code.get(construct.name);
+                    if construct.params.is_empty() {
+                        content.push_str(&format!("    {};\n", construct_name));
+                    } else {
+                        // Constructor with parameters
+                        content.push_str(&format!("    {}(", construct_name));
+                        for (i, param) in construct.params.iter().enumerate() {
+                            if i > 0 {
+                                content.push_str(", ");
+                            }
+                            // Parameter name: param0, param1, etc. (bytecode doesn't have names)
+                            content.push_str(&format!("param{}: Dynamic", i));
+                            let _ = param; // Acknowledge param type (could be used for better typing)
+                        }
+                        content.push_str(");\n");
+                    }
+                }
+
+                content.push_str("}\n");
+
+                fs::write(&full_path, &content)?;
+
+                // Record in index
+                index.types.insert(enum_name.clone(), type_idx);
+            }
+        }
         Ok(())
     }
 

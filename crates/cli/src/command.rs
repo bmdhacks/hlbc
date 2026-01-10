@@ -131,7 +131,7 @@ pub fn command_parser(ctx: &ParseContext) -> impl Parser<char, Command, Error = 
         cmd!("info" => Info),
         cmd!("entrypoint" => Entrypoint),
         cmd!("int", "i"; index_range(ctx.int_max) => Int),
-        cmd!("float", "f"; index_range(ctx.float_max) => Float),
+        cmd!("float", "fl"; index_range(ctx.float_max) => Float),
         cmd!("string", "s"; index_range(ctx.string_max) => String),
         cmd!("sstr"; string.clone() => SearchStr),
         cmd!("debugfile", "file"; index_range(ctx.debug_file_max) => Debugfile),
@@ -141,7 +141,7 @@ pub fn command_parser(ctx: &ParseContext) -> impl Parser<char, Command, Error = 
         cmd!("constant", "c"; index_range(ctx.constant_max) => Constant),
         cmd!("native", "n"; index_range(ctx.native_max) => Native),
         cmd!("fnh"; index_range(ctx.findex_max) => FunctionHeader),
-        cmd!("fn"; index_range(ctx.findex_max) => Function),
+        cmd!("fn", "f"; index_range(ctx.findex_max) => Function),
         cmd!("fnamed", "fnn"; string.clone() => FunctionNamed),
         cmd!("sfn"; string.clone() => SearchFunction),
         cmd!("infile").ignore_then(choice((

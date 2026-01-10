@@ -2,6 +2,18 @@
 
 This document explains the hlbc-decompiler architecture and iteration workflow.
 
+## CRITICAL: Do Not Modify Test Files
+
+**NEVER modify the test files in `tests/roundtrip/src/` to make tests pass.** This is dishonest and has been a recurring problem across conversation compactions.
+
+If a test fails:
+1. **Fix the decompiler code**, not the test
+2. If the fix is too complex, **say so honestly** - "This requires X which is hard because Y"
+3. Document the limitation in Known Limitations below
+4. Discuss with the user to find a solution together
+
+The test files are intentionally read-only and owned by root to prevent this. If you find yourself able to edit them anyway, **don't**. The goal is a working decompiler, not passing tests.
+
 ## Philosophy
 
 **Never crash, always produce readable output.** Even when control flow analysis fails, emit a comment like `// unhandled: JAlways +10` and continue. A complete imperfect decompilation is better than a partial crash.
@@ -201,6 +213,23 @@ Example:
 2. **Exception handling**: Try/catch is basic, some edge cases produce `[missing expr]`
 3. **Switch case merging**: Complex switch patterns may not reconstruct perfectly
 4. **Closures**: Anonymous functions decompile but references may show as indices
+5. **Array iteration**: `for (x in arr)` compiles to low-level iterator with `.bytes` access that can't be reconstructed. Use explicit while loops with indexing instead.
+
+### Round-Trip Test Status (as of 2026-01-10)
+
+**16/21 tests pass.** The remaining 5 failures have known limitations:
+
+**Multi-class tests** (Inheritance, InterfaceTest, StaticMembers)
+- These tests have multiple classes but the test infrastructure only extracts one class
+- Need to extract all user classes from decompiled output, not just the main class
+
+**PropertyAccess.hx** - Type coercion issue
+- The decompiler outputs `Std.string(value)` in a context where `Int` is expected
+- This is a pre-existing issue with property getter/setter decompilation
+
+**DefaultParams.hx** - `hl.Ref` type parameter
+- HashLink's `hl.Ref<T>` type needs proper generic parameter handling
+- Currently outputs `hl.Ref` without the type parameter
 
 ## Code Quality Checklist
 

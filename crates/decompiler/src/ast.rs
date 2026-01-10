@@ -90,6 +90,30 @@ pub enum Operation {
     Lte(Box<Expr>, Box<Expr>),
 }
 
+impl Operation {
+    /// Returns the precedence of this operation (higher = binds tighter).
+    /// Used for determining when parentheses are needed.
+    pub fn precedence(&self) -> u8 {
+        use Operation::*;
+        match self {
+            // Unary operators - highest precedence
+            Neg(_) | Not(_) | Incr(_) | Decr(_) => 10,
+            // Multiplicative
+            Mul(_, _) | Div(_, _) | Mod(_, _) => 7,
+            // Additive
+            Add(_, _) | Sub(_, _) => 6,
+            // Shift
+            Shl(_, _) | Shr(_, _) => 5,
+            // Comparison
+            Lt(_, _) | Lte(_, _) | Gt(_, _) | Gte(_, _) => 4,
+            // Equality
+            Eq(_, _) | NotEq(_, _) => 3,
+            // Bitwise (already wrapped in parens)
+            And(_, _) | Xor(_, _) | Or(_, _) => 2,
+        }
+    }
+}
+
 /// Constructor call
 #[derive(Debug, Clone)]
 pub struct ConstructorCall {
@@ -130,6 +154,8 @@ pub enum Expr {
     Anonymous(RefType, HashMap<RefField, Expr>),
     /// Array access : array\[index]
     Array(Box<Expr>, Box<Expr>),
+    /// Array literal : [a, b, c]
+    ArrayLiteral(Vec<Expr>),
     /// Function call
     Call(Box<Call>),
     /// Constant value
@@ -263,11 +289,14 @@ pub fn call_fun(fun: RefFun, args: Vec<Expr>) -> Expr {
 }
 
 pub fn field(expr: Expr, obj: RefType, field: RefField, code: &Bytecode) -> Expr {
-    // FIXME meh
-    Expr::Field(
-        Box::new(expr),
-        Str::from(field.display::<EnhancedFmt>(code, &code[obj]).to_string()),
-    )
+    let field_name = field.display::<EnhancedFmt>(code, &code[obj]).to_string();
+    // Empty field names are internal virtual interface fields
+    let field_name = if field_name.is_empty() {
+        "__proto".to_string()
+    } else {
+        field_name
+    };
+    Expr::Field(Box::new(expr), Str::from(field_name))
 }
 
 #[derive(Debug, Clone)]
@@ -293,7 +322,10 @@ pub enum Statement {
     Switch {
         arg: Expr,
         default: Vec<Statement>,
-        cases: Vec<(Expr, Vec<Statement>)>,
+        /// Cases with potentially combined patterns (e.g., case 0, 1, 2:)
+        cases: Vec<(Vec<usize>, Vec<Statement>)>,
+        /// If this switch is on an enum constructor index, the enum type for lookup
+        enum_type: Option<RefType>,
     },
     /// While statement
     While {
@@ -312,6 +344,15 @@ pub enum Statement {
     /// A block of statements (used for orphan scopes)
     Block {
         stmts: Vec<Statement>,
+    },
+    /// A sequence of statements without creating a new scope (no braces)
+    /// Used for hoisting declarations before switch statements
+    Sequence {
+        stmts: Vec<Statement>,
+    },
+    /// Variable declaration without initialization (e.g., `var x;`)
+    VarDecl {
+        name: Str,
     },
 }
 

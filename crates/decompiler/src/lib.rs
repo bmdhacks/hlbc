@@ -21,10 +21,58 @@ pub mod ast;
 pub mod batch;
 /// Functions to render the [ast] to a string
 pub mod fmt;
+/// Native function name lookup
+pub mod natives;
 /// AST post-processing
 mod post;
 /// Scope handling structures
 mod scopes;
+
+/// Detect loop counter registers by looking ahead from a Label to find Incr ops.
+/// Returns a set of registers that are incremented within the loop body.
+fn detect_loop_counters(ops: &[Opcode], label_pos: usize) -> HashSet<Reg> {
+    let mut counters = HashSet::new();
+
+    // Find the backward JAlways that jumps back to this label
+    for j in (label_pos + 1)..ops.len() {
+        if let Opcode::JAlways { offset } = &ops[j] {
+            let target = (j as i32 + 1 + *offset) as usize;
+            if target == label_pos {
+                // Found the loop end - scan for Incr ops within the loop body
+                for k in label_pos..=j {
+                    if let Opcode::Incr { dst } = &ops[k] {
+                        counters.insert(*dst);
+                    }
+                }
+                break;
+            }
+        }
+    }
+    counters
+}
+
+/// Pre-scan the entire function to find ALL loop counter registers.
+/// This is called before processing any opcodes so that Int instructions
+/// that initialize loop counters can emit variable declarations.
+fn prescan_all_loop_counters(ops: &[Opcode]) -> HashSet<Reg> {
+    let mut all_counters = HashSet::new();
+
+    // Find all Labels that are loop targets (have backward JAlways)
+    for (i, op) in ops.iter().enumerate() {
+        if matches!(op, Opcode::Label) {
+            // Check if this Label is a loop target
+            let is_loop_target = ops.iter().enumerate().skip(i + 1).any(|(j, op)| {
+                matches!(op, Opcode::JAlways { offset } if (j as i32 + *offset + 1) as usize == i)
+            });
+            if is_loop_target {
+                // Found a loop - collect its counters
+                let counters = detect_loop_counters(ops, i);
+                all_counters.extend(counters);
+            }
+        }
+    }
+    all_counters
+}
 
 enum ExprCtx {
     Constructor {
@@ -47,8 +95,9 @@ struct DecompilerState<'c> {
     // For parsing statements made of multiple instructions like constructor calls and anonymous structures
     // TODO move this to another pass on the generated ast
     expr_ctx: Vec<ExprCtx>,
-    // Variable names we already declared
-    seen: HashSet<Str>,
+    // Variable names we already declared, mapped to the register that owns them.
+    // This prevents name collisions when debug info gives the same name to different registers.
+    name_to_reg: HashMap<Str, Reg>,
     // Counter for synthetic variable names
     synthetic_var_counter: u32,
     f: &'c Function,
@@ -72,6 +121,16 @@ struct DecompilerState<'c> {
     /// Each switch saves the state before it starts, and restores when entering each case.
     /// This prevents register values from one case bleeding into another.
     switch_saved_states: Vec<HashMap<Reg, Expr>>,
+    /// Registers that hold EnumIndex results, mapped to the source enum value register.
+    /// Used to reconstruct enum pattern matching in switches.
+    enum_index_sources: HashMap<Reg, Reg>,
+    /// Stack of loop counter registers (for nested loops).
+    /// When we detect a loop (Label with backward JAlways), we look ahead to find Incr ops
+    /// and treat those registers as variables from the start, so loop conditions work correctly.
+    loop_counters: Vec<HashSet<Reg>>,
+    /// All loop counter registers in the function, pre-scanned at start.
+    /// Used to handle Int opcodes that initialize loop counters BEFORE the Label.
+    all_loop_counters: HashSet<Reg>,
 }
 
 impl<'c> DecompilerState<'c> {
@@ -79,7 +138,7 @@ impl<'c> DecompilerState<'c> {
         let scopes = Scopes::new();
         let mut reg_state = HashMap::with_capacity(f.regs.len());
         let expr_ctx = Vec::new();
-        let mut seen = HashSet::new();
+        let mut name_to_reg = HashMap::new();
 
         let mut start = 0;
         // First argument / First register is 'this'
@@ -95,17 +154,21 @@ impl<'c> DecompilerState<'c> {
                 param_counter += 1;
                 Some(format!("arg{}", param_counter - 1).into())
             });
-            reg_state.insert(Reg(i as u32), Expr::Variable(Reg(i as u32), name.clone()));
+            let reg = Reg(i as u32);
+            reg_state.insert(reg, Expr::Variable(reg, name.clone()));
             if let Some(name) = name {
-                seen.insert(name);
+                name_to_reg.insert(name, reg);
             }
         }
+
+        // Pre-scan all loop counters so we can handle Int opcodes before the Label
+        let all_loop_counters = prescan_all_loop_counters(&f.ops);
 
         Self {
             scopes,
             reg_state,
             expr_ctx,
-            seen,
+            name_to_reg,
             synthetic_var_counter: 0,
             f,
             code,
@@ -114,7 +177,23 @@ impl<'c> DecompilerState<'c> {
             saved_reg_states: Vec::new(),
             set_to_null_in_scope: Vec::new(),
             switch_saved_states: Vec::new(),
+            enum_index_sources: HashMap::new(),
+            loop_counters: Vec::new(),
+            all_loop_counters,
         }
+    }
+
+    /// Check if a register is a loop counter in any active loop scope
+    fn is_loop_counter(&self, reg: Reg) -> bool {
+        self.loop_counters.iter().any(|counters| counters.contains(&reg))
+    }
+
+    /// Generate a variable name for a register
+    fn var_name(&mut self, reg: Reg) -> Str {
+        let name: Str = format!("v{}", self.synthetic_var_counter).into();
+        self.synthetic_var_counter += 1;
+        self.name_to_reg.insert(name.clone(), reg);
+        name
     }
 
     /// Check if we're at a catch block start and open the catch scope
@@ -168,16 +247,61 @@ impl<'c> DecompilerState<'c> {
             self.reg_state.insert(dst, expr);
         } else {
             // Either we have a debug name, or we need to force a variable due to scope concerns
-            let var_name = name.or_else(|| {
-                self.synthetic_var_counter += 1;
-                Some(format!("v{}", self.synthetic_var_counter - 1).into())
-            });
+            // Check if debug name is already used by a different register - if so, use synthetic name
+            let var_name = match name {
+                Some(ref n) => {
+                    match self.name_to_reg.get(n) {
+                        Some(&existing_reg) if existing_reg != dst => {
+                            // Name collision! Different register already owns this name.
+                            // Generate a synthetic name instead.
+                            self.synthetic_var_counter += 1;
+                            format!("v{}", self.synthetic_var_counter - 1).into()
+                        }
+                        _ => n.clone(),
+                    }
+                }
+                None => {
+                    // No debug name - check if saved_reg_states has a variable for this register.
+                    // This handles the case where both if and else branches assign to the same
+                    // register - we reuse the if-branch's variable name in the else branch.
+                    let existing_var_name = self.saved_reg_states.last().and_then(|saved| {
+                        if let Some(Expr::Variable(_, Some(name))) = saved.get(&dst) {
+                            Some(name.clone())
+                        } else {
+                            None
+                        }
+                    });
+
+                    existing_var_name.unwrap_or_else(|| {
+                        self.synthetic_var_counter += 1;
+                        format!("v{}", self.synthetic_var_counter - 1).into()
+                    })
+                }
+            };
             self.reg_state
-                .insert(dst, Expr::Variable(dst, var_name.clone()));
-            let declaration = self.seen.insert(var_name.clone().unwrap());
+                .insert(dst, Expr::Variable(dst, Some(var_name.clone())));
+            // Check if this is a new declaration or reassignment
+            let declaration = match self.name_to_reg.get(&var_name) {
+                Some(&existing_reg) => {
+                    // Name exists - declaration only if same register (first use of this name for this reg)
+                    if existing_reg == dst {
+                        false // reassignment to same variable
+                    } else {
+                        // This shouldn't happen since we generate synthetic names above,
+                        // but handle it just in case
+                        self.name_to_reg.insert(var_name.clone(), dst);
+                        true
+                    }
+                }
+                None => {
+                    // New name - this is a declaration
+                    self.name_to_reg.insert(var_name.clone(), dst);
+                    true
+                }
+            };
             self.push_stmt(Statement::Assign {
                 declaration,
-                variable: Expr::Variable(dst, var_name.clone()),
+                variable: Expr::Variable(dst, Some(var_name)),
                 assign: expr,
             });
         }
@@ -214,7 +338,8 @@ impl<'c> DecompilerState<'c> {
         let var_expr = Expr::Variable(reg, Some(var_name.clone()));
 
         // Emit the variable declaration with the current expression
-        let declaration = self.seen.insert(var_name.clone());
+        let declaration = !self.name_to_reg.contains_key(&var_name);
+        self.name_to_reg.insert(var_name.clone(), reg);
         self.push_stmt(Statement::Assign {
             declaration,
             variable: var_expr.clone(),
@@ -269,7 +394,15 @@ impl<'c> DecompilerState<'c> {
 
         // Normal function call handling
         {
-            self.push_stmt(comment(fun.display::<EnhancedFmt>(self.code).to_string()));
+            // Check if this is an internal conversion function that should be inlined
+            // (itos/ftos/dtos are only used as intermediate values for __alloc__)
+            let fun_name = fun.name(self.code);
+            let should_inline = fun_name == "itos" || fun_name == "ftos" || fun_name == "dtos";
+
+            // Only emit comment for non-inlined calls
+            if !should_inline {
+                self.push_stmt(comment(fun.display::<EnhancedFmt>(self.code).to_string()));
+            }
             let call = if let Some((func, true)) =
                 fun.as_fn(self.code).map(|func| (func, func.is_method()))
             {
@@ -296,6 +429,9 @@ impl<'c> DecompilerState<'c> {
             let is_void = ret_type.is_void();
             if is_void {
                 self.push_stmt(stmt(call));
+            } else if should_inline {
+                // Inline conversion functions - they will be combined with __alloc__ in post-processing
+                self.reg_state.insert(dst, call);
             } else {
                 // For function calls, always materialize as a variable since:
                 // 1. They often have side effects
@@ -306,12 +442,25 @@ impl<'c> DecompilerState<'c> {
                     // Debug info available - use the original name
                     self.push_expr(i, dst, call);
                 } else {
-                    // No debug name - create synthetic variable for readability
-                    let var_name: Str = format!("v{}", self.synthetic_var_counter).into();
-                    self.synthetic_var_counter += 1;
+                    // No debug name - check if saved_reg_states has a variable for this register.
+                    // This handles if/else branches that both assign to the same register.
+                    let existing_var_name = self.saved_reg_states.last().and_then(|saved| {
+                        if let Some(Expr::Variable(_, Some(name))) = saved.get(&dst) {
+                            Some(name.clone())
+                        } else {
+                            None
+                        }
+                    });
+
+                    let var_name: Str = existing_var_name.unwrap_or_else(|| {
+                        let name = format!("v{}", self.synthetic_var_counter).into();
+                        self.synthetic_var_counter += 1;
+                        name
+                    });
                     let var_expr = Expr::Variable(dst, Some(var_name.clone()));
 
-                    let declaration = self.seen.insert(var_name.clone());
+                    let declaration = !self.name_to_reg.contains_key(&var_name);
+                    self.name_to_reg.insert(var_name.clone(), dst);
                     self.push_stmt(Statement::Assign {
                         declaration,
                         variable: var_expr.clone(),
@@ -399,14 +548,22 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
 
         // Check if we've reached a switch case offset position
         // This needs to happen BEFORE processing the opcode
-        if let Some(case_idx) = state.scopes.last_is_switch_ctx()
-            .and_then(|offsets| offsets.iter().position(|&o| o == i))
-        {
-            // Note: We intentionally do NOT restore register state here.
-            // The JIT discards register bindings at jump targets, but for decompilation
-            // we want values to flow through. The if/else scope handling will restore
-            // registers that were set to null, which handles the ternary pattern.
-            state.scopes.push_switch_case(case_idx);
+        // For combined cases like `case 0, 1, 2:`, multiple indices share the same offset
+        if let Some(offsets) = state.scopes.last_is_switch_ctx() {
+            // Find ALL case indices that point to this offset (for combined cases)
+            let matching_patterns: Vec<usize> = offsets.iter()
+                .enumerate()
+                .filter(|(_, &offset)| offset == i)
+                .map(|(idx, _)| idx)
+                .collect();
+
+            if !matching_patterns.is_empty() {
+                // Note: We intentionally do NOT restore register state here.
+                // The JIT discards register bindings at jump targets, but for decompilation
+                // we want values to flow through. The if/else scope handling will restore
+                // registers that were set to null, which handles the ternary pattern.
+                state.scopes.push_switch_case(matching_patterns);
+            }
         }
 
         // Opcodes are grouped by semantic
@@ -478,6 +635,8 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
                             // we generate the loop statement
                             if let Some(stmt) = state.scopes.end_last_loop() {
                                 state.push_stmt(stmt);
+                                // Pop the loop counter set for this loop
+                                state.loop_counters.pop();
                             } else {
                                 // Fallback: emit comment instead of panicking
                                 state.push_stmt(Statement::Comment(format!(
@@ -537,11 +696,17 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
                 // Save register state before entering switch.
                 // Each case will restore this state to prevent register bleeding between cases.
                 state.switch_saved_states.push(state.reg_state.clone());
-                // Convert to absolute positions
+
+                // Check if this switch is on an EnumIndex result (for enum pattern matching)
+                // If so, look up the enum type for constructor name lookup during formatting
+                let enum_type = state.enum_index_sources.get(reg).map(|&src_reg| f.regtype(src_reg));
+
+                // Convert to absolute positions (offsets are relative to instruction AFTER switch)
                 state.scopes.push_switch(
                     *end + 1,
                     state.expr(*reg),
-                    offsets.iter().map(|o| i + *o as usize).collect(),
+                    offsets.iter().map(|o| i + 1 + *o as usize).collect(),
+                    enum_type,
                 );
                 // The default switch case is implicit
             }
@@ -552,6 +717,22 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
                     matches!(op, Opcode::JAlways { offset } if (j as i32 + *offset + 1) as usize == i)
                 });
                 if is_loop_target {
+                    // Detect loop counters (registers with Incr ops) and track them
+                    // This ensures loop counters are treated as variables from the start,
+                    // so loop conditions like `while (index < arr.length)` work correctly
+                    let counters = detect_loop_counters(&f.ops, i);
+
+                    // For each counter, ensure it has a variable expression in reg_state
+                    // This is needed so that when we process the loop exit condition,
+                    // the counter register shows as a variable, not a constant
+                    for &counter_reg in &counters {
+                        if !matches!(state.reg_state.get(&counter_reg), Some(Expr::Variable(_, _))) {
+                            let name = state.var_name(counter_reg);
+                            state.reg_state.insert(counter_reg, Expr::Variable(counter_reg, Some(name)));
+                        }
+                    }
+
+                    state.loop_counters.push(counters);
                     state.scopes.push_loop(i);
                 }
                 // If not a loop target, the Label is just a forward jump target - no scope needed
@@ -648,7 +829,23 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
 
             //region CONSTANTS
             &Opcode::Int { dst, ptr } => {
-                state.push_expr(i, dst, cst_int(ptr));
+                // Check if this register is a loop counter - if so, emit as variable declaration
+                // This handles the case where `Int reg = 0` (loop init) happens BEFORE the Label
+                if state.all_loop_counters.contains(&dst) {
+                    let var_name: Str = format!("v{}", state.synthetic_var_counter).into();
+                    state.synthetic_var_counter += 1;
+                    let var_expr = Expr::Variable(dst, Some(var_name.clone()));
+                    let declaration = !state.name_to_reg.contains_key(&var_name);
+                    state.name_to_reg.insert(var_name.clone(), dst);
+                    state.push_stmt(Statement::Assign {
+                        declaration,
+                        variable: var_expr.clone(),
+                        assign: cst_int(ptr),
+                    });
+                    state.reg_state.insert(dst, var_expr);
+                } else {
+                    state.push_expr(i, dst, cst_int(ptr));
+                }
             }
             &Opcode::Float { dst, ptr } => {
                 state.push_expr(i, dst, cst_float(ptr));
@@ -802,7 +999,8 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
                         state.synthetic_var_counter += 1;
                         let var_expr = Expr::Variable(*dst, Some(var_name.clone()));
 
-                        let declaration = state.seen.insert(var_name.clone());
+                        let declaration = !state.name_to_reg.contains_key(&var_name);
+                        state.name_to_reg.insert(var_name.clone(), *dst);
                         state.push_stmt(Statement::Assign {
                             declaration,
                             variable: var_expr.clone(),
@@ -1210,11 +1408,10 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
                 // Constructor analysis
                 match &code[f[dst]] {
                     Type::Obj(_) | Type::Struct(_) => {
-                        // Store constructor expression immediately - if a constructor call
-                        // is matched later, it will update this. Otherwise field assignments
-                        // will work on this object and it can be returned/used directly.
-                        state.push_expr(
-                            i,
+                        // Store constructor expression in reg_state only (no statement yet).
+                        // If a constructor call follows, it will create the final statement with args.
+                        // Otherwise field assignments will use this object directly.
+                        state.reg_state.insert(
                             dst,
                             Expr::Constructor(ConstructorCall::new(f.regtype(dst), Vec::new())),
                         );
@@ -1268,12 +1465,19 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
                 );
             }
             &Opcode::EnumIndex { dst, value } => {
+                // Track that dst holds an enum index extracted from `value`
+                // This is used later to reconstruct enum pattern matching
+                state.enum_index_sources.insert(dst, value);
+
+                // Use Type.enumIndex(value) which is valid Haxe
                 state.push_expr(
                     i,
                     dst,
-                    Expr::Field(Box::new(state.expr(value)), Str::from("constructorIndex")),
+                    Expr::Call(Box::new(Call::new(
+                        Expr::Field(Box::new(Expr::Ident("Type".into())), Str::from("enumIndex")),
+                        vec![state.expr(value)],
+                    ))),
                 );
-                //state.push_expr(i, dst, state.expr(value));
             }
             &Opcode::EnumField {
                 dst,
@@ -1281,11 +1485,48 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
                 construct: _,
                 field,
             } => {
-                state.push_expr(
-                    i,
-                    dst,
-                    Expr::Field(Box::new(state.expr(value)), Str::from(field.0.to_string())),
-                );
+                // Check if this is a closure capture access:
+                // - value is Reg(0) (first parameter)
+                // - first param is an enum type
+                // - function has captured variables (assigns with position == usize::MAX)
+                let has_captured_vars = f.assigns.as_ref()
+                    .map(|a| a.iter().any(|(_, pos)| *pos == usize::MAX))
+                    .unwrap_or(false);
+                let is_closure_capture = value == Reg(0)
+                    && has_captured_vars
+                    && f.regs.first().map(|r| matches!(&code[*r], Type::Enum { .. })).unwrap_or(false);
+
+                if is_closure_capture {
+                    // Look up captured variable name from assigns metadata
+                    // Captured variables have position usize::MAX in assigns
+                    let captured_name = f.assigns.as_ref().and_then(|assigns| {
+                        // Filter to only captured variables (position == usize::MAX)
+                        let captured: Vec<_> = assigns.iter()
+                            .filter(|(_, pos)| *pos == usize::MAX)
+                            .collect();
+                        // The field index corresponds to the order of captured variables
+                        captured.get(field.0 as usize).map(|(s, _)| code.get(*s).clone())
+                    });
+
+                    if let Some(name) = captured_name {
+                        // Use the captured variable name directly
+                        state.push_expr(i, dst, Expr::Ident(name));
+                    } else {
+                        // Fallback: use generic captured_N name
+                        state.push_expr(i, dst, Expr::Ident(Str::from(format!("captured_{}", field.0))));
+                    }
+                } else {
+                    // Regular enum field access - use Type.enumParameters(value)[field]
+                    let enum_params = Expr::Call(Box::new(Call::new(
+                        Expr::Field(Box::new(Expr::Ident("Type".into())), Str::from("enumParameters")),
+                        vec![state.expr(value)],
+                    )));
+                    state.push_expr(
+                        i,
+                        dst,
+                        Expr::Array(Box::new(enum_params), Box::new(Expr::Constant(Constant::InlineInt(field.0 as usize)))),
+                    );
+                }
             }
             &Opcode::SetEnumField { value, field, src } => match state.expr(value) {
                 Expr::Variable(_r, _name) => {
@@ -1299,15 +1540,9 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
                     });
                 }
                 _ => {
-                    state.push_stmt(comment("closure capture"));
-                    state.push_stmt(Statement::Assign {
-                        declaration: false,
-                        variable: Expr::Field(
-                            Box::new(state.expr(value)),
-                            Str::from(field.0.to_string()),
-                        ),
-                        assign: state.expr(src),
-                    });
+                    // Closure capture uses anonymous enum types that produce invalid syntax.
+                    // Just emit a comment since the captured value is accessed via Type.enumParameters().
+                    state.push_stmt(comment("closure capture (internal)"));
                 }
             },
             //endregion
@@ -1391,13 +1626,18 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
     }
     let mut statements = state.scopes.statements();
 
+    // Reconstruct array literals from alloc_bytes patterns
+    post::reconstruct_array_literals(code, &mut statements);
+
     // AST post processing step !
     // It makes a single pass for all visitors
     post::visit(
         code,
         &mut statements,
         &mut [
+            Box::new(post::BoundsCheckSimplify),
             Box::new(post::IfExpressions),
+            Box::new(post::SwitchExpressions),
             Box::new(post::StringConcat),
             Box::new(post::Itos),
             Box::new(post::Trace),

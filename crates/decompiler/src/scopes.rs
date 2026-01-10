@@ -1,4 +1,4 @@
-use hlbc::types::Reg;
+use hlbc::types::{Reg, RefType};
 
 use crate::ast::{Constant, Expr, Statement};
 
@@ -21,10 +21,13 @@ pub(crate) enum ScopeData {
     Switch {
         arg: Expr,
         offsets: Vec<usize>,
-        cases: Vec<(Expr, Vec<Statement>)>,
+        cases: Vec<(Vec<usize>, Vec<Statement>)>,
+        /// If switching on an EnumIndex, this holds the enum type for constructor lookup
+        enum_type: Option<RefType>,
     },
     SwitchCase {
-        pattern: Expr,
+        /// Multiple patterns for combined cases (e.g., case 0, 1, 2:)
+        patterns: Vec<usize>,
     },
     Loop {
         start: usize,
@@ -76,10 +79,11 @@ impl Scope {
                 if_: if_stmts,
                 else_: self.stmts,
             },
-            ScopeData::Switch { arg, cases, .. } => Statement::Switch {
+            ScopeData::Switch { arg, cases, enum_type, .. } => Statement::Switch {
                 arg,
                 default: self.stmts,
                 cases,
+                enum_type,
             },
             ScopeData::Loop { cond, .. } => Statement::While {
                 cond,
@@ -99,9 +103,9 @@ impl Scope {
                 // Root scope shouldn't be converted to statement - wrap in a block
                 Statement::Block { stmts: self.stmts }
             }
-            ScopeData::SwitchCase { pattern } => {
+            ScopeData::SwitchCase { patterns } => {
                 // SwitchCase should be merged into parent Switch, not standalone
-                Statement::Comment(format!("orphan switch case: {:?}", pattern))
+                Statement::Comment(format!("orphan switch case: {:?}", patterns))
             }
         }
     }
@@ -151,9 +155,6 @@ impl Scopes {
             }
 
             let mut scope = self.scopes.remove(i);
-            if let Some(s) = stmt.take() {
-                scope.stmts.push(s);
-            }
 
             // Track If/Else closures for register state restoration
             if matches!(scope.data, ScopeData::If { .. } | ScopeData::Else { .. }) {
@@ -169,9 +170,9 @@ impl Scopes {
                 while self.scopes.len() > i {
                     let inner_scope = self.scopes.pop().unwrap();
                     match inner_scope.data {
-                        ScopeData::SwitchCase { pattern } => {
+                        ScopeData::SwitchCase { patterns } => {
                             // Found the last case - add it to the switch's cases
-                            cases.push((pattern, inner_scope.stmts));
+                            cases.push((patterns, inner_scope.stmts));
                         }
                         ScopeData::If { .. } | ScopeData::Else { .. } => {
                             // Track nested If/Else closures too
@@ -198,10 +199,19 @@ impl Scopes {
                 }
             }
 
-            stmt = Some(scope.make_stmt());
+            let closed_stmt = scope.make_stmt();
+
+            // Immediately push the closed statement to the current top scope if one exists,
+            // rather than carrying it forward. This ensures nested switch statements go to
+            // the correct SwitchCase instead of the parent switch's default.
+            if let Some(current_scope) = self.scopes.last_mut() {
+                current_scope.stmts.push(closed_stmt);
+            } else {
+                stmt = Some(closed_stmt);
+            }
         }
 
-        // Phase 3: Push any remaining statement to the current scope
+        // Phase 3: Push any remaining statement to the current scope (only if no scopes were left)
         if let Some(s) = stmt {
             if let Some(scope) = self.scopes.last_mut() {
                 scope.stmts.push(s);
@@ -282,18 +292,20 @@ impl Scopes {
         }
     }
 
-    pub(crate) fn push_switch(&mut self, len: i32, arg: Expr, offsets: Vec<usize>) {
+    pub(crate) fn push_switch(&mut self, len: i32, arg: Expr, offsets: Vec<usize>, enum_type: Option<RefType>) {
         self.scopes.push(Scope::new(
             ScopeType::Len(len),
             ScopeData::Switch {
                 arg,
                 offsets,
                 cases: Vec::new(),
+                enum_type,
             },
         ))
     }
 
-    pub(crate) fn push_switch_case(&mut self, cst: usize) {
+    /// Push a switch case with potentially multiple patterns (for combined cases like `case 0, 1, 2:`)
+    pub(crate) fn push_switch_case(&mut self, patterns: Vec<usize>) {
         // Find the Switch scope in the stack
         let switch_idx = self.scopes.iter().rposition(|s| {
             matches!(s.data, ScopeData::Switch { .. })
@@ -302,8 +314,8 @@ impl Scopes {
         let Some(switch_idx) = switch_idx else {
             // No switch context found - emit a comment
             self.last_mut().stmts.push(Statement::Comment(format!(
-                "switch case {} (no outer switch context)",
-                cst
+                "switch case {:?} (no outer switch context)",
+                patterns
             )));
             return;
         };
@@ -313,10 +325,10 @@ impl Scopes {
         while self.scopes.len() > switch_idx + 1 {
             let inner_scope = self.scopes.pop().unwrap();
             match inner_scope.data {
-                ScopeData::SwitchCase { pattern } => {
+                ScopeData::SwitchCase { patterns } => {
                     // Found the previous case - add it to the switch's cases
                     if let ScopeData::Switch { cases, .. } = &mut self.scopes[switch_idx].data {
-                        cases.push((pattern, inner_scope.stmts));
+                        cases.push((patterns, inner_scope.stmts));
                     }
                 }
                 _ => {
@@ -338,9 +350,7 @@ impl Scopes {
         // Now push the new SwitchCase
         self.scopes.push(Scope::new(
             ScopeType::Manual,
-            ScopeData::SwitchCase {
-                pattern: Expr::Constant(Constant::InlineInt(cst)),
-            },
+            ScopeData::SwitchCase { patterns },
         ));
     }
 
@@ -427,7 +437,7 @@ impl Scopes {
             let inner_scope = self.scopes.pop().unwrap();
 
             match inner_scope.data {
-                ScopeData::SwitchCase { pattern } => {
+                ScopeData::SwitchCase { patterns } => {
                     // Find the parent Switch scope and merge this case into it
                     let switch_idx = self.scopes[loop_idx..].iter().rposition(|s| {
                         matches!(s.data, ScopeData::Switch { .. })
@@ -435,13 +445,13 @@ impl Scopes {
 
                     if let Some(switch_idx) = switch_idx {
                         if let ScopeData::Switch { cases, .. } = &mut self.scopes[switch_idx].data {
-                            cases.push((pattern, inner_scope.stmts));
+                            cases.push((patterns, inner_scope.stmts));
                             continue;
                         }
                     }
                     // No Switch found - emit as orphan comment
                     self.scopes[loop_idx].stmts.push(Statement::Comment(
-                        format!("orphan switch case in loop: {:?}", pattern)
+                        format!("orphan switch case in loop: {:?}", patterns)
                     ));
                 }
                 _ => {

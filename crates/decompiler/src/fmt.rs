@@ -23,7 +23,17 @@ impl BytecodeFmt for HaxeFmt {
     fn fmt_type(&self, f: &mut Formatter, ctx: &Bytecode, v: &Type) -> fmt::Result {
         match v {
             Type::Fun(fun) => self.fmt_typefun(f, ctx, fun),
-            Type::Obj(TypeObj { name, .. }) => write!(f, "{}", ctx.get(*name)),
+            Type::Obj(TypeObj { name, .. }) => {
+                let name_str = ctx.get(*name);
+                // Map internal HL types to their Haxe equivalents
+                match name_str.as_ref() {
+                    "hl.types.ArrayBytes_Int" => write!(f, "Array<Int>"),
+                    "hl.types.ArrayBytes_Float" | "hl.types.ArrayBytes_Single" => write!(f, "Array<Float>"),
+                    "hl.types.ArrayObj" => write!(f, "Array<Dynamic>"),
+                    "hl.types.ArrayDyn" => write!(f, "Array<Dynamic>"),
+                    _ => write!(f, "{}", name_str),
+                }
+            }
             Type::Ref(reftype) => {
                 write!(f, "ref<")?;
                 self.fmt_type(f, ctx, &ctx[*reftype])?;
@@ -144,7 +154,7 @@ impl Display for FormatOptions {
     }
 }
 
-fn to_haxe_type<'a>(ty: &Type, ctx: &'a Bytecode) -> impl Display + 'a {
+fn to_haxe_type<'a>(ty: &Type, ctx: &'a Bytecode) -> Str {
     use crate::Type::*;
     match ty {
         Void => Str::from_static("Void"),
@@ -157,7 +167,18 @@ fn to_haxe_type<'a>(ty: &Type, ctx: &'a Bytecode) -> impl Display + 'a {
         Bool => Str::from_static("Bool"),
         Bytes => Str::from_static("hl.Bytes"),
         Dyn | DynObj | Virtual { .. } => Str::from_static("Dynamic"),
-        Fun(_) | Method(_) => Str::from_static("Function"),
+        Fun(fun) | Method(fun) => {
+            // Format function types as (Arg1, Arg2) -> RetType or simplified for single arg
+            let args: Vec<_> = fun.args.iter().map(|a| to_haxe_type(&ctx[*a], ctx)).collect();
+            let ret = to_haxe_type(&ctx[fun.ret], ctx);
+            if args.is_empty() {
+                Str::from(format!("Void -> {}", ret))
+            } else if args.len() == 1 {
+                Str::from(format!("{} -> {}", args[0], ret))
+            } else {
+                Str::from(format!("({}) -> {}", args.join(", "), ret))
+            }
+        }
         Obj(obj) | Struct(obj) => ctx.get(obj.name),
         Array => Str::from_static("Array<Dynamic>"),
         Type => Str::from_static("Class<Dynamic>"),
@@ -245,18 +266,28 @@ impl Method {
         let fun = self.fun.as_fn(ctx).unwrap();
         let fun_idx = self.fun.0;
         let nops = fun.ops.len();
+        let name = fun.name(ctx);
+        let is_constructor = name == "__constructor__";
+        // For constructors and instance methods, skip the first param (this)
+        let skip_params = if self.static_ && !is_constructor { 0 } else { 1 };
         fmtools::fmt! { move
             // Function header comment with index
             if opts.show_fun_indices {
                 {opts}"// fun@"{fun_idx}" ("{nops}" ops)\n"
             }
-            {opts} if self.static_ { "static " } if self.dynamic { "dynamic " }
-            "function "{fun.name(ctx)}"("
-            {fmtools::join(", ", fun.args(ctx).iter().enumerate().skip(if self.static_ { 0 } else { 1 })
-                .map(move |(i, arg)| fmtools::fmt! {move
-                    {fun.arg_name(ctx, i).unwrap_or(Str::from("_"))}": "{to_haxe_type(&ctx[*arg], ctx)}
+            // Don't output 'static' for constructors
+            {opts} if self.static_ && !is_constructor { "static " } if self.dynamic { "dynamic " }
+            // Output 'new' instead of '__constructor__'
+            "function " if is_constructor { "new" } else { {name} } "("
+            {fmtools::join(", ", fun.args(ctx).iter().enumerate().skip(skip_params)
+                .map(move |(i, arg)| {
+                    // arg_name expects index relative to user params (excluding this)
+                    let name_idx = i - skip_params;
+                    fmtools::fmt! {move
+                        {fun.arg_name(ctx, name_idx).unwrap_or(Str::from("_"))}": "{to_haxe_type(&ctx[*arg], ctx)}
+                    }
                 }))}
-            ")" if !fun.ty(ctx).ret.is_void() { ": "{to_haxe_type(fun.ret(ctx), ctx)} } " {"
+            ")" if !fun.ty(ctx).ret.is_void() && !is_constructor { ": "{to_haxe_type(fun.ret(ctx), ctx)} } " {"
 
             if self.statements.is_empty() {
                 "}"
@@ -324,37 +355,97 @@ impl Operation {
         code: &'a Bytecode,
         f: &'a Function,
     ) -> impl Display + 'a {
-        use Operation::*;
-        macro_rules! disp {
-            ($e:ident) => {
-                $e.display(indent, code, f)
-            };
-        }
-        fmtools::fmt! { move
-            match self {
-                Add(e1, e2) => {{disp!(e1)}" + "{disp!(e2)}}
-                Sub(e1, e2) => {{disp!(e1)}" - "{disp!(e2)}}
-                Mul(e1, e2) => {{disp!(e1)}" * "{disp!(e2)}}
-                Div(e1, e2) => {{disp!(e1)}" / "{disp!(e2)}}
-                Mod(e1, e2) => {{disp!(e1)}" % "{disp!(e2)}}
-                Shl(e1, e2) => {{disp!(e1)}" << "{disp!(e2)}}
-                Shr(e1, e2) => {{disp!(e1)}" >> "{disp!(e2)}}
-                And(e1, e2) => {{disp!(e1)}" && "{disp!(e2)}}
-                Or(e1, e2) => {{disp!(e1)}" || "{disp!(e2)}}
-                Xor(e1, e2) => {{disp!(e1)}" ^ "{disp!(e2)}}
-                Neg(expr) => {"-"{disp!(expr)}}
-                Not(expr) => {"!"{disp!(expr)}}
-                Incr(expr) => {{disp!(expr)}"++"}
-                Decr(expr) => {{disp!(expr)}"--"}
-                Eq(e1, e2) => {{disp!(e1)}" == "{disp!(e2)}}
-                NotEq(e1, e2) => {{disp!(e1)}" != "{disp!(e2)}}
-                Gt(e1, e2) => {{disp!(e1)}" > "{disp!(e2)}}
-                Gte(e1, e2) => {{disp!(e1)}" >= "{disp!(e2)}}
-                Lt(e1, e2) => {{disp!(e1)}" < "{disp!(e2)}}
-                Lte(e1, e2) => {{disp!(e1)}" <= "{disp!(e2)}}
-            }
+        OperationDisplay {
+            op: self,
+            indent,
+            code,
+            f,
         }
     }
+}
+
+/// Helper to determine if an expression needs parentheses when used as operand
+fn needs_parens(expr: &Expr, parent_prec: u8, is_right: bool) -> bool {
+    if let Expr::Op(child_op) = expr {
+        let child_prec = child_op.precedence();
+        // RHS needs parens if equal or lower precedence (right-to-left would need different handling)
+        // LHS needs parens if strictly lower precedence
+        if is_right {
+            child_prec <= parent_prec
+        } else {
+            child_prec < parent_prec
+        }
+    } else {
+        false
+    }
+}
+
+struct OperationDisplay<'a> {
+    op: &'a Operation,
+    indent: &'a FormatOptions,
+    code: &'a Bytecode,
+    f: &'a Function,
+}
+
+impl<'a> Display for OperationDisplay<'a> {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use Operation::*;
+
+        let disp = |e: &'a Expr| e.display(self.indent, self.code, self.f);
+        let prec = self.op.precedence();
+
+        match self.op {
+            Add(e1, e2) | Sub(e1, e2) | Mul(e1, e2) | Div(e1, e2) | Mod(e1, e2) => {
+                let op_str = match self.op {
+                    Add(_, _) => "+",
+                    Sub(_, _) => "-",
+                    Mul(_, _) => "*",
+                    Div(_, _) => "/",
+                    Mod(_, _) => "%",
+                    _ => unreachable!(),
+                };
+                if needs_parens(e1, prec, false) {
+                    write!(fmt, "({})", disp(e1))?;
+                } else {
+                    write!(fmt, "{}", disp(e1))?;
+                }
+                write!(fmt, " {} ", op_str)?;
+                if needs_parens(e2, prec, true) {
+                    write!(fmt, "({})", disp(e2))?;
+                } else {
+                    write!(fmt, "{}", disp(e2))?;
+                }
+                Ok(())
+            }
+            // Shift and bitwise always wrapped in parens (low precedence)
+            Shl(e1, e2) => write!(fmt, "({} << {})", disp(e1), disp(e2)),
+            Shr(e1, e2) => write!(fmt, "({} >> {})", disp(e1), disp(e2)),
+            And(e1, e2) => write!(fmt, "({} & {})", disp(e1), disp(e2)),
+            Or(e1, e2) => write!(fmt, "({} | {})", disp(e1), disp(e2)),
+            Xor(e1, e2) => write!(fmt, "({} ^ {})", disp(e1), disp(e2)),
+            // Unary
+            Neg(expr) => write!(fmt, "-{}", disp(expr)),
+            Not(expr) => write!(fmt, "!{}", disp(expr)),
+            Incr(expr) => write!(fmt, "{}++", disp(expr)),
+            Decr(expr) => write!(fmt, "{}--", disp(expr)),
+            // Comparison
+            Eq(e1, e2) => write!(fmt, "{} == {}", disp(e1), disp(e2)),
+            NotEq(e1, e2) => write!(fmt, "{} != {}", disp(e1), disp(e2)),
+            Gt(e1, e2) => write!(fmt, "{} > {}", disp(e1), disp(e2)),
+            Gte(e1, e2) => write!(fmt, "{} >= {}", disp(e1), disp(e2)),
+            Lt(e1, e2) => write!(fmt, "{} < {}", disp(e1), disp(e2)),
+            Lte(e1, e2) => write!(fmt, "{} <= {}", disp(e1), disp(e2)),
+        }
+    }
+}
+
+/// Helper enum for special call handling
+enum CallHandling<'a> {
+    SpecialFormat(String),
+    Elide(&'a Expr),
+    /// Skip internal methods that shouldn't be visible (e.g., __expand)
+    Skip,
+    Normal,
 }
 
 impl Expr {
@@ -388,33 +479,90 @@ impl Expr {
                     _ => "[invalid anonymous type]",
                 },
                 Expr::Array(array, index) => {
-                    {disp!(array)}"["{disp!(index)}"]"
-                }
-                Expr::Call(call) => {
-                    // Check for builtin functions that should be elided
-                    let builtin_replacement = if let Expr::FunRef(fun_ref) = &call.fun {
-                        let name = fun_ref.name(code);
-                        match name.as_ref() {
-                            // itos/ftos convert numbers to string bytes - just use the value
-                            "itos" | "ftos" | "dtos" => call.args.first(),
-                            // __alloc__ creates a String from bytes - use the first arg
-                            "__alloc__" => call.args.first(),
-                            // thrown wraps an exception - use the argument
-                            "thrown" => call.args.first(),
-                            _ => None,
+                    // Check for array.bytes[index << 2] pattern (HL array access)
+                    // and convert to array[index] for valid Haxe
+                    let simplified = if let Expr::Field(obj, field) = array.as_ref() {
+                        if field.as_ref() == "bytes" {
+                            // Extract the unshifted index: if index is `x << 2`, use `x`
+                            let real_index = if let Expr::Op(Operation::Shl(left, right)) = index.as_ref() {
+                                if let Expr::Constant(Constant::InlineInt(2)) = right.as_ref() {
+                                    Some((obj.as_ref(), left.as_ref()))
+                                } else if let Expr::Constant(Constant::Int(ref_int)) = right.as_ref() {
+                                    if code[*ref_int] == 2 {
+                                        Some((obj.as_ref(), left.as_ref()))
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                            real_index
+                        } else {
+                            None
                         }
                     } else {
                         None
                     };
 
-                    if let Some(replacement) = builtin_replacement {
-                        {disp!(replacement)}
+                    if let Some((arr, idx)) = simplified {
+                        {disp!(arr)}"["{disp!(idx)}"]"
                     } else {
-                        {disp!(call.fun)}"("{fmtools::join(", ", call.args.iter().map(|e| disp!(e)))}")"
-                        // Add function index comment if the callee is a FunRef
-                        if indent.show_fun_indices {
-                            if let Expr::FunRef(fun_ref) = &call.fun {
-                                " /* fun@"{fun_ref.0}" */"
+                        {disp!(array)}"["{disp!(index)}"]"
+                    }
+                }
+                Expr::ArrayLiteral(elems) => {
+                    "["{fmtools::join(", ", elems.iter().map(|e| disp!(e)))}"]"
+                }
+                Expr::Call(call) => {
+                    // Check for builtin functions that need special handling or elision
+                    let handling = if let Expr::FunRef(fun_ref) = &call.fun {
+                        let name = fun_ref.name(code);
+                        match name.as_ref() {
+                            // itos/ftos/dtos convert numbers to strings - use Std.string(first_arg)
+                            "itos" | "ftos" | "dtos" => {
+                                call.args.first().map(|arg| {
+                                    CallHandling::SpecialFormat(format!("Std.string({})", arg.display(indent, code, f)))
+                                }).unwrap_or(CallHandling::Normal)
+                            }
+                            // __alloc__ creates a String from bytes - use the first arg
+                            "__alloc__" => call.args.first().map(CallHandling::Elide).unwrap_or(CallHandling::Normal),
+                            // thrown wraps an exception - use the argument
+                            "thrown" => call.args.first().map(CallHandling::Elide).unwrap_or(CallHandling::Normal),
+                            // caught extracts exception from HL wrapper - use the argument
+                            "caught" => call.args.first().map(CallHandling::Elide).unwrap_or(CallHandling::Normal),
+                            // string converts to string - use the argument
+                            "string" => call.args.first().map(CallHandling::Elide).unwrap_or(CallHandling::Normal),
+                            // Internal array methods that shouldn't be visible
+                            "__expand" | "__construct" => CallHandling::Skip,
+                            _ => CallHandling::Normal,
+                        }
+                    } else if let Expr::Field(receiver, method) = &call.fun {
+                        // Check for method calls that should be elided or skipped
+                        match method.as_ref() {
+                            // __exceptionMessage extracts actual exception value - return receiver
+                            "__exceptionMessage" => CallHandling::Elide(receiver.as_ref()),
+                            // Internal array methods that shouldn't be visible
+                            "__expand" | "__construct" => CallHandling::Skip,
+                            _ => CallHandling::Normal,
+                        }
+                    } else {
+                        CallHandling::Normal
+                    };
+
+                    match handling {
+                        CallHandling::SpecialFormat(s) => {{s}}
+                        CallHandling::Elide(replacement) => {{disp!(replacement)}}
+                        CallHandling::Skip => {"0 /* internal */"}
+                        CallHandling::Normal => {
+                            {disp!(call.fun)}"("{fmtools::join(", ", call.args.iter().map(|e| disp!(e)))}")"
+                            // Add function index comment if the callee is a FunRef
+                            if indent.show_fun_indices {
+                                if let Expr::FunRef(fun_ref) = &call.fun {
+                                    " /* fun@"{fun_ref.0}" */"
+                                }
                             }
                         }
                     }
@@ -425,11 +573,28 @@ impl Expr {
                 }
                 Expr::Closure(f, stmts) => {
                     let fun = f.as_fn(code).unwrap();
-                    "("{fmtools::join(", ", fun.ty(code).args.iter().enumerate().map(move |(i, arg)|
-                        fmtools::fmt! { move
-                            {fun.arg_name(code, i).unwrap_or(Str::from("_"))}": "{to_haxe_type(&code[*arg], code)}
-                        }
-                    ))}") -> {\n"
+                    let args = &fun.ty(code).args;
+
+                    // Check if first param is closure context (enum type)
+                    let has_capture = args.first().map(|t| matches!(&code[*t], Type::Enum { .. })).unwrap_or(false);
+                    let skip_first = if has_capture { 1 } else { 0 };
+
+                    // Build parameter names using same logic as DecompilerState::new()
+                    // Uses a counter for synthetic names to match body variable references
+                    let mut param_counter = 0u32;
+                    let param_names = args.iter().enumerate().map(|(i, _)| {
+                        fun.arg_name(code, i).unwrap_or_else(|| {
+                            let name = Str::from(format!("arg{}", param_counter));
+                            param_counter += 1;
+                            name
+                        })
+                    }).collect::<Vec<_>>();
+
+                    // Format visible parameters (skip closure context if present)
+                    let params_display = args.iter().enumerate().skip(skip_first).map(|(i, arg)| {
+                        format!("{}: {}", param_names[i], to_haxe_type(&code[*arg], code))
+                    }).collect::<Vec<_>>().join(", ");
+                    "("{params_display}") -> {\n"
                     let indent2 = indent.inc_nesting();
                     for stmt in stmts {
                         {indent2}{stmt.display(&indent2, code, fun)}"\n"
@@ -442,7 +607,22 @@ impl Expr {
                 Expr::Field(receiver, name) => {
                     {disp!(receiver)}"."{name}
                 }
-                Expr::FunRef(fun) => {{fun.name(code)}},
+                Expr::FunRef(fun) => {
+                    // Check if this is a native function and translate to Haxe name
+                    match code.get(*fun) {
+                        hlbc::types::FunPtr::Native(n) => {
+                            let lib = n.lib(code);
+                            let name = n.name(code);
+                            if let Some(haxe_name) = crate::natives::lookup_native(&lib, &name) {
+                                {haxe_name}
+                            } else {
+                                // Unknown native - show raw name for debugging
+                                "@native("{lib}"/"{name}")"
+                            }
+                        }
+                        _ => {{fun.name(code)}}
+                    }
+                },
                 Expr::IfElse { cond, if_, else_ } => {
                     "if ("{disp!(cond)}") {\n"
                     let indent2 = indent.inc_nesting();
@@ -516,8 +696,52 @@ impl Statement {
                         {indent}"}"
                     }
                 }
-                Statement::Switch {arg, default, cases} => {
-                    "switch ("{disp!(arg)}") {\n"
+                Statement::Switch {arg, default, cases, enum_type} => {
+                    // Get enum constructs if this is an enum switch
+                    let enum_constructs = enum_type.and_then(|ty| {
+                        if let Type::Enum { constructs, .. } = &code[ty] {
+                            Some(constructs.as_slice())
+                        } else {
+                            None
+                        }
+                    });
+
+                    // For enum switches, extract the inner enum value from Type.enumIndex(x) call
+                    // and use just the enum value for proper pattern matching syntax
+                    let enum_switch_inner = if enum_constructs.is_some() {
+                        // Check if arg is Type.enumIndex(x) and extract x
+                        if let Expr::Call(call) = arg {
+                            if let Expr::Field(base, method) = &call.fun {
+                                if method.as_ref() == "enumIndex" {
+                                    if let Expr::Ident(name) = base.as_ref() {
+                                        if name.as_ref() == "Type" {
+                                            call.args.first()
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    "switch ("
+                    if let Some(inner) = enum_switch_inner {
+                        {disp!(inner)}
+                    } else {
+                        {disp!(arg)}
+                    }
+                    ") {\n"
                     let indent2 = indent.inc_nesting();
                     let indent3 = indent2.inc_nesting();
                     if !default.is_empty() {
@@ -526,8 +750,32 @@ impl Statement {
                             {indent3}{stmt.display(&indent3, code, f)}"\n"
                         }
                     }
-                    for (pattern, stmts) in cases {
-                        {indent2}"case "{disp!(pattern)}":\n"
+                    for (patterns, stmts) in cases {
+                        // Format combined cases: case 0, 1, 2: or case None, Some(_):
+                        {indent2}"case "
+                        for (i, pattern) in patterns.iter().enumerate() {
+                            if i > 0 { ", " }
+                            // If this is an enum switch, use constructor name instead of index
+                            if let Some(constructs) = enum_constructs {
+                                if let Some(construct) = constructs.get(*pattern) {
+                                    {code.get(construct.name)}
+                                    // Add wildcard parameters for constructors with params
+                                    if !construct.params.is_empty() {
+                                        "("
+                                        for (pi, _) in construct.params.iter().enumerate() {
+                                            if pi > 0 { ", " }
+                                            "_"
+                                        }
+                                        ")"
+                                    }
+                                } else {
+                                    {pattern}
+                                }
+                            } else {
+                                {pattern}
+                            }
+                        }
+                        ":\n"
                         for stmt in stmts {
                             {indent3}{stmt.display(&indent3, code, f)}"\n"
                         }
@@ -573,6 +821,16 @@ impl Statement {
                         {indent2}{stmt.display(&indent2, code, f)}"\n"
                     }
                     {indent}"}"
+                }
+                Statement::Sequence { stmts } => {
+                    // Sequence is like Block but without braces (no new scope)
+                    for (i, stmt) in stmts.iter().enumerate() {
+                        {stmt.display(indent, code, f)}
+                        if i < stmts.len() - 1 { "\n"{indent} }
+                    }
+                }
+                Statement::VarDecl { name } => {
+                    "var "{name}";"
                 }
             }
         }
