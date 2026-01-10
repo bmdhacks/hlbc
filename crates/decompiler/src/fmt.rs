@@ -193,8 +193,16 @@ fn to_haxe_type<'a>(ty: &Type, ctx: &'a Bytecode) -> Str {
             }
         }
         Enum { name, .. } => ctx.get(*name),
-        Ref(_) => Str::from_static("hl.Ref"),
-        Null(_) => Str::from_static("Null"),
+        Ref(inner) => {
+            // hl.Ref<T> is used internally for nullable parameters
+            // At Haxe source level, this is Null<T>
+            let inner_name = to_haxe_type(&ctx[*inner], ctx);
+            Str::from(format!("Null<{}>", inner_name))
+        }
+        Null(inner) => {
+            let inner_name = to_haxe_type(&ctx[*inner], ctx);
+            Str::from(format!("Null<{}>", inner_name))
+        }
         Packed(_) => Str::from_static("Dynamic"),
     }
 }

@@ -23,6 +23,8 @@ pub mod batch;
 pub mod fmt;
 /// Native function name lookup
 pub mod natives;
+/// Liveness analysis for accurate variable naming
+mod liveness;
 /// AST post-processing
 mod post;
 /// Scope handling structures
@@ -131,6 +133,10 @@ struct DecompilerState<'c> {
     /// All loop counter registers in the function, pre-scanned at start.
     /// Used to handle Int opcodes that initialize loop counters BEFORE the Label.
     all_loop_counters: HashSet<Reg>,
+    /// Live range analysis for accurate variable naming across control flow.
+    live_ranges: liveness::LiveRangeMap,
+    /// Maps live range ID -> variable name (assigned on first def).
+    range_to_name: HashMap<usize, Str>,
 }
 
 impl<'c> DecompilerState<'c> {
@@ -164,6 +170,12 @@ impl<'c> DecompilerState<'c> {
         // Pre-scan all loop counters so we can handle Int opcodes before the Label
         let all_loop_counters = prescan_all_loop_counters(&f.ops);
 
+        // Compute live ranges for accurate variable naming across control flow
+        // Use CFG-based analysis to properly handle branches that merge
+        let cfg = liveness::CFG::build(&f.ops);
+        let liveness_info = liveness::compute_liveness(&cfg);
+        let live_ranges = liveness::ranges::extract_live_ranges(&cfg, &liveness_info, f.regs.len());
+
         Self {
             scopes,
             reg_state,
@@ -180,6 +192,8 @@ impl<'c> DecompilerState<'c> {
             enum_index_sources: HashMap::new(),
             loop_counters: Vec::new(),
             all_loop_counters,
+            live_ranges,
+            range_to_name: HashMap::new(),
         }
     }
 
@@ -194,6 +208,31 @@ impl<'c> DecompilerState<'c> {
         self.synthetic_var_counter += 1;
         self.name_to_reg.insert(name.clone(), reg);
         name
+    }
+
+    /// Get or create a variable name for a definition at a specific opcode index.
+    /// Uses live range analysis to ensure consistent naming across control flow.
+    fn var_name_for_def(&mut self, reg: Reg, op_index: usize, debug_name: Option<Str>) -> Str {
+        if let Some(range_id) = self.live_ranges.get_range_id(reg, op_index) {
+            // Reuse existing name for this live range
+            if let Some(name) = self.range_to_name.get(&range_id) {
+                return name.clone();
+            }
+
+            // Create new name - prefer debug name if available
+            let name = debug_name.unwrap_or_else(|| {
+                let n: Str = format!("v{}", self.synthetic_var_counter).into();
+                self.synthetic_var_counter += 1;
+                n
+            });
+
+            self.range_to_name.insert(range_id, name.clone());
+            self.name_to_reg.insert(name.clone(), reg);
+            name
+        } else {
+            // Fallback if no live range info
+            debug_name.unwrap_or_else(|| self.var_name(reg))
+        }
     }
 
     /// Check if we're at a catch block start and open the catch scope
@@ -246,59 +285,24 @@ impl<'c> DecompilerState<'c> {
         if name.is_none() && !force_variable {
             self.reg_state.insert(dst, expr);
         } else {
-            // Either we have a debug name, or we need to force a variable due to scope concerns
-            // Check if debug name is already used by a different register - if so, use synthetic name
-            let var_name = match name {
-                Some(ref n) => {
-                    match self.name_to_reg.get(n) {
-                        Some(&existing_reg) if existing_reg != dst => {
-                            // Name collision! Different register already owns this name.
-                            // Generate a synthetic name instead.
-                            self.synthetic_var_counter += 1;
-                            format!("v{}", self.synthetic_var_counter - 1).into()
-                        }
-                        _ => n.clone(),
-                    }
-                }
-                None => {
-                    // No debug name - check if saved_reg_states has a variable for this register.
-                    // This handles the case where both if and else branches assign to the same
-                    // register - we reuse the if-branch's variable name in the else branch.
-                    let existing_var_name = self.saved_reg_states.last().and_then(|saved| {
-                        if let Some(Expr::Variable(_, Some(name))) = saved.get(&dst) {
-                            Some(name.clone())
-                        } else {
-                            None
-                        }
-                    });
-
-                    existing_var_name.unwrap_or_else(|| {
-                        self.synthetic_var_counter += 1;
-                        format!("v{}", self.synthetic_var_counter - 1).into()
-                    })
-                }
-            };
+            // Create a variable using liveness-aware naming.
+            // This ensures consistent names across control flow (e.g., if-else branches).
+            let var_name = self.var_name_for_def(dst, i, name);
             self.reg_state
                 .insert(dst, Expr::Variable(dst, Some(var_name.clone())));
-            // Check if this is a new declaration or reassignment
-            let declaration = match self.name_to_reg.get(&var_name) {
-                Some(&existing_reg) => {
-                    // Name exists - declaration only if same register (first use of this name for this reg)
-                    if existing_reg == dst {
-                        false // reassignment to same variable
-                    } else {
-                        // This shouldn't happen since we generate synthetic names above,
-                        // but handle it just in case
-                        self.name_to_reg.insert(var_name.clone(), dst);
-                        true
-                    }
-                }
-                None => {
-                    // New name - this is a declaration
-                    self.name_to_reg.insert(var_name.clone(), dst);
-                    true
-                }
+
+            // Check if this is a new declaration or reassignment using live range info.
+            // A declaration is the first assignment to a new live range.
+            let declaration = if let Some(range_id) = self.live_ranges.get_range_id(dst, i) {
+                // First time we're emitting code for this range = declaration
+                // We just inserted into range_to_name in var_name_for_def, so check if
+                // this was the first insertion by seeing if name_to_reg just got updated
+                !self.name_to_reg.get(&var_name).map(|&r| r == dst && self.range_to_name.len() > 1).unwrap_or(false)
+                    || self.live_ranges.ranges.get(range_id).map(|r| r.def_point == i).unwrap_or(true)
+            } else {
+                !self.name_to_reg.contains_key(&var_name)
             };
+
             self.push_stmt(Statement::Assign {
                 declaration,
                 variable: Expr::Variable(dst, Some(var_name)),
@@ -315,9 +319,46 @@ impl<'c> DecompilerState<'c> {
             .unwrap_or_else(|| Expr::Unknown("missing expr".to_owned()))
     }
 
+    /// Get expression for a register at a specific opcode index with correct variable name.
+    /// Uses live range analysis to ensure we return the right variable name for this use site.
+    fn expr_at(&self, reg: Reg, op_index: usize) -> Expr {
+        let base = self.reg_state
+            .get(&reg)
+            .cloned()
+            .unwrap_or_else(|| Expr::Unknown("missing expr".to_owned()));
+
+        // If it's a variable, verify/fix the name based on liveness
+        if let Expr::Variable(r, _) = &base {
+            if *r == reg {
+                // Try to find a name for this specific range
+                if let Some(range_id) = self.live_ranges.get_range_id(reg, op_index) {
+                    if let Some(name) = self.range_to_name.get(&range_id) {
+                        return Expr::Variable(reg, Some(name.clone()));
+                    }
+                }
+                // Fallback: If no name for this range, look for ANY range of this register
+                // that has a name. This handles the case where multiple defs in different
+                // branches should share the same variable name.
+                for (rid, name) in &self.range_to_name {
+                    if let Some(range) = self.live_ranges.ranges.get(*rid) {
+                        if range.reg == reg {
+                            return Expr::Variable(reg, Some(name.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        base
+    }
+
     /// Expands the expression of many registers
     fn args_expr(&self, args: &[Reg]) -> Vec<Expr> {
         args.iter().map(|&r| self.expr(r)).collect()
+    }
+
+    /// Expands expressions with correct variable names at a specific opcode index.
+    fn args_expr_at(&self, args: &[Reg], op_index: usize) -> Vec<Expr> {
+        args.iter().map(|&r| self.expr_at(r, op_index)).collect()
     }
 
     /// Ensure a register has a named variable, materializing it if needed.
@@ -570,15 +611,15 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
         // Control flow first because they are the most important
         match o {
             //region CONTROL FLOW
-            &Opcode::JTrue { cond, offset } => state.push_jmp(i, offset, not(state.expr(cond))),
-            &Opcode::JFalse { cond, offset } => state.push_jmp(i, offset, state.expr(cond)),
+            &Opcode::JTrue { cond, offset } => state.push_jmp(i, offset, not(state.expr_at(cond, i))),
+            &Opcode::JFalse { cond, offset } => state.push_jmp(i, offset, state.expr_at(cond, i)),
             &Opcode::JNull { reg, offset } => {
                 // If the register currently holds null, force it into a variable.
                 // This prevents "null.field" in the else-branch where we know it's not null.
                 if matches!(state.reg_state.get(&reg), Some(Expr::Constant(Constant::Null))) {
                     state.ensure_variable(reg);
                 }
-                state.push_jmp(i, offset, noteq(state.expr(reg), cst_null()))
+                state.push_jmp(i, offset, noteq(state.expr_at(reg, i), cst_null()))
             }
             &Opcode::JNotNull { reg, offset } => {
                 // If the register currently holds null, force it into a variable.
@@ -586,33 +627,33 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
                 if matches!(state.reg_state.get(&reg), Some(Expr::Constant(Constant::Null))) {
                     state.ensure_variable(reg);
                 }
-                state.push_jmp(i, offset, eq(state.expr(reg), cst_null()))
+                state.push_jmp(i, offset, eq(state.expr_at(reg, i), cst_null()))
             }
             &Opcode::JSGte { a, b, offset } | &Opcode::JUGte { a, b, offset } => {
-                state.push_jmp(i, offset, gt(state.expr(b), state.expr(a)))
+                state.push_jmp(i, offset, gt(state.expr_at(b, i), state.expr_at(a, i)))
             }
             &Opcode::JSGt { a, b, offset } => {
-                state.push_jmp(i, offset, gte(state.expr(b), state.expr(a)))
+                state.push_jmp(i, offset, gte(state.expr_at(b, i), state.expr_at(a, i)))
             }
             &Opcode::JSLte { a, b, offset } => {
-                state.push_jmp(i, offset, lt(state.expr(b), state.expr(a)))
+                state.push_jmp(i, offset, lt(state.expr_at(b, i), state.expr_at(a, i)))
             }
             &Opcode::JSLt { a, b, offset } | &Opcode::JULt { a, b, offset } => {
-                state.push_jmp(i, offset, lte(state.expr(b), state.expr(a)))
+                state.push_jmp(i, offset, lte(state.expr_at(b, i), state.expr_at(a, i)))
             }
             &Opcode::JNotLt { a, b, offset } => {
                 // JNotLt: jump if a >= b (not a < b)
-                state.push_jmp(i, offset, lt(state.expr(a), state.expr(b)))
+                state.push_jmp(i, offset, lt(state.expr_at(a, i), state.expr_at(b, i)))
             }
             &Opcode::JNotGte { a, b, offset } => {
                 // JNotGte: jump if a < b (not a >= b)
-                state.push_jmp(i, offset, gte(state.expr(a), state.expr(b)))
+                state.push_jmp(i, offset, gte(state.expr_at(a, i), state.expr_at(b, i)))
             }
             &Opcode::JEq { a, b, offset } => {
-                state.push_jmp(i, offset, noteq(state.expr(a), state.expr(b)))
+                state.push_jmp(i, offset, noteq(state.expr_at(a, i), state.expr_at(b, i)))
             }
             &Opcode::JNotEq { a, b, offset } => {
-                state.push_jmp(i, offset, eq(state.expr(a), state.expr(b)))
+                state.push_jmp(i, offset, eq(state.expr_at(a, i), state.expr_at(b, i)))
             }
             // Unconditional jumps can actually mean a lot of things
             &Opcode::JAlways { offset } => {
@@ -743,10 +784,10 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
                     state.push_stmt(Statement::Return(if f.regtype(ret).is_void() {
                         None
                     } else {
-                        Some(state.expr(ret))
+                        Some(state.expr_at(ret, i))
                     }));
                 } else if !f.regtype(ret).is_void() {
-                    state.push_stmt(Statement::Return(Some(state.expr(ret))));
+                    state.push_stmt(Statement::Return(Some(state.expr_at(ret, i))));
                 }
             }
             //endregion
@@ -881,40 +922,40 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
                 }
             }
             &Opcode::Add { dst, a, b } => {
-                state.push_expr(i, dst, add(state.expr(a), state.expr(b)));
+                state.push_expr(i, dst, add(state.expr_at(a, i), state.expr_at(b, i)));
             }
             &Opcode::Sub { dst, a, b } => {
-                state.push_expr(i, dst, sub(state.expr(a), state.expr(b)));
+                state.push_expr(i, dst, sub(state.expr_at(a, i), state.expr_at(b, i)));
             }
             &Opcode::Mul { dst, a, b } => {
-                state.push_expr(i, dst, mul(state.expr(a), state.expr(b)));
+                state.push_expr(i, dst, mul(state.expr_at(a, i), state.expr_at(b, i)));
             }
             &Opcode::SDiv { dst, a, b } | &Opcode::UDiv { dst, a, b } => {
-                state.push_expr(i, dst, div(state.expr(a), state.expr(b)));
+                state.push_expr(i, dst, div(state.expr_at(a, i), state.expr_at(b, i)));
             }
             &Opcode::SMod { dst, a, b } | &Opcode::UMod { dst, a, b } => {
-                state.push_expr(i, dst, modulo(state.expr(a), state.expr(b)));
+                state.push_expr(i, dst, modulo(state.expr_at(a, i), state.expr_at(b, i)));
             }
             &Opcode::Shl { dst, a, b } => {
-                state.push_expr(i, dst, shl(state.expr(a), state.expr(b)));
+                state.push_expr(i, dst, shl(state.expr_at(a, i), state.expr_at(b, i)));
             }
             &Opcode::SShr { dst, a, b } | &Opcode::UShr { dst, a, b } => {
-                state.push_expr(i, dst, shr(state.expr(a), state.expr(b)));
+                state.push_expr(i, dst, shr(state.expr_at(a, i), state.expr_at(b, i)));
             }
             &Opcode::And { dst, a, b } => {
-                state.push_expr(i, dst, and(state.expr(a), state.expr(b)));
+                state.push_expr(i, dst, and(state.expr_at(a, i), state.expr_at(b, i)));
             }
             &Opcode::Or { dst, a, b } => {
-                state.push_expr(i, dst, or(state.expr(a), state.expr(b)));
+                state.push_expr(i, dst, or(state.expr_at(a, i), state.expr_at(b, i)));
             }
             &Opcode::Xor { dst, a, b } => {
-                state.push_expr(i, dst, xor(state.expr(a), state.expr(b)));
+                state.push_expr(i, dst, xor(state.expr_at(a, i), state.expr_at(b, i)));
             }
             &Opcode::Neg { dst, src } => {
-                state.push_expr(i, dst, neg(state.expr(src)));
+                state.push_expr(i, dst, neg(state.expr_at(src, i)));
             }
             &Opcode::Not { dst, src } => {
-                state.push_expr(i, dst, not(state.expr(src)));
+                state.push_expr(i, dst, not(state.expr_at(src, i)));
             }
             &Opcode::Incr { dst } => {
                 // Ensure we have a variable to increment (not a constant like "0")
