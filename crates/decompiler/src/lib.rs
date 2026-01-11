@@ -27,6 +27,8 @@ pub mod natives;
 pub mod lifter;
 /// Pass 2: Dominator computation and loop detection
 pub mod analyzer;
+/// Pass 3: SSA construction (φ-functions and variable versioning)
+pub mod ssa;
 /// Liveness analysis for accurate variable naming
 mod liveness;
 /// AST post-processing
