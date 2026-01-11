@@ -677,8 +677,6 @@ impl AstVisitor for Itos {
 /// var arr = [value1, value2, ...];
 /// ```
 pub(crate) fn reconstruct_array_literals(code: &Bytecode, stmts: &mut Vec<Statement>) {
-    use hlbc::types::Reg;
-
     // Scan for the pattern across statements
     let mut i = 0;
     while i < stmts.len() {
@@ -720,7 +718,7 @@ pub(crate) fn reconstruct_array_literals(code: &Bytecode, stmts: &mut Vec<Statem
 
             // Check for allocI32 call: var arr = allocI32(bytes, count)
             if let Statement::Assign { declaration, variable, assign, .. } = stmt {
-                if let Some(arr_var) = is_alloc_i32_call(assign, bytes_reg, code) {
+                if is_alloc_i32_call(assign, bytes_reg, code).is_some() {
                     // Found the final allocI32 - reconstruct as array literal
                     let array_literal = Expr::ArrayLiteral(values);
 

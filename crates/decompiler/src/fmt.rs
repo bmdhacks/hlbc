@@ -253,7 +253,11 @@ impl Class {
             " {\n"
             // Fields with indices - add 'public' for static fields (private by default in Haxe)
             for (i, f) in self.fields.iter().enumerate() {
-                {new_opts} if f.static_ { "public static " } "var "{f.name}": "{to_haxe_type(&ctx[f.ty], ctx)}";"
+                {new_opts} if f.static_ { "public static " } "var "{f.name}": "{to_haxe_type(&ctx[f.ty], ctx)}
+                if let Some(init) = &f.initializer {
+                    " = "{init.display_simple(ctx, &new_opts)}
+                }
+                ";"
                 if opts.show_field_indices {
                     "  // F"{i}", type@"{f.ty.0}
                 }
@@ -458,7 +462,43 @@ enum CallHandling<'a> {
     Normal,
 }
 
+/// Helper struct for displaying simple expressions
+pub struct SimpleExprDisplay<'a> {
+    expr: &'a Expr,
+    code: &'a Bytecode,
+}
+
+impl<'a> Display for SimpleExprDisplay<'a> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self.expr {
+            Expr::Constant(c) => match c {
+                Constant::InlineInt(i) => write!(f, "{}", i),
+                Constant::Int(r) => write!(f, "{}", self.code[*r]),
+                Constant::Float(r) => write!(f, "{}", self.code[*r]),
+                Constant::String(r) => write!(f, "\"{}\"", self.code[*r]),
+                Constant::Bool(b) => write!(f, "{}", if *b { "true" } else { "false" }),
+                Constant::Null => write!(f, "null"),
+                Constant::This => write!(f, "this"),
+                Constant::TypeRef(t) => write!(f, "{}", to_haxe_type(&self.code[*t], self.code)),
+            },
+            Expr::Ident(s) => write!(f, "{}", s),
+            Expr::Variable(_, Some(name)) => write!(f, "{}", name),
+            _ => write!(f, "[complex expr]"),
+        }
+    }
+}
+
 impl Expr {
+    /// Display a simple expression without needing a Function context.
+    /// Works for constants and identifiers (used for field initializers).
+    pub fn display_simple<'a>(
+        &'a self,
+        code: &'a Bytecode,
+        _opts: &'a FormatOptions,
+    ) -> impl Display + 'a {
+        SimpleExprDisplay { expr: self, code }
+    }
+
     pub fn display<'a>(
         &'a self,
         indent: &'a FormatOptions,

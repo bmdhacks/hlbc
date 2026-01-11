@@ -26,15 +26,34 @@ The decompiler transforms HashLink bytecode opcodes into an AST, then formats th
 Opcodes → DecompilerState → AST (Statement/Expr) → Formatted Output
 ```
 
+### Multi-Pass Architecture (In Progress)
+
+A new multi-pass architecture is being implemented:
+
+```
+Bytecode → Lifter → CFG → Analyzer → SSA-CFG → Structurer → AST → Printer → Haxe
+```
+
+| Pass | Module | Purpose |
+|------|--------|---------|
+| 1 | `lifter.rs` | Build petgraph CFG from bytecode |
+| 2 | `analyzer.rs` | Compute dominators, identify loops, detect reducibility |
+| 3 | `type_prop.rs` | (Planned) Infer types from usage |
+| 4 | `structurer.rs` | (Planned) Interval Analysis / Relooper |
+| 5 | `fmt.rs` | Print AST as Haxe code |
+
 ### Key Files
 
 | File | Purpose |
 |------|---------|
 | `src/lib.rs` | Main decompilation loop, opcode handlers, `DecompilerState` |
+| `src/lifter.rs` | Pass 1: CFG construction using petgraph |
+| `src/analyzer.rs` | Pass 2: Dominator trees, natural loop detection |
 | `src/ast.rs` | AST types: `Statement`, `Expr`, `Constant` |
 | `src/scopes.rs` | Scope stack for control flow (if/else, loops, switch, try/catch) |
 | `src/fmt.rs` | AST → string formatting with indentation |
 | `src/post.rs` | Post-processing visitors for AST cleanup |
+| `src/liveness/` | Live range analysis for variable naming |
 
 ### Core Data Structures
 
@@ -215,21 +234,21 @@ Example:
 4. **Closures**: Anonymous functions decompile but references may show as indices
 5. **Array iteration**: `for (x in arr)` compiles to low-level iterator with `.bytes` access that can't be reconstructed. Use explicit while loops with indexing instead.
 
-### Round-Trip Test Status (as of 2026-01-10)
+### Round-Trip Test Status (as of 2026-01-11)
 
 **16/21 tests pass.** The remaining 5 failures have known limitations:
 
-**Multi-class tests** (Inheritance, InterfaceTest, StaticMembers)
-- These tests have multiple classes but the test infrastructure only extracts one class
-- Need to extract all user classes from decompiled output, not just the main class
+**DefaultParams.hx** - Unknown identifier issue
+- Variable scoping/initialization problem
 
-**PropertyAccess.hx** - Type coercion issue
-- The decompiler outputs `Std.string(value)` in a context where `Int` is expected
-- This is a pre-existing issue with property getter/setter decompilation
+**ForLoop.hx** - Uninitialized variable
+- Variable used without being initialized in decompiled output
 
-**DefaultParams.hx** - `hl.Ref` type parameter
-- HashLink's `hl.Ref<T>` type needs proper generic parameter handling
-- Currently outputs `hl.Ref` without the type parameter
+**InterfaceTest.hx / IntMapTest.hx** - Method resolution
+- `p.[method_0]()` syntax - interface method calls not properly resolved
+
+**TryCatch.hx** - Private field access
+- Cannot access private field `unwrap` on exception object
 
 ## Code Quality Checklist
 

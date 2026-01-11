@@ -37,12 +37,15 @@ full list of commands.",
   decomp <idx>      Decompile a function
   refto <type@idx>  Find references to an element
   type <idx>        Show type definition
+  assigns <idx>     Show variable name assignments
+  dbginfo <idx>     Show debug info summary (file, lines)
 
 EXAMPLES:
   hlbc game.hl                     Open bytecode interactively
   hlbc game.hl -c 'help'           Show all interactive commands
   hlbc game.hl -c 'info'           Show info and exit
   hlbc game.hl -c 'sfn update'     Search for 'update' functions
+  hlbc game.hl -c 'assigns 42'     Show variable names for function 42
   hlbc game.hl -w 'decomp 42'      Watch file and re-decompile on change
   hlbc game.hl --gen-externs -o externs/    Generate Haxe extern definitions"
 )]
@@ -299,6 +302,18 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Only enter interactive mode if stdin is a TTY
+    // This prevents hanging when invoked non-interactively (e.g., by Claude or via pipes)
+    if !atty::is(atty::Stream::Stdin) {
+        eprintln!("No command specified and stdin is not a terminal.");
+        eprintln!("Use -c 'command' to run a command non-interactively, or run interactively from a terminal.");
+        eprintln!("Examples:");
+        eprintln!("  hlbc file.hl -c 'info'           Show bytecode info");
+        eprintln!("  hlbc file.hl -c 'help'           Show available commands");
+        eprintln!("  hlbc file.hl --decompile-all -o dir/  Decompile all types");
+        return Ok(());
+    }
+
     'main: loop {
         let mut line = String::new();
         stdout.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)))?;
@@ -383,6 +398,10 @@ ANALYSIS
   decompt      <idx>            Decompile entire type (class/enum) to source
   dump-types   [prefix]         Dump all types (optionally filtered by prefix)
 
+DEBUG INFO
+  assigns      <findex>         Show variable name assignments for a function
+  dbginfo      <findex>         Show debug info summary (file, line range, stats)
+
 OUTPUT
   saveto       <filename>       Write bytecode to file (for round-trip testing)
 
@@ -409,7 +428,9 @@ EXAMPLES
   > refto fun@42                Find all calls to function 42
   > callgraph 42 3              Show call graph 3 levels deep
   > string ..20                 Show first 20 strings
-  > type 0..5; global 0..3      Run multiple commands (semicolon-separated)"#
+  > type 0..5; global 0..3      Run multiple commands (semicolon-separated)
+  > assigns 42                  Show variable names for function 42
+  > dbginfo 42                  Show source file/line summary for function 42"#
             );
         }
         Command::Explain(s) => {
@@ -761,9 +782,10 @@ EXAMPLES
             match ty {
                 Type::Obj(obj) => {
                     println!("Dumping type@{idx} : {}", ty.display::<EnhancedFmt>(code));
+                    let static_inits = hlbc_decompiler::extract_static_initializers(code);
                     println!(
                         "{}",
-                        hlbc_decompiler::decompile_class(code, obj)
+                        hlbc_decompiler::decompile_class(code, obj, &static_inits)
                             .display(code, &hlbc_decompiler::fmt::FormatOptions::new(2))
                     );
                 }
@@ -772,6 +794,105 @@ EXAMPLES
         }
         Command::DumpTypes(prefix) => {
             dump_types(code, prefix.as_deref());
+        }
+        Command::Assigns(idx) => {
+            match code.get(RefFun(idx)) {
+                FunPtr::Fun(f) => {
+                    println!(
+                        "Variable assignments for {}",
+                        f.display_header::<EnhancedFmt>(code)
+                    );
+                    if let Some(assigns) = &f.assigns {
+                        if assigns.is_empty() {
+                            println!("  (no variable assignments)");
+                        } else {
+                            println!();
+                            for (name_ref, op_idx) in assigns {
+                                let name = code.get(*name_ref);
+                                let op = &f.ops[*op_idx];
+                                println!(
+                                    "  {:<20} at op {:>3}: {}",
+                                    name,
+                                    op_idx,
+                                    op.display(code, f, *op_idx as i32, 11)
+                                );
+                            }
+                        }
+                    } else {
+                        println!("  No debug info (assigns) in this function");
+                    }
+                }
+                FunPtr::Native(n) => {
+                    println!(
+                        "{} is a native function (no assigns)",
+                        n.display::<EnhancedFmt>(code)
+                    );
+                }
+            }
+        }
+        Command::DebugSummary(idx) => {
+            let debug_files = require_debug_info(code)?;
+            match code.get(RefFun(idx)) {
+                FunPtr::Fun(f) => {
+                    println!(
+                        "Debug info for {}",
+                        f.display_header::<EnhancedFmt>(code)
+                    );
+                    if let Some(debug_info) = &f.debug_info {
+                        // Collect stats per file
+                        let mut file_stats: std::collections::BTreeMap<usize, (usize, usize, usize)> =
+                            std::collections::BTreeMap::new();
+
+                        for (file_idx, line) in debug_info {
+                            let entry = file_stats.entry(*file_idx).or_insert((*line, *line, 0));
+                            entry.0 = entry.0.min(*line); // min line
+                            entry.1 = entry.1.max(*line); // max line
+                            entry.2 += 1; // op count
+                        }
+
+                        println!();
+                        println!("  Source files:");
+                        for (file_idx, (min_line, max_line, op_count)) in &file_stats {
+                            println!(
+                                "    file@{:<3} {} : lines {}-{} ({} ops)",
+                                file_idx,
+                                &debug_files[*file_idx],
+                                min_line,
+                                max_line,
+                                op_count
+                            );
+                        }
+
+                        println!();
+                        println!("  Summary:");
+                        println!("    Total opcodes: {}", f.ops.len());
+                        println!("    Total registers: {}", f.regs.len());
+
+                        if let Some(assigns) = &f.assigns {
+                            println!("    Variable assignments: {}", assigns.len());
+                            if !assigns.is_empty() {
+                                println!();
+                                println!("  Variable assignments:");
+                                for (name_ref, op_idx) in assigns {
+                                    let name = code.get(*name_ref);
+                                    println!("    {:<20} at op {:>3}", name, op_idx);
+                                }
+                            }
+                        } else {
+                            println!("    Variable assignments: (none)");
+                        }
+                    } else {
+                        println!("  No debug info in this function");
+                    }
+                }
+                FunPtr::Native(n) => {
+                    println!(
+                        "{} is a native function from {}",
+                        n.display::<EnhancedFmt>(code),
+                        n.lib(code)
+                    );
+                }
+            }
         }
     }
     Ok(())

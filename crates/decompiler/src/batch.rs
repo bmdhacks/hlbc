@@ -14,7 +14,7 @@ use hlbc::types::Type;
 use hlbc::{Bytecode, Resolve};
 
 use crate::fmt::FormatOptions;
-use crate::{decompile_class, decompile_function};
+use crate::{decompile_class, decompile_function, extract_static_initializers, StaticInitMap};
 
 /// Index file containing mappings from names to bytecode indices.
 #[cfg(feature = "batch")]
@@ -95,6 +95,7 @@ pub struct BatchDecompiler<'a> {
     code: &'a Bytecode,
     opts: FormatOptions,
     batch_opts: BatchOptions,
+    static_inits: StaticInitMap,
 }
 
 impl<'a> BatchDecompiler<'a> {
@@ -104,6 +105,7 @@ impl<'a> BatchDecompiler<'a> {
             code,
             opts: FormatOptions::with_fun_indices(2),
             batch_opts: BatchOptions::default(),
+            static_inits: extract_static_initializers(code),
         }
     }
 
@@ -113,6 +115,7 @@ impl<'a> BatchDecompiler<'a> {
             code,
             opts: FormatOptions::with_fun_indices(2),
             batch_opts,
+            static_inits: extract_static_initializers(code),
         }
     }
 
@@ -145,8 +148,9 @@ impl<'a> BatchDecompiler<'a> {
                 }
 
                 // Decompile and write (with panic recovery)
+                let static_inits = &self.static_inits;
                 let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                    let class = decompile_class(self.code, obj);
+                    let class = decompile_class(self.code, obj, static_inits);
                     let display = class.display_with_index(self.code, &self.opts, Some(type_idx));
                     let s = display.to_string();
                     s

@@ -47,6 +47,7 @@ mod tests {
     use crate::Bytecode;
 
     #[test]
+    #[ignore] // Requires ../../data/Empty.hl which is not in repo
     fn test_files() {
         let code = Bytecode::from_file("../../data/Empty.hl").unwrap();
         let files = functions_in_files(&code);
@@ -54,6 +55,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Requires ../../data/Empty.hl which is not in repo
     fn test_lines() {
         let code = Bytecode::from_file("../../data/Empty.hl").unwrap();
         let files = files_in_function(&code, code.entrypoint());

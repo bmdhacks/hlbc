@@ -251,6 +251,7 @@ mod tests {
     use crate::Bytecode;
 
     #[test]
+    #[ignore] // Requires ../../data/Empty.hl which is not in repo
     fn list_fun() {
         let code = Bytecode::from_file("../../data/Empty.hl").unwrap();
         for (i, fun) in code.functions.iter().enumerate() {
@@ -259,6 +260,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Requires ../../data/Empty.hl which is not in repo
     fn test() {
         let code = Bytecode::from_file("../../data/Empty.hl").unwrap();
         let mut usage = FullUsageReport::new(&code);

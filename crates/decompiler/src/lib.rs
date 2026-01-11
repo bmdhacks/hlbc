@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use ast::*;
 use hlbc::fmt::EnhancedFmt;
 use hlbc::opcodes::Opcode;
-use hlbc::types::{Function, ObjProto, RefField, RefFun, RefString, RefType, Reg, Type, TypeObj};
+use hlbc::types::{Function, ObjProto, RefField, RefFun, RefGlobal, RefString, RefType, Reg, Type, TypeObj};
 use hlbc::{Bytecode, Resolve, Str};
 use scopes::*;
 
@@ -23,12 +23,114 @@ pub mod batch;
 pub mod fmt;
 /// Native function name lookup
 pub mod natives;
+/// Pass 1: CFG construction using petgraph
+pub mod lifter;
+/// Pass 2: Dominator computation and loop detection
+pub mod analyzer;
 /// Liveness analysis for accurate variable naming
 mod liveness;
 /// AST post-processing
 mod post;
 /// Scope handling structures
 mod scopes;
+
+/// Map from (static_type_global, field_index) -> initialization Expr
+/// Used to track static field initializers extracted from the entrypoint function.
+pub type StaticInitMap = HashMap<(RefGlobal, RefField), Expr>;
+
+/// Extract static field initializers from the entrypoint function.
+///
+/// Static fields are initialized in the entrypoint via SetField operations:
+/// ```text
+/// OInt      r12 = 10           # Load value into register
+/// OGetGlobal r19 = G4          # Load static type ($Counter)
+/// OSetField r19.F6 = r12       # Set MULTIPLIER field
+/// ```
+pub fn extract_static_initializers(code: &Bytecode) -> StaticInitMap {
+    let mut result = HashMap::new();
+    let entrypoint = code.entrypoint();
+
+    // Track register values as we scan opcodes
+    let mut reg_values: HashMap<Reg, Expr> = HashMap::new();
+    // Track which register holds which global (for static type refs)
+    let mut reg_globals: HashMap<Reg, RefGlobal> = HashMap::new();
+
+    for op in entrypoint.ops.iter() {
+        match op {
+            // Track constant loads
+            Opcode::Int { dst, ptr } => {
+                reg_values.insert(*dst, Expr::Constant(Constant::Int(*ptr)));
+            }
+            Opcode::Float { dst, ptr } => {
+                reg_values.insert(*dst, Expr::Constant(Constant::Float(*ptr)));
+            }
+            Opcode::Bool { dst, value } => {
+                reg_values.insert(*dst, Expr::Constant(Constant::Bool(*value)));
+            }
+            Opcode::String { dst, ptr } => {
+                reg_values.insert(*dst, Expr::Constant(Constant::String(*ptr)));
+            }
+            Opcode::Null { dst } => {
+                reg_values.insert(*dst, Expr::Constant(Constant::Null));
+            }
+
+            // Track GetGlobal - remember which register holds which global
+            Opcode::GetGlobal { dst, global } => {
+                reg_globals.insert(*dst, *global);
+                // Also check if this global is a string constant
+                if let Some(expr) = global_to_expr(code, *global) {
+                    reg_values.insert(*dst, expr);
+                }
+            }
+
+            // SetField on a static type global -> record the initialization
+            Opcode::SetField { obj, field, src } => {
+                if let Some(&global) = reg_globals.get(obj) {
+                    // Check if this global is a static type ($ClassName)
+                    if is_static_type_global(code, global) {
+                        if let Some(value) = reg_values.get(src).cloned() {
+                            result.insert((global, *field), value);
+                        }
+                    }
+                }
+            }
+
+            _ => {}
+        }
+    }
+    result
+}
+
+/// Check if a global holds a static type (name starts with $).
+/// Note: GetGlobal opcode uses 0-based global indexing directly into code.globals.
+fn is_static_type_global(code: &Bytecode, global: RefGlobal) -> bool {
+    if let Some(global_type) = code.globals.get(global.0) {
+        match &code[*global_type] {
+            Type::Obj(obj) | Type::Struct(obj) => {
+                code[obj.name].starts_with('$')
+            }
+            _ => false,
+        }
+    } else {
+        false
+    }
+}
+
+/// Convert a global reference to an Expr if it represents a constant value.
+/// Note: GetGlobal opcode uses 0-based global indexing directly into code.globals.
+fn global_to_expr(code: &Bytecode, global: RefGlobal) -> Option<Expr> {
+    // For string globals, look up the constant value
+    let global_type = code.globals.get(global.0)?;
+    // String type is index 13
+    if global_type.0 == 13 {
+        let const_idx = code.globals_initializers.get(&global)?;
+        let constants = code.constants.as_ref()?;
+        let def = constants.get(*const_idx)?;
+        let string_idx = *def.fields.first()?;
+        return Some(Expr::Constant(Constant::String(RefString(string_idx))));
+    }
+    None
+}
 
 /// Detect loop counter registers by looking ahead from a Label to find Incr ops.
 /// Returns a set of registers that are incremented within the loop body.
@@ -227,11 +329,11 @@ impl<'c> DecompilerState<'c> {
         // Pre-scan all loop counters so we can handle Int opcodes before the Label
         let all_loop_counters = prescan_all_loop_counters(&f.ops);
 
-        // Compute live ranges for accurate variable naming across control flow
-        // Use CFG-based analysis to properly handle branches that merge
-        let cfg = liveness::CFG::build(&f.ops);
-        let liveness_info = liveness::compute_liveness(&cfg);
-        let live_ranges = liveness::ranges::extract_live_ranges(&cfg, &liveness_info, f.regs.len());
+        // Compute live ranges for accurate variable naming across control flow.
+        // Use opcode-level precise analysis to ensure each register definition
+        // gets its own live range ID, enabling SSA-style unique variable names.
+        // This prevents type conflicts when a register is reused for different types.
+        let live_ranges = liveness::ranges::extract_live_ranges_precise(&f.ops);
 
         Self {
             scopes,
@@ -255,16 +357,23 @@ impl<'c> DecompilerState<'c> {
     }
 
     /// Check if a register is a loop counter in any active loop scope
+    #[allow(dead_code)] // Reserved for future use
     fn is_loop_counter(&self, reg: Reg) -> bool {
         self.loop_counters.iter().any(|counters| counters.contains(&reg))
     }
 
-    /// Generate a variable name for a register
+    /// Generate a unique synthetic variable name for a register.
+    /// Ensures the generated name doesn't conflict with existing names (including debug names).
     fn var_name(&mut self, reg: Reg) -> Str {
-        let name: Str = format!("v{}", self.synthetic_var_counter).into();
-        self.synthetic_var_counter += 1;
-        self.name_to_reg.insert(name.clone(), reg);
-        name
+        // Keep incrementing until we find an unused name
+        loop {
+            let name: Str = format!("v{}", self.synthetic_var_counter).into();
+            self.synthetic_var_counter += 1;
+            if !self.name_to_reg.contains_key(&name) {
+                self.name_to_reg.insert(name.clone(), reg);
+                return name;
+            }
+        }
     }
 
     /// Get or create a variable name for a definition at a specific opcode index.
@@ -287,12 +396,41 @@ impl<'c> DecompilerState<'c> {
                 return cached_name;
             }
 
-            // Create new name - prefer debug name if available
-            let name = debug_name.unwrap_or_else(|| {
-                let n: Str = format!("v{}", self.synthetic_var_counter).into();
-                self.synthetic_var_counter += 1;
-                n
-            });
+            // Create new name - prefer debug name if available, but check for conflicts.
+            // The Haxe compiler may incorrectly map multiple registers to the same debug name,
+            // especially when registers are reused for different types (e.g., Int then String).
+            // If the debug name is already taken by a DIFFERENT register, generate a unique
+            // synthetic name instead to prevent type conflicts in the output.
+            let name = if let Some(ref dn) = debug_name {
+                // Check if this debug name is already taken by a different register
+                if let Some(&existing_reg) = self.name_to_reg.get(dn) {
+                    if existing_reg != reg {
+                        // Name collision with different register - generate unique synthetic name
+                        loop {
+                            let n: Str = format!("v{}", self.synthetic_var_counter).into();
+                            self.synthetic_var_counter += 1;
+                            if !self.name_to_reg.contains_key(&n) {
+                                break n;
+                            }
+                        }
+                    } else {
+                        // Same register - reuse the name
+                        dn.clone()
+                    }
+                } else {
+                    // Name not taken - use debug name
+                    dn.clone()
+                }
+            } else {
+                // No debug name - generate unique synthetic name
+                loop {
+                    let n: Str = format!("v{}", self.synthetic_var_counter).into();
+                    self.synthetic_var_counter += 1;
+                    if !self.name_to_reg.contains_key(&n) {
+                        break n;
+                    }
+                }
+            };
 
             self.range_to_name.insert(range_id, name.clone());
             self.name_to_reg.insert(name.clone(), reg);
@@ -398,10 +536,26 @@ impl<'c> DecompilerState<'c> {
             // This ensures consistent names across control flow (e.g., if-else branches).
             let var_name = self.var_name_for_def(dst, i, name.clone());
 
+            // Re-check if this name was declared, using the ACTUAL name returned by var_name_for_def.
+            // This is necessary because collision detection may have returned a different name
+            // than the debug name we originally checked.
+            let actual_name_already_declared = if let Some(ref n) = name {
+                // If var_name_for_def returned a different name due to collision,
+                // check if the NEW name was already declared
+                if var_name != *n {
+                    // Collision occurred - the new name should be fresh (not declared)
+                    false
+                } else {
+                    name_already_declared
+                }
+            } else {
+                name_already_declared
+            };
+
             // A name is a new declaration if:
             // 1. It's a new live range AND the name wasn't already declared, OR
             // 2. It's a new logical variable (debug name differs from cached range name)
-            let is_declaration = (is_new_range && !name_already_declared) || (is_new_variable && !name_already_declared);
+            let is_declaration = (is_new_range && !actual_name_already_declared) || (is_new_variable && !actual_name_already_declared);
 
             self.reg_state
                 .insert(dst, Expr::Variable(dst, Some(var_name.clone())));
@@ -460,6 +614,7 @@ impl<'c> DecompilerState<'c> {
     }
 
     /// Expands expressions with correct variable names at a specific opcode index.
+    #[allow(dead_code)] // Reserved for future use
     fn args_expr_at(&self, args: &[Reg], op_index: usize) -> Vec<Expr> {
         args.iter().map(|&r| self.expr_at(r, op_index)).collect()
     }
@@ -476,8 +631,14 @@ impl<'c> DecompilerState<'c> {
         }
 
         // Need to materialize: create a synthetic variable name
-        let var_name: Str = format!("v{}", self.synthetic_var_counter).into();
-        self.synthetic_var_counter += 1;
+        // Ensure we don't collide with existing names (including debug names)
+        let var_name: Str = loop {
+            let name: Str = format!("v{}", self.synthetic_var_counter).into();
+            self.synthetic_var_counter += 1;
+            if !self.name_to_reg.contains_key(&name) {
+                break name;
+            }
+        };
 
         let var_expr = Expr::Variable(reg, Some(var_name.clone()));
 
@@ -596,10 +757,15 @@ impl<'c> DecompilerState<'c> {
                         }
                     });
 
+                    // Generate a unique synthetic name that doesn't conflict with existing names
                     let var_name: Str = existing_var_name.unwrap_or_else(|| {
-                        let name = format!("v{}", self.synthetic_var_counter).into();
-                        self.synthetic_var_counter += 1;
-                        name
+                        loop {
+                            let name: Str = format!("v{}", self.synthetic_var_counter).into();
+                            self.synthetic_var_counter += 1;
+                            if !self.name_to_reg.contains_key(&name) {
+                                break name;
+                            }
+                        }
                     });
                     let var_expr = Expr::Variable(dst, Some(var_name.clone()));
 
@@ -869,12 +1035,17 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
                     let to_hoist = detect_hoisting_needed(&f.ops, i, loop_end_pos, f, code);
                     for (reg, debug_name) in to_hoist {
                         // Create variable name and emit uninitialized declaration
+                        // Generate unique synthetic name if no debug name provided
                         let var_name = debug_name.unwrap_or_else(|| {
-                            let n: Str = format!("v{}", state.synthetic_var_counter).into();
-                            state.synthetic_var_counter += 1;
-                            n
+                            loop {
+                                let n: Str = format!("v{}", state.synthetic_var_counter).into();
+                                state.synthetic_var_counter += 1;
+                                if !state.name_to_reg.contains_key(&n) {
+                                    break n;
+                                }
+                            }
                         });
-                        // Only emit if not already declared
+                        // Only emit if not already declared (handles case where debug name exists)
                         if !state.name_to_reg.contains_key(&var_name) {
                             state.name_to_reg.insert(var_name.clone(), reg);
                             state.reg_state.insert(reg, Expr::Variable(reg, Some(var_name.clone())));
@@ -999,8 +1170,14 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
                 // Check if this register is a loop counter - if so, emit as variable declaration
                 // This handles the case where `Int reg = 0` (loop init) happens BEFORE the Label
                 if state.all_loop_counters.contains(&dst) {
-                    let var_name: Str = format!("v{}", state.synthetic_var_counter).into();
-                    state.synthetic_var_counter += 1;
+                    // Generate unique synthetic name
+                    let var_name: Str = loop {
+                        let name: Str = format!("v{}", state.synthetic_var_counter).into();
+                        state.synthetic_var_counter += 1;
+                        if !state.name_to_reg.contains_key(&name) {
+                            break name;
+                        }
+                    };
                     let var_expr = Expr::Variable(dst, Some(var_name.clone()));
                     let declaration = !state.name_to_reg.contains_key(&var_name);
                     state.name_to_reg.insert(var_name.clone(), dst);
@@ -1040,8 +1217,14 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
                 // Only create a synthetic variable for complex expressions.
                 if !matches!(&src_expr, Expr::Variable(_, _)) {
                     let name = f.var_name(code, i).or_else(|| {
-                        state.synthetic_var_counter += 1;
-                        Some(format!("v{}", state.synthetic_var_counter - 1).into())
+                        // Generate unique synthetic name
+                        loop {
+                            let n: Str = format!("v{}", state.synthetic_var_counter).into();
+                            state.synthetic_var_counter += 1;
+                            if !state.name_to_reg.contains_key(&n) {
+                                break Some(n);
+                            }
+                        }
                     });
                     // Use src register index (not dst!) so the variable refers to the correct register
                     state.reg_state.insert(src, Expr::Variable(src, name));
@@ -1194,8 +1377,14 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
                     if name.is_some() {
                         state.push_expr(i, *dst, call);
                     } else {
-                        let var_name: Str = format!("v{}", state.synthetic_var_counter).into();
-                        state.synthetic_var_counter += 1;
+                        // Generate unique synthetic name
+                        let var_name: Str = loop {
+                            let name: Str = format!("v{}", state.synthetic_var_counter).into();
+                            state.synthetic_var_counter += 1;
+                            if !state.name_to_reg.contains_key(&name) {
+                                break name;
+                            }
+                        };
                         let var_expr = Expr::Variable(*dst, Some(var_name.clone()));
 
                         let declaration = !state.name_to_reg.contains_key(&var_name);
@@ -1861,7 +2050,7 @@ pub fn decompile_function(code: &Bytecode, f: &Function) -> Method {
 }
 
 /// Decompile a class with its static and instance fields and methods.
-pub fn decompile_class(code: &Bytecode, obj: &TypeObj) -> Class {
+pub fn decompile_class(code: &Bytecode, obj: &TypeObj, static_inits: &StaticInitMap) -> Class {
     let static_type = obj.get_static_type(code);
 
     let mut fields = Vec::new();
@@ -1876,20 +2065,29 @@ pub fn decompile_class(code: &Bytecode, obj: &TypeObj) -> Class {
             name: f.name(code).to_owned(),
             static_: false,
             ty: f.t,
+            initializer: None, // Instance fields don't have initializers from entrypoint
         });
     }
     if let Some(ty) = static_type {
+        // Convert from 1-based TypeObj.global to 0-based opcode global indexing
+        let static_global = if obj.global.0 > 0 {
+            RefGlobal(obj.global.0 - 1)
+        } else {
+            obj.global
+        };
+
         for (i, f) in ty.own_fields.iter().enumerate() {
-            if ty
-                .bindings
-                .contains_key(&RefField(i + ty.fields.len() - ty.own_fields.len()))
-            {
+            let field_idx = RefField(i + ty.fields.len() - ty.own_fields.len());
+            if ty.bindings.contains_key(&field_idx) {
                 continue;
             }
+            // Look up initializer from entrypoint analysis
+            let initializer = static_inits.get(&(static_global, field_idx)).cloned();
             fields.push(ClassField {
                 name: f.name(code).to_owned(),
                 static_: true,
                 ty: f.t,
+                initializer,
             });
         }
     }
@@ -1976,7 +2174,7 @@ mod tests {
 
     use hlbc::Bytecode;
 
-    use crate::{decompile_class, decompile_code, decompile_function};
+    use crate::{decompile_class, decompile_code, decompile_function, extract_static_initializers};
 
     #[test]
     fn decomp_code_all() {
@@ -2015,8 +2213,9 @@ mod tests {
             if let Some(ext) = path.extension() {
                 if ext == "hl" {
                     let code = Bytecode::from_file(&path).unwrap();
+                    let static_inits = extract_static_initializers(&code);
                     for t in code.types.iter().filter_map(|t| t.get_type_obj()) {
-                        black_box(decompile_class(&code, t));
+                        black_box(decompile_class(&code, t, &static_inits));
                     }
                 }
             }
@@ -2024,13 +2223,15 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Requires local game files
     fn decomp_northgard() {
         let code = Bytecode::from_file("E:\\Games\\Northgard\\hlboot.dat").unwrap();
+        let static_inits = extract_static_initializers(&code);
         for f in &code.functions {
             black_box(decompile_code(&code, f));
         }
         for t in code.types.iter().filter_map(|t| t.get_type_obj()) {
-            black_box(decompile_class(&code, t));
+            black_box(decompile_class(&code, t, &static_inits));
         }
         for f in &code.functions {
             black_box(decompile_function(&code, f));
@@ -2038,13 +2239,15 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Requires local game files
     fn decomp_wartales() {
         let code = Bytecode::from_file("E:\\Games\\Wartales\\hlboot.dat").unwrap();
+        let static_inits = extract_static_initializers(&code);
         for f in &code.functions {
             black_box(decompile_code(&code, f));
         }
         for t in code.types.iter().filter_map(|t| t.get_type_obj()) {
-            black_box(decompile_class(&code, t));
+            black_box(decompile_class(&code, t, &static_inits));
         }
         for f in &code.functions {
             black_box(decompile_function(&code, f));

@@ -22,6 +22,7 @@ pub struct ClassField {
     pub name: Str,
     pub ty: RefType,
     pub static_: bool,
+    pub initializer: Option<Expr>,
 }
 
 #[derive(Debug)]

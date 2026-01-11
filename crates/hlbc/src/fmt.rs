@@ -954,12 +954,14 @@ mod test {
     }
 
     #[test]
+    #[ignore] // Requires local game files
     fn fmt_wartales() {
         let path = "E:\\Games\\Wartales\\hlboot.dat";
         test_fmt(path);
     }
 
     #[test]
+    #[ignore] // Requires local game files
     fn fmt_northgard() {
         let path = "E:\\Games\\Northgard\\hlboot.dat";
         test_fmt(path);

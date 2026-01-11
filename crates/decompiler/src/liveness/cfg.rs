@@ -1,6 +1,8 @@
 //! Control Flow Graph construction for liveness analysis
 //!
 //! Builds a CFG from HashLink opcodes, identifying basic blocks and edges.
+//!
+//! NOTE: This module will be reworked in Phase 2 to use petgraph.
 
 use std::collections::{HashMap, HashSet};
 
@@ -225,7 +227,7 @@ fn compute_block_def_use(
 /// Find successor block indices for a block.
 fn find_successors(
     ops: &[Opcode],
-    start: usize,
+    _start: usize,
     end: usize,
     block_starts: &HashSet<usize>,
 ) -> Vec<usize> {

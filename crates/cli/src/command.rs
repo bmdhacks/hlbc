@@ -59,6 +59,10 @@ pub enum Command {
     Decomp(usize),
     /// Dump type information with optional prefix filter
     DumpTypes(Option<Str>),
+    /// Show variable name assignments for a function
+    Assigns(usize),
+    /// Show debug info summary for a function (file, line range)
+    DebugSummary(usize),
 }
 
 // Used a default max values for index ranges
@@ -117,19 +121,18 @@ pub fn command_parser(ctx: &ParseContext) -> impl Parser<char, Command, Error = 
 
     let string = string();
 
-    // We split the parsers in 2 to not overflow the tuple maximum size
+    // We split the parsers into groups to not overflow the tuple maximum size
 
     let core_cmds = choice((
         cmd!("exit" => Exit),
         cmd!("help" => Help),
         cmd!("explain"; string.clone() => Explain),
         cmd!("wiki" => Wiki),
-    ));
-
-    choice((
-        core_cmds,
         cmd!("info" => Info),
         cmd!("entrypoint" => Entrypoint),
+    ));
+
+    let data_cmds = choice((
         cmd!("int", "i"; index_range(ctx.int_max) => Int),
         cmd!("float", "fl"; index_range(ctx.float_max) => Float),
         cmd!("string", "s"; index_range(ctx.string_max) => String),
@@ -140,6 +143,9 @@ pub fn command_parser(ctx: &ParseContext) -> impl Parser<char, Command, Error = 
         cmd!("global", "g"; index_range(ctx.global_max) => Global),
         cmd!("constant", "c"; index_range(ctx.constant_max) => Constant),
         cmd!("native", "n"; index_range(ctx.native_max) => Native),
+    ));
+
+    let fn_cmds = choice((
         cmd!("fnh"; index_range(ctx.findex_max) => FunctionHeader),
         cmd!("fn", "f"; index_range(ctx.findex_max) => Function),
         cmd!("fnamed", "fnn"; string.clone() => FunctionNamed),
@@ -151,6 +157,9 @@ pub fn command_parser(ctx: &ParseContext) -> impl Parser<char, Command, Error = 
                 .map(|v| InFile(FileOrIndex::File(v.into_iter().collect()))),
         ))),
         cmd!("fileof"; num() => FileOf),
+    ));
+
+    let analysis_cmds = choice((
         cmd!("saveto"; string.clone() => SaveTo),
         cmd!("callgraph")
             .ignore_then(num())
@@ -168,7 +177,11 @@ pub fn command_parser(ctx: &ParseContext) -> impl Parser<char, Command, Error = 
         cmd!("dump-types")
             .ignore_then(string.clone().or_not())
             .map(|s| Command::DumpTypes(s.filter(|s| !s.is_empty()))),
-    ))
+        cmd!("assigns"; num() => Assigns),
+        cmd!("dbginfo", "dbg"; num() => DebugSummary),
+    ));
+
+    choice((core_cmds, data_cmds, fn_cmds, analysis_cmds))
 }
 
 fn string() -> impl Parser<char, Str, Error = Simple<char>> + Clone {
@@ -246,7 +259,7 @@ mod tests {
     fn test_index_single() {
         assert_eq!(
             (4..5).sum::<usize>(),
-            index_range(10).parse("4").unwrap().sum()
+            index_range(10).parse("4").unwrap().sum::<usize>()
         );
     }
 

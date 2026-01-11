@@ -1,15 +1,13 @@
 //! Live range extraction from liveness information
 //!
-//! Converts block-level liveness into per-opcode live ranges, where each
+//! Converts bytecode into per-opcode live ranges, where each
 //! live range represents a distinct value that should get a unique variable.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use hlbc::opcodes::Opcode;
 use hlbc::types::Reg;
 
-use super::cfg::CFG;
-use super::dataflow::LivenessInfo;
 use super::def_use::{get_defs, get_uses};
 
 /// A live range for a register value.
@@ -46,135 +44,20 @@ impl LiveRangeMap {
     }
 
     /// Get the live range for a register at a specific opcode index.
+    #[allow(dead_code)] // Used in tests
     pub fn get_range(&self, reg: Reg, op_index: usize) -> Option<&LiveRange> {
         self.get_range_id(reg, op_index)
             .map(|id| &self.ranges[id])
     }
 
     /// Get all live ranges for a specific register.
+    #[allow(dead_code)] // Used in tests
     pub fn ranges_for_reg(&self, reg: Reg) -> Vec<&LiveRange> {
         self.ranges.iter().filter(|r| r.reg == reg).collect()
     }
 }
 
-/// Extract live ranges from CFG and liveness info.
-pub fn extract_live_ranges(cfg: &CFG, liveness: &LivenessInfo, _num_regs: usize) -> LiveRangeMap {
-    if cfg.ops_len == 0 {
-        return LiveRangeMap {
-            ranges: Vec::new(),
-            lookup: HashMap::new(),
-        };
-    }
-
-    // We need to track, for each register:
-    // - Current active live range (if any)
-    // - All completed live ranges
-    //
-    // Strategy: Walk through opcodes, tracking definitions and uses.
-    // When we see a def, start a new live range.
-    // When we see a use, extend the current live range.
-
-    // First, collect all ops from CFG blocks in order
-    // Note: We don't have direct access to ops, so we track by index
-    let mut ranges: Vec<LiveRange> = Vec::new();
-    let mut lookup: HashMap<(Reg, usize), usize> = HashMap::new();
-
-    // Track active ranges: reg -> (range_index, def_point)
-    let mut active: HashMap<Reg, usize> = HashMap::new();
-
-    // We need to process ops in order. Since CFG has blocks, we need to
-    // handle control flow merge points carefully.
-    //
-    // Simplified approach for now: process each block separately, using
-    // liveness info to handle cross-block flow.
-
-    // For each block in order
-    for &block_start in &cfg.block_order {
-        let block = &cfg.blocks[&block_start];
-        let live_in = &liveness.live_in[&block_start];
-
-        // At block entry, registers in live_in may have active ranges from predecessors
-        // For these, we need to ensure they're tracked
-        for reg in live_in {
-            if !active.contains_key(reg) {
-                // This register is live coming into the block but we haven't seen its def
-                // This means it was defined in a predecessor block
-                // Create a synthetic "incoming" range - we'll fix this up later
-                // For now, mark it as defined at block_start (approximate)
-                let range_id = ranges.len();
-                ranges.push(LiveRange {
-                    reg: *reg,
-                    def_point: block_start,
-                    last_use: block_start,
-                    use_count: 0,
-                });
-                active.insert(*reg, range_id);
-            }
-        }
-
-        // Process each opcode in the block
-        // We don't have direct access to ops here, but we have def/use info
-        // Let's track by index using the block's def/use sets
-
-        // For now, use a simplified per-block approach
-        // This won't be 100% accurate for complex control flow but handles
-        // the common case of linear code within blocks
-
-        // Registers defined in this block: start new ranges
-        for reg in &block.def {
-            // If there's an existing active range, it ends here
-            active.remove(reg);
-
-            // Start new range at block start (approximate - ideally at exact def point)
-            let range_id = ranges.len();
-            ranges.push(LiveRange {
-                reg: *reg,
-                def_point: block_start,
-                last_use: block.end,
-                use_count: 1, // At least one use (the def)
-            });
-            active.insert(*reg, range_id);
-            // Add lookup for all ops in this block for this register
-            for i in block_start..=block.end {
-                lookup.insert((*reg, i), range_id);
-            }
-        }
-
-        // Registers used but not defined in this block: they come from earlier blocks
-        for reg in &block.use_ {
-            if let Some(&range_id) = active.get(reg) {
-                // Extend the range
-                let range = &mut ranges[range_id];
-                if block.end > range.last_use {
-                    range.last_use = block.end;
-                }
-                range.use_count += 1;
-                // Add lookup entries
-                for i in block_start..=block.end {
-                    lookup.entry((*reg, i)).or_insert(range_id);
-                }
-            }
-        }
-
-        // Registers in live_out but not defined here: maintain their ranges
-        let live_out = &liveness.live_out[&block_start];
-        for reg in live_out {
-            if !block.def.contains(reg) {
-                if let Some(&range_id) = active.get(reg) {
-                    // Ensure range covers this block
-                    let range = &mut ranges[range_id];
-                    if block.end > range.last_use {
-                        range.last_use = block.end;
-                    }
-                }
-            }
-        }
-    }
-
-    LiveRangeMap { ranges, lookup }
-}
-
-/// More precise live range extraction that walks opcodes directly.
+/// Extract live ranges by walking opcodes directly.
 ///
 /// This version requires access to the actual opcodes array.
 pub fn extract_live_ranges_precise(ops: &[Opcode]) -> LiveRangeMap {

@@ -585,6 +585,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Requires local game files
     fn test_deserialize_wartales() {
         let path = "E:\\Games\\Wartales\\hlboot.dat";
         let code = Bytecode::from_file(path);
@@ -592,6 +593,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Requires local game files
     fn test_deserialize_northgard() {
         let path = "E:\\Games\\Northgard\\hlboot.dat";
         let code = Bytecode::from_file(path);
@@ -599,6 +601,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Requires local game files
     fn test_deserialize_deadcells() {
         let path = "E:\\Games\\DeadCells\\deadcells.exe";
         let code = Bytecode::from_file(path);
@@ -628,6 +631,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Requires ../../data/SpecialOpcodes.hl which is not in repo
     fn test_special_opcodes() -> crate::Result<()> {
         let code = Bytecode::from_file("../../data/SpecialOpcodes.hl")?;
         dbg!(&code.function_by_name("main").unwrap().ops);
