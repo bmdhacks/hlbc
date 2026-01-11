@@ -53,6 +53,63 @@ fn detect_loop_counters(ops: &[Opcode], label_pos: usize) -> HashSet<Reg> {
     counters
 }
 
+/// Detect variables that need hoisting - they have a debug name that first appears
+/// inside the scope but the register is used after the scope ends.
+///
+/// This handles cases where a register is initialized before the loop but the
+/// debug name (variable name) first appears in an assignment inside the loop.
+fn detect_hoisting_needed(
+    ops: &[Opcode],
+    scope_start: usize,
+    scope_end: usize,
+    f: &hlbc::types::Function,
+    code: &hlbc::Bytecode,
+) -> Vec<(Reg, Option<Str>)> {
+    use liveness::{get_defs, get_uses};
+
+    let mut needs_hoisting = Vec::new();
+
+    // Find debug names that appear BEFORE the scope
+    let mut names_before_scope: HashSet<Str> = HashSet::new();
+    for i in 0..scope_start {
+        if let Some(name) = f.var_name(code, i) {
+            names_before_scope.insert(name);
+        }
+    }
+
+    // Find debug names that FIRST appear inside the scope, with their registers
+    let mut names_first_in_scope: HashMap<Str, Reg> = HashMap::new();
+    for i in scope_start..=scope_end {
+        if let Some(name) = f.var_name(code, i) {
+            // Only if this name wasn't seen before the scope
+            if !names_before_scope.contains(&name) && !names_first_in_scope.contains_key(&name) {
+                // Find the register this name is associated with
+                for reg in get_defs(&ops[i]) {
+                    names_first_in_scope.insert(name.clone(), reg);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Check which of those names' registers are used after the scope
+    let mut used_after: HashSet<Reg> = HashSet::new();
+    for i in (scope_end + 1)..ops.len() {
+        for reg in get_uses(&ops[i]) {
+            used_after.insert(reg);
+        }
+    }
+
+    // If a name's register is used after the scope, it needs hoisting
+    for (name, reg) in names_first_in_scope {
+        if used_after.contains(&reg) {
+            needs_hoisting.push((reg, Some(name)));
+        }
+    }
+
+    needs_hoisting
+}
+
 /// Pre-scan the entire function to find ALL loop counter registers.
 /// This is called before processing any opcodes so that Int instructions
 /// that initialize loop counters can emit variable declarations.
@@ -214,9 +271,20 @@ impl<'c> DecompilerState<'c> {
     /// Uses live range analysis to ensure consistent naming across control flow.
     fn var_name_for_def(&mut self, reg: Reg, op_index: usize, debug_name: Option<Str>) -> Str {
         if let Some(range_id) = self.live_ranges.get_range_id(reg, op_index) {
-            // Reuse existing name for this live range
-            if let Some(name) = self.range_to_name.get(&range_id) {
-                return name.clone();
+            // Check if we have an existing name for this live range
+            if let Some(cached_name) = self.range_to_name.get(&range_id).cloned() {
+                // If debug name is provided and differs from cached name,
+                // the register is being reused for a different logical variable.
+                // Respect the debug name in this case.
+                if let Some(ref dn) = debug_name {
+                    if *dn != cached_name {
+                        // Different debug name - update the mapping
+                        self.range_to_name.insert(range_id, dn.clone());
+                        self.name_to_reg.insert(dn.clone(), reg);
+                        return dn.clone();
+                    }
+                }
+                return cached_name;
             }
 
             // Create new name - prefer debug name if available
@@ -231,7 +299,10 @@ impl<'c> DecompilerState<'c> {
             name
         } else {
             // Fallback if no live range info
-            debug_name.unwrap_or_else(|| self.var_name(reg))
+            let name = debug_name.unwrap_or_else(|| self.var_name(reg));
+            // Ensure name is registered even in fallback path
+            self.name_to_reg.entry(name.clone()).or_insert(reg);
+            name
         }
     }
 
@@ -285,26 +356,58 @@ impl<'c> DecompilerState<'c> {
         if name.is_none() && !force_variable {
             self.reg_state.insert(dst, expr);
         } else {
+            // Check if this is a new declaration BEFORE calling var_name_for_def
+            // (since var_name_for_def inserts into range_to_name)
+            let is_new_range = if let Some(range_id) = self.live_ranges.get_range_id(dst, i) {
+                !self.range_to_name.contains_key(&range_id)
+            } else {
+                // No live range info - check if we have a name registered for this register
+                !self.name_to_reg.values().any(|&r| r == dst)
+            };
+
+            // Check if the name was already declared BEFORE calling var_name_for_def
+            // (since var_name_for_def will add the name to name_to_reg).
+            // This prevents parameter shadowing and redeclarations across branches.
+            let name_already_declared = if let Some(ref n) = name {
+                // Debug name provided - check if already declared
+                self.name_to_reg.contains_key(n)
+            } else if let Some(range_id) = self.live_ranges.get_range_id(dst, i) {
+                // No debug name - check if this range already has a name
+                self.range_to_name.contains_key(&range_id)
+            } else {
+                // Fallback - check if any name maps to this register
+                self.name_to_reg.values().any(|&r| r == dst)
+            };
+
+            // Check if debug name differs from cached range name (register reuse for new variable)
+            let is_new_variable = if let Some(ref n) = name {
+                if let Some(range_id) = self.live_ranges.get_range_id(dst, i) {
+                    if let Some(cached) = self.range_to_name.get(&range_id) {
+                        n != cached  // Different name = new logical variable
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
             // Create a variable using liveness-aware naming.
             // This ensures consistent names across control flow (e.g., if-else branches).
-            let var_name = self.var_name_for_def(dst, i, name);
+            let var_name = self.var_name_for_def(dst, i, name.clone());
+
+            // A name is a new declaration if:
+            // 1. It's a new live range AND the name wasn't already declared, OR
+            // 2. It's a new logical variable (debug name differs from cached range name)
+            let is_declaration = (is_new_range && !name_already_declared) || (is_new_variable && !name_already_declared);
+
             self.reg_state
                 .insert(dst, Expr::Variable(dst, Some(var_name.clone())));
 
-            // Check if this is a new declaration or reassignment using live range info.
-            // A declaration is the first assignment to a new live range.
-            let declaration = if let Some(range_id) = self.live_ranges.get_range_id(dst, i) {
-                // First time we're emitting code for this range = declaration
-                // We just inserted into range_to_name in var_name_for_def, so check if
-                // this was the first insertion by seeing if name_to_reg just got updated
-                !self.name_to_reg.get(&var_name).map(|&r| r == dst && self.range_to_name.len() > 1).unwrap_or(false)
-                    || self.live_ranges.ranges.get(range_id).map(|r| r.def_point == i).unwrap_or(true)
-            } else {
-                !self.name_to_reg.contains_key(&var_name)
-            };
-
             self.push_stmt(Statement::Assign {
-                declaration,
+                declaration: is_declaration,
                 variable: Expr::Variable(dst, Some(var_name)),
                 assign: expr,
             });
@@ -754,10 +857,33 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
             &Opcode::Label => {
                 // Only create a loop scope if there's a backward JAlways that jumps to this Label
                 // Labels can also be targets for forward jumps (switch fall-through, etc.)
-                let is_loop_target = f.ops.iter().enumerate().skip(i + 1).any(|(j, op)| {
-                    matches!(op, Opcode::JAlways { offset } if (j as i32 + *offset + 1) as usize == i)
+                let loop_end = f.ops.iter().enumerate().skip(i + 1).find_map(|(j, op)| {
+                    if matches!(op, Opcode::JAlways { offset } if (j as i32 + *offset + 1) as usize == i) {
+                        Some(j)
+                    } else {
+                        None
+                    }
                 });
-                if is_loop_target {
+                if let Some(loop_end_pos) = loop_end {
+                    // Detect variables that need hoisting - assigned in loop but used after
+                    let to_hoist = detect_hoisting_needed(&f.ops, i, loop_end_pos, f, code);
+                    for (reg, debug_name) in to_hoist {
+                        // Create variable name and emit uninitialized declaration
+                        let var_name = debug_name.unwrap_or_else(|| {
+                            let n: Str = format!("v{}", state.synthetic_var_counter).into();
+                            state.synthetic_var_counter += 1;
+                            n
+                        });
+                        // Only emit if not already declared
+                        if !state.name_to_reg.contains_key(&var_name) {
+                            state.name_to_reg.insert(var_name.clone(), reg);
+                            state.reg_state.insert(reg, Expr::Variable(reg, Some(var_name.clone())));
+                            state.push_stmt(Statement::VarDecl {
+                                name: var_name,
+                            });
+                        }
+                    }
+
                     // Detect loop counters (registers with Incr ops) and track them
                     // This ensures loop counters are treated as variables from the start,
                     // so loop conditions like `while (index < arr.length)` work correctly
