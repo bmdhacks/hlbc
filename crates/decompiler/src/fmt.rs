@@ -590,6 +590,22 @@ impl Expr {
                             "string" => call.args.first().map(CallHandling::Elide).unwrap_or(CallHandling::Normal),
                             // Internal array methods that shouldn't be visible
                             "__expand" | "__construct" => CallHandling::Skip,
+                            // __constructor__ is called after new Type() - skip since object is already created
+                            "__constructor__" => CallHandling::Skip,
+                            // __add__ is string concatenation - convert String.__add__(a, b) to (a + b)
+                            "__add__" => {
+                                if call.args.len() == 2 {
+                                    let left = &call.args[0];
+                                    let right = &call.args[1];
+                                    CallHandling::SpecialFormat(format!(
+                                        "({} + {})",
+                                        left.display(indent, code, f),
+                                        right.display(indent, code, f)
+                                    ))
+                                } else {
+                                    CallHandling::Normal
+                                }
+                            }
                             _ => CallHandling::Normal,
                         }
                     } else if let Expr::Field(receiver, method) = &call.fun {
@@ -599,6 +615,22 @@ impl Expr {
                             "__exceptionMessage" => CallHandling::Elide(receiver.as_ref()),
                             // Internal array methods that shouldn't be visible
                             "__expand" | "__construct" => CallHandling::Skip,
+                            // __constructor__ is called after new Type() - skip since object is already created
+                            "__constructor__" => CallHandling::Skip,
+                            // __add__ is string concatenation - convert String.__add__(a, b) to (a + b)
+                            "__add__" => {
+                                if call.args.len() == 2 {
+                                    let left = &call.args[0];
+                                    let right = &call.args[1];
+                                    CallHandling::SpecialFormat(format!(
+                                        "({} + {})",
+                                        left.display(indent, code, f),
+                                        right.display(indent, code, f)
+                                    ))
+                                } else {
+                                    CallHandling::Normal
+                                }
+                            }
                             _ => CallHandling::Normal,
                         }
                     } else {
@@ -727,6 +759,11 @@ impl Expr {
     }
 }
 
+/// Check if an expression is an empty anonymous object (needs :Dynamic type annotation)
+fn is_empty_anonymous(expr: &Expr) -> bool {
+    matches!(expr, Expr::Anonymous(_, fields) if fields.is_empty())
+}
+
 impl Statement {
     pub fn display<'a>(
         &'a self,
@@ -746,7 +783,10 @@ impl Statement {
                     variable,
                     assign,
                 } => {
-                    if *declaration { "var " } else { "" }{disp!(variable)}" = "{disp!(assign)}";"
+                    // Add :Dynamic type annotation for empty anonymous objects
+                    // so that field assignments work afterward
+                    let needs_dynamic = *declaration && is_empty_anonymous(assign);
+                    if *declaration { "var " } else { "" }{disp!(variable)}if needs_dynamic { ":Dynamic" } else { "" }" = "{disp!(assign)}";"
                 }
                 Statement::ExprStatement(expr) => {
                     {disp!(expr)}";"

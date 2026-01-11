@@ -82,6 +82,8 @@ impl<'a> Structurer<'a> {
     /// assignment to this variable name.
     fn make_assign(&mut self, variable: Expr, assign: Expr) -> Statement {
         // Extract variable name to check if it's been declared
+        // ONLY simple variables can have declarations (var x = ...)
+        // Field access, array index, etc. are NEVER declarations
         let is_declaration = match &variable {
             Expr::Variable(_, Some(name)) => {
                 if self.declared_vars.contains(name) {
@@ -99,7 +101,11 @@ impl<'a> Structurer<'a> {
                     true
                 }
             }
-            // Field access, array index, etc. are never declarations
+            // Field access (obj.field) - never a declaration
+            Expr::Field(_, _) => false,
+            // Array access (arr[i]) - never a declaration
+            Expr::Array(_, _) => false,
+            // Any other expression type - never a declaration
             _ => false,
         };
 
@@ -107,6 +113,18 @@ impl<'a> Structurer<'a> {
             declaration: is_declaration,
             variable,
             assign,
+        }
+    }
+
+    /// Create a call statement, handling void return types correctly.
+    /// For void functions, we emit just the call as an expression statement.
+    /// For non-void functions, we assign the result to a variable.
+    fn make_call_stmt(&mut self, dst: Reg, call: Call) -> Statement {
+        if self.is_void_type(dst) {
+            Statement::ExprStatement(Expr::Call(Box::new(call)))
+        } else {
+            let var = self.reg_to_expr(dst);
+            self.make_assign(var, Expr::Call(Box::new(call)))
         }
     }
 
@@ -245,6 +263,12 @@ impl<'a> Structurer<'a> {
                     Opcode::Neg { dst, .. } |
                     Opcode::Not { dst, .. } |
                     Opcode::ToVirtual { dst, .. } |
+                    Opcode::ToSFloat { dst, .. } |
+                    Opcode::ToUFloat { dst, .. } |
+                    Opcode::ToInt { dst, .. } |
+                    Opcode::ToDyn { dst, .. } |
+                    Opcode::SafeCast { dst, .. } |
+                    Opcode::UnsafeCast { dst, .. } |
                     Opcode::Ref { dst, .. } |
                     Opcode::Unref { dst, .. } |
                     Opcode::Type { dst, .. } |
@@ -698,22 +722,38 @@ impl<'a> Structurer<'a> {
 
         for op_idx in block.start..=end {
             // Check if this op has an SSA destination we can analyze
-            if let Some(&ssa_dst) = op_to_ssa.get(&op_idx) {
-                // Skip dead variables entirely
-                if self.is_dead_var(ssa_dst) {
-                    continue;
-                }
+            let is_dead = if let Some(&ssa_dst) = op_to_ssa.get(&op_idx) {
+                self.is_dead_var(ssa_dst)
+            } else {
+                false
+            };
 
-                // For single-use variables, store for inlining instead of emitting
-                if self.can_inline_var(ssa_dst) {
-                    if let Some(expr) = self.opcode_to_expr(op_idx) {
-                        self.store_for_inline(ssa_dst, expr);
-                        continue;
-                    }
-                }
+            // Only skip dead variables for opcodes that have no side effects.
+            // Function calls always have side effects and should be emitted.
+            let op = &self.func.ops[op_idx];
+            let has_side_effects = matches!(
+                op,
+                Opcode::Call0 { .. }
+                    | Opcode::Call1 { .. }
+                    | Opcode::Call2 { .. }
+                    | Opcode::Call3 { .. }
+                    | Opcode::Call4 { .. }
+                    | Opcode::CallN { .. }
+                    | Opcode::CallMethod { .. }
+                    | Opcode::CallThis { .. }
+                    | Opcode::CallClosure { .. }
+                    | Opcode::SetField { .. }
+                    | Opcode::SetArray { .. }
+                    | Opcode::SetMem { .. }
+                    | Opcode::SetGlobal { .. }
+                    | Opcode::Throw { .. }
+            );
+
+            if is_dead && !has_side_effects {
+                continue;
             }
 
-            // Normal case: emit as statement
+            // Emit statement for this opcode
             if let Some(stmt) = self.opcode_to_statement(op_idx) {
                 stmts.push(stmt);
             }
@@ -755,8 +795,13 @@ impl<'a> Structurer<'a> {
                 Some(Expr::Field(Box::new(obj_expr), field_name))
             }
             Opcode::GetGlobal { global, .. } => {
-                let name = self.get_global_name(*global);
-                Some(Expr::Ident(name))
+                // Check if this is a string constant global
+                if let Some(string_ref) = self.get_global_string_value(*global) {
+                    Some(Expr::Constant(Constant::String(string_ref)))
+                } else {
+                    let name = self.get_global_name(*global);
+                    Some(Expr::Ident(name))
+                }
             }
             _ => None, // Complex expressions not handled for inlining
         }
@@ -780,7 +825,14 @@ impl<'a> Structurer<'a> {
 
     fn check_terminal(&self, op_idx: usize) -> Option<Statement> {
         match &self.func.ops[op_idx] {
-            Opcode::Ret { ret } => Some(Statement::Return(Some(self.reg_to_expr(*ret)))),
+            Opcode::Ret { ret } => {
+                // Don't return void-typed values
+                if self.is_void_type(*ret) {
+                    Some(Statement::Return(None))
+                } else {
+                    Some(Statement::Return(Some(self.reg_to_expr(*ret))))
+                }
+            }
             Opcode::Throw { exc } => Some(Statement::Throw(self.reg_to_expr(*exc))),
             _ => None,
         }
@@ -878,86 +930,82 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::Call0 { dst, fun } => {
-                let var = self.reg_to_expr(*dst);
                 let call = Call::new_fun(*fun, vec![]);
-                Some(self.make_assign(var, Expr::Call(Box::new(call))))
+                Some(self.make_call_stmt(*dst, call))
             }
 
             Opcode::Call1 { dst, fun, arg0 } => {
-                let var = self.reg_to_expr(*dst);
                 let call = Call::new_fun(*fun, vec![self.reg_to_expr(*arg0)]);
-                Some(self.make_assign(var, Expr::Call(Box::new(call))))
+                Some(self.make_call_stmt(*dst, call))
             }
 
             Opcode::Call2 { dst, fun, arg0, arg1 } => {
-                let var = self.reg_to_expr(*dst);
                 let call = Call::new_fun(*fun, vec![self.reg_to_expr(*arg0), self.reg_to_expr(*arg1)]);
-                Some(self.make_assign(var, Expr::Call(Box::new(call))))
+                Some(self.make_call_stmt(*dst, call))
             }
 
             Opcode::Call3 { dst, fun, arg0, arg1, arg2 } => {
-                let var = self.reg_to_expr(*dst);
                 let call = Call::new_fun(*fun, vec![
                     self.reg_to_expr(*arg0),
                     self.reg_to_expr(*arg1),
                     self.reg_to_expr(*arg2),
                 ]);
-                Some(self.make_assign(var, Expr::Call(Box::new(call))))
+                Some(self.make_call_stmt(*dst, call))
             }
 
             Opcode::Call4 { dst, fun, arg0, arg1, arg2, arg3 } => {
-                let var = self.reg_to_expr(*dst);
                 let call = Call::new_fun(*fun, vec![
                     self.reg_to_expr(*arg0),
                     self.reg_to_expr(*arg1),
                     self.reg_to_expr(*arg2),
                     self.reg_to_expr(*arg3),
                 ]);
-                Some(self.make_assign(var, Expr::Call(Box::new(call))))
+                Some(self.make_call_stmt(*dst, call))
             }
 
             Opcode::CallN { dst, fun, args } => {
-                let var = self.reg_to_expr(*dst);
                 let arg_exprs: Vec<_> = args.iter().map(|r| self.reg_to_expr(*r)).collect();
                 let call = Call::new_fun(*fun, arg_exprs);
-                Some(self.make_assign(var, Expr::Call(Box::new(call))))
+                Some(self.make_call_stmt(*dst, call))
             }
 
             Opcode::CallMethod { dst, field, args } => {
                 if args.is_empty() {
                     return Some(Statement::Comment("callmethod with no args".into()));
                 }
-                let var = self.reg_to_expr(*dst);
                 let obj = self.reg_to_expr(args[0]);
                 let field_name = self.get_field_name(args[0], *field);
                 let method = Expr::Field(Box::new(obj), field_name);
                 let arg_exprs: Vec<_> = args[1..].iter().map(|r| self.reg_to_expr(*r)).collect();
                 let call = Call { fun: method, args: arg_exprs };
-                Some(self.make_assign(var, Expr::Call(Box::new(call))))
+                Some(self.make_call_stmt(*dst, call))
             }
 
             Opcode::CallThis { dst, field, args } => {
-                let var = self.reg_to_expr(*dst);
                 let this = Expr::Variable(Reg(0), Some("this".into()));
                 let field_name = self.get_field_name(Reg(0), *field);
                 let method = Expr::Field(Box::new(this), field_name);
                 let arg_exprs: Vec<_> = args.iter().map(|r| self.reg_to_expr(*r)).collect();
                 let call = Call { fun: method, args: arg_exprs };
-                Some(self.make_assign(var, Expr::Call(Box::new(call))))
+                Some(self.make_call_stmt(*dst, call))
             }
 
             Opcode::CallClosure { dst, fun, args } => {
-                let var = self.reg_to_expr(*dst);
                 let fun_expr = self.reg_to_expr(*fun);
                 let arg_exprs: Vec<_> = args.iter().map(|r| self.reg_to_expr(*r)).collect();
                 let call = Call { fun: fun_expr, args: arg_exprs };
-                Some(self.make_assign(var, Expr::Call(Box::new(call))))
+                Some(self.make_call_stmt(*dst, call))
             }
 
             Opcode::GetGlobal { dst, global } => {
                 let var = self.reg_to_expr(*dst);
-                let global_name = self.get_global_name(*global);
-                Some(self.make_assign(var, Expr::Ident(global_name)))
+                // Check if this is a string constant global
+                if let Some(string_ref) = self.get_global_string_value(*global) {
+                    Some(self.make_assign(var, Expr::Constant(Constant::String(string_ref))))
+                } else {
+                    let global_name = self.get_global_name(*global);
+                    Some(self.make_assign(var, Expr::Ident(global_name)))
+                }
             }
 
             Opcode::SetGlobal { global, src } => {
@@ -977,8 +1025,13 @@ impl<'a> Structurer<'a> {
             Opcode::New { dst } => {
                 let var = self.reg_to_expr(*dst);
                 let type_ref = self.get_type_ref(*dst);
-                let ctor = ConstructorCall::new(type_ref, vec![]);
-                Some(self.make_assign(var, Expr::Constructor(ctor)))
+                // For Virtual types (anonymous objects), use empty object literal
+                if matches!(&self.code.types[type_ref.0], hlbc::types::Type::Virtual { .. }) {
+                    Some(self.make_assign(var, Expr::Anonymous(type_ref, HashMap::new())))
+                } else {
+                    let ctor = ConstructorCall::new(type_ref, vec![]);
+                    Some(self.make_assign(var, Expr::Constructor(ctor)))
+                }
             }
 
             Opcode::NullCheck { reg } => {
@@ -991,6 +1044,42 @@ impl<'a> Structurer<'a> {
                 let var = self.reg_to_expr(*dst);
                 let expr = self.reg_to_expr(*src);
                 Some(self.make_assign(var, expr))
+            }
+
+            Opcode::ToSFloat { dst, src } | Opcode::ToUFloat { dst, src } => {
+                // Convert int to float - emit as assignment (implicit cast in Haxe)
+                let var = self.reg_to_expr(*dst);
+                let expr = self.reg_to_expr(*src);
+                Some(self.make_assign(var, expr))
+            }
+
+            Opcode::ToInt { dst, src } => {
+                // Convert float to int - emit as Std.int(src) call
+                let var = self.reg_to_expr(*dst);
+                let src_expr = self.reg_to_expr(*src);
+                let call = Expr::Call(Box::new(Call {
+                    fun: Expr::Field(Box::new(Expr::Ident("Std".into())), "int".into()),
+                    args: vec![src_expr],
+                }));
+                Some(self.make_assign(var, call))
+            }
+
+            Opcode::ToDyn { dst, src } => {
+                // Convert to Dynamic - emit as simple assignment
+                let var = self.reg_to_expr(*dst);
+                let expr = self.reg_to_expr(*src);
+                Some(self.make_assign(var, expr))
+            }
+
+            Opcode::SafeCast { dst, src } | Opcode::UnsafeCast { dst, src } => {
+                // Cast to destination type - emit as simple assignment for now
+                let var = self.reg_to_expr(*dst);
+                let expr = self.reg_to_expr(*src);
+                Some(self.make_assign(var, expr))
+            }
+
+            Opcode::Rethrow { exc } => {
+                Some(Statement::Throw(self.reg_to_expr(*exc)))
             }
 
             Opcode::SDiv { dst, a, b } | Opcode::UDiv { dst, a, b } => {
@@ -1172,19 +1261,57 @@ impl<'a> Structurer<'a> {
         if let Some(ty) = self.code.globals.get(global.0) {
             match &self.code.types[ty.0] {
                 hlbc::types::Type::Obj(obj) => {
-                    return self.code.strings.get(obj.name.0)
+                    let raw_name = self.code.strings.get(obj.name.0)
                         .cloned()
                         .unwrap_or_else(|| format!("global_{}", global.0).into());
+                    // Strip internal $ from type names like "haxe.$Log" -> "haxe.Log"
+                    // or "$Counter" -> "Counter"
+                    return self.clean_internal_name(&raw_name);
                 }
                 hlbc::types::Type::Struct(obj) => {
-                    return self.code.strings.get(obj.name.0)
+                    let raw_name = self.code.strings.get(obj.name.0)
                         .cloned()
                         .unwrap_or_else(|| format!("global_{}", global.0).into());
+                    return self.clean_internal_name(&raw_name);
                 }
                 _ => {}
             }
         }
         format!("global_{}", global.0).into()
+    }
+
+    /// Clean internal names by stripping $ prefix from components.
+    /// e.g., "haxe.$Log" -> "haxe.Log", "$Counter" -> "Counter"
+    fn clean_internal_name(&self, name: &str) -> Str {
+        if name.contains(".$") {
+            // Replace .$X with .X
+            name.replace(".$", ".").into()
+        } else if name.starts_with('$') {
+            // Strip leading $
+            name[1..].into()
+        } else {
+            name.into()
+        }
+    }
+
+    /// Check if a global is a string constant and return its string reference
+    fn get_global_string_value(&self, global: hlbc::types::RefGlobal) -> Option<hlbc::types::RefString> {
+        // Check if global has a constant initializer
+        let &const_idx = self.code.globals_initializers.get(&global)?;
+        let constants = self.code.constants.as_ref()?;
+        let constant_def = constants.get(const_idx)?;
+
+        // Check if the global's type is String (an Obj type named "String")
+        let type_ref = self.code.globals.get(global.0)?;
+        if let hlbc::types::Type::Obj(obj) = &self.code.types[type_ref.0] {
+            let name = self.code.strings.get(obj.name.0)?;
+            if name.as_ref() == "String" {
+                // For String type, fields[0] is the string pool index
+                let string_idx = constant_def.fields.first()?;
+                return Some(hlbc::types::RefString(*string_idx));
+            }
+        }
+        None
     }
 
     fn get_type_ref(&self, reg: Reg) -> RefType {
@@ -1194,6 +1321,12 @@ impl<'a> Structurer<'a> {
         } else {
             RefType(0) // Fallback to void type
         }
+    }
+
+    /// Check if a register has void type (used to skip assignments of void-returning calls)
+    fn is_void_type(&self, reg: Reg) -> bool {
+        let type_ref = self.get_type_ref(reg);
+        matches!(&self.code.types[type_ref.0], hlbc::types::Type::Void)
     }
 
     fn get_type_name(&self, reg: Reg) -> Str {
@@ -1246,13 +1379,37 @@ impl<'a> Structurer<'a> {
                 if def_idx < self.func.ops.len() {
                     if let Some(dst_reg) = get_opcode_dst(&self.func.ops[def_idx]) {
                         if dst_reg == reg {
-                            return self.code.strings.get(str_ref.0).map(|s| s.to_string());
+                            if let Some(name) = self.code.strings.get(str_ref.0) {
+                                // Validate that this looks like a real identifier
+                                // (not a string constant value like "Hello.hx")
+                                if self.is_valid_identifier(name) {
+                                    return Some(name.to_string());
+                                }
+                            }
                         }
                     }
                 }
             }
         }
         None
+    }
+
+    /// Check if a string is a valid Haxe identifier (not a constant value)
+    fn is_valid_identifier(&self, name: &str) -> bool {
+        if name.is_empty() {
+            return false;
+        }
+        // Valid identifiers: start with letter or underscore, contain only alphanumeric/underscore
+        let first = name.chars().next().unwrap();
+        if !first.is_alphabetic() && first != '_' {
+            return false;
+        }
+        // Reject if contains dots, spaces, or looks like a file path
+        if name.contains('.') || name.contains(' ') || name.contains('/') {
+            return false;
+        }
+        // Must be all alphanumeric/underscore
+        name.chars().all(|c| c.is_alphanumeric() || c == '_')
     }
 
     fn get_field_name(&self, obj_reg: Reg, field: hlbc::types::RefField) -> Str {
@@ -1272,17 +1429,12 @@ impl<'a> Structurer<'a> {
     }
 
     fn reg_to_expr(&self, reg: Reg) -> Expr {
-        // Check if we have an inlined expression for this register
-        // (find the SsaVar for this register that's stored for inlining)
-        for (var, expr) in &self.inline_exprs {
-            if var.reg == reg {
-                return expr.clone();
-            }
-        }
-
-        // Note: We no longer check self.constants here because the SSA-based
-        // use-count inlining now handles constants properly. The old constant
-        // propagation was conflicting with SSA variable naming.
+        // NOTE: We previously checked inline_exprs here, but the lookup was broken:
+        // it found ANY SSA version with matching reg, not the correct version.
+        // For now, we just return a variable reference. Proper SSA-aware inlining
+        // would require tracking which version is "current" at each use site.
+        //
+        // TODO: Implement proper SSA version tracking for expression inlining
         let name = self.reg_name(reg);
         Expr::Variable(reg, Some(name))
     }
@@ -1347,8 +1499,10 @@ fn simplify_statements(stmts: Vec<Statement>) -> Vec<Statement> {
                 // Pattern: r3 = expr; r0 = r3; → r0 = expr;
                 if is_same_expr(var1, assign2) && !is_same_expr(var1, var2) {
                     // Merge: replace with var2 = assign1
+                    // Field and Array accesses can NEVER be declarations
+                    let is_field_or_array = matches!(var2, Expr::Field(_, _) | Expr::Array(_, _));
                     let merged = Statement::Assign {
-                        declaration: *decl1 || *decl2,
+                        declaration: if is_field_or_array { false } else { *decl1 || *decl2 },
                         variable: var2.clone(),
                         assign: assign1.clone(),
                     };
