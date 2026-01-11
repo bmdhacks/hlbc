@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use ast::*;
 use hlbc::fmt::EnhancedFmt;
 use hlbc::opcodes::Opcode;
-use hlbc::types::{Function, RefField, RefFun, RefString, RefType, Reg, Type, TypeObj};
+use hlbc::types::{Function, ObjProto, RefField, RefFun, RefString, RefType, Reg, Type, TypeObj};
 use hlbc::{Bytecode, Resolve, Str};
 use scopes::*;
 
@@ -1151,6 +1151,38 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
                     // Not a constructor call - fall through to normal handling
                 }
 
+                // Check for super constructor call:
+                // - We're in a constructor
+                // - Calling another __constructor__
+                // - First arg is 'this' (Reg(0))
+                // - Called constructor's class is a parent of our class
+                // NOTE: Use regs[0] (the instance type) not f.parent (the static class type)
+                let is_super_constructor = if let Some(called_fn) = fun.as_fn(code) {
+                    let our_name = code.get(f.name);
+                    let called_name = called_fn.name(code);
+                    let our_type = f.regs.first().copied();
+                    let called_type = called_fn.regs.first().copied();
+                    our_name == "__constructor__" &&
+                        called_name == "__constructor__" &&
+                        args.first() == Some(&Reg(0)) &&
+                        our_type.is_some() &&
+                        called_type.is_some() &&
+                        our_type != called_type &&
+                        state.is_parent_class(called_type.unwrap(), our_type.unwrap())
+                } else {
+                    false
+                };
+
+                if is_super_constructor {
+                    // Emit super(args...) - skip the 'this' argument
+                    let super_call = call(
+                        Expr::Ident("super".into()),
+                        state.args_expr(&args[1..]),
+                    );
+                    state.push_stmt(stmt(super_call));
+                    continue;
+                }
+
                 // Normal function call
                 state.push_stmt(comment(fun.display::<EnhancedFmt>(code).to_string()));
                 let call = call_fun(*fun, state.args_expr(args));
@@ -1179,7 +1211,7 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
             }
             Opcode::CallMethod { dst, field, args } => {
                 let call = call(
-                    ast::field(state.expr(args[0]), f.regtype(args[0]), *field, code),
+                    ast::method(state.expr(args[0]), f.regtype(args[0]), *field, code),
                     state.args_expr(&args[1..]),
                 );
                 if f.regtype(args[0])
@@ -1318,10 +1350,13 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
                 } else {
                     match &code[f[dst]] {
                         Type::Obj(obj) | Type::Struct(obj) => {
+                            // Strip leading $ from static class type names
+                            let name = code[obj.name].as_ref();
+                            let clean_name = name.strip_prefix('$').unwrap_or(name);
                             state.push_expr(
                                 i,
                                 dst,
-                                Expr::Variable(dst, Some(code[obj.name].to_owned())),
+                                Expr::Variable(dst, Some(Str::from(clean_name))),
                             );
                         }
                         Type::Enum { name, constructs, .. } => {
@@ -1820,6 +1855,7 @@ pub fn decompile_function(code: &Bytecode, f: &Function) -> Method {
         fun: f.findex,
         static_: true,
         dynamic: false,
+        override_: false, // Can't detect override without class context
         statements: decompile_code(code, f),
     }
 }
@@ -1858,6 +1894,29 @@ pub fn decompile_class(code: &Bytecode, obj: &TypeObj) -> Class {
         }
     }
 
+    // Helper to check if a proto overrides a parent method
+    let is_override = |proto: &ObjProto| -> bool {
+        if proto.pindex < 0 {
+            return false;
+        }
+        // Check if parent class has a proto with the same pindex
+        if let Some(parent_type) = obj.super_ {
+            if let Some(parent_obj) = parent_type.as_obj(code) {
+                // Search up the inheritance chain
+                let mut current = Some(parent_obj);
+                while let Some(curr) = current {
+                    for parent_proto in &curr.protos {
+                        if parent_proto.pindex >= 0 && parent_proto.pindex == proto.pindex {
+                            return true;
+                        }
+                    }
+                    current = curr.super_.and_then(|t| t.as_obj(code));
+                }
+            }
+        }
+        false
+    };
+
     let mut methods = Vec::new();
     for fun in obj.bindings.values() {
         // Skip native functions - can't decompile them
@@ -1866,6 +1925,7 @@ pub fn decompile_class(code: &Bytecode, obj: &TypeObj) -> Class {
                 fun: *fun,
                 static_: false,
                 dynamic: true,
+                override_: false, // Bindings don't override
                 statements: decompile_code(code, func),
             })
         }
@@ -1878,18 +1938,20 @@ pub fn decompile_class(code: &Bytecode, obj: &TypeObj) -> Class {
                     fun: *fun,
                     static_: true,
                     dynamic: false,
+                    override_: false, // Static methods don't override
                     statements: decompile_code(code, func),
                 })
             }
         }
     }
-    for f in &obj.protos {
+    for proto in &obj.protos {
         // Skip native functions - can't decompile them
-        if let Some(func) = f.findex.as_fn(code) {
+        if let Some(func) = proto.findex.as_fn(code) {
             methods.push(Method {
-                fun: f.findex,
+                fun: proto.findex,
                 static_: false,
                 dynamic: false,
+                override_: is_override(proto),
                 statements: decompile_code(code, func),
             })
         }

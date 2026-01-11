@@ -251,9 +251,9 @@ impl Class {
                 " extends "{parent}
             }
             " {\n"
-            // Fields with indices
+            // Fields with indices - add 'public' for static fields (private by default in Haxe)
             for (i, f) in self.fields.iter().enumerate() {
-                {new_opts} if f.static_ { "static " } "var "{f.name}": "{to_haxe_type(&ctx[f.ty], ctx)}";"
+                {new_opts} if f.static_ { "public static " } "var "{f.name}": "{to_haxe_type(&ctx[f.ty], ctx)}";"
                 if opts.show_field_indices {
                     "  // F"{i}", type@"{f.ty.0}
                 }
@@ -284,7 +284,9 @@ impl Method {
                 {opts}"// fun@"{fun_idx}" ("{nops}" ops)\n"
             }
             // Don't output 'static' for constructors
-            {opts} if self.static_ && !is_constructor { "static " } if self.dynamic { "dynamic " }
+            // Add 'override' for methods that override parent methods
+            // Add 'public' for all methods (Haxe defaults to private)
+            {opts} if self.override_ { "override " } "public " if self.static_ && !is_constructor { "static " } if self.dynamic { "dynamic " }
             // Output 'new' instead of '__constructor__'
             "function " if is_constructor { "new" } else { {name} } "("
             {fmtools::join(", ", fun.args(ctx).iter().enumerate().skip(skip_params)
@@ -628,7 +630,27 @@ impl Expr {
                                 "@native("{lib}"/"{name}")"
                             }
                         }
-                        _ => {{fun.name(code)}}
+                        hlbc::types::FunPtr::Fun(func) => {
+                            let name = func.name(code);
+                            // For static methods with a parent class, include the class qualifier
+                            if let Some(parent_ref) = func.parent {
+                                if let Some(parent_obj) = parent_ref.as_obj(code) {
+                                    let parent_name = parent_obj.name(code);
+                                    // Strip leading $ from static class type names
+                                    let clean_name = parent_name.strip_prefix('$').unwrap_or(&parent_name);
+                                    // Check if this is a static method (parent is a static class type)
+                                    if parent_name.starts_with('$') {
+                                        {clean_name}"."{name}
+                                    } else {
+                                        {name}
+                                    }
+                                } else {
+                                    {name}
+                                }
+                            } else {
+                                {name}
+                            }
+                        }
                     }
                 },
                 Expr::IfElse { cond, if_, else_ } => {

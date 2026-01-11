@@ -29,6 +29,7 @@ pub struct Method {
     pub fun: RefFun,
     pub static_: bool,
     pub dynamic: bool,
+    pub override_: bool,
     pub statements: Vec<Statement>,
 }
 
@@ -297,6 +298,16 @@ pub fn field(expr: Expr, obj: RefType, field: RefField, code: &Bytecode) -> Expr
         field_name
     };
     Expr::Field(Box::new(expr), Str::from(field_name))
+}
+
+/// Get a method expression for a CallMethod opcode.
+/// Unlike `field`, this uses vtable/pindex lookup to resolve the method name.
+pub fn method(expr: Expr, obj: RefType, pindex: RefField, code: &Bytecode) -> Expr {
+    // Use the proper method lookup that searches protos by pindex
+    let method_name = obj.method(pindex.0, code)
+        .map(|proto| proto.name(code).to_string())
+        .unwrap_or_else(|| format!("[method_{}]", pindex.0));
+    Expr::Field(Box::new(expr), Str::from(method_name))
 }
 
 #[derive(Debug, Clone)]
