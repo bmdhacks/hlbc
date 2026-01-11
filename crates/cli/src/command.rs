@@ -57,6 +57,8 @@ pub enum Command {
     RefTo(ElementRef),
     DecompType(usize),
     Decomp(usize),
+    /// Decompile using new multi-pass pipeline
+    DecompNew(usize),
     /// Dump type information with optional prefix filter
     DumpTypes(Option<Str>),
     /// Show variable name assignments for a function
@@ -173,6 +175,7 @@ pub fn command_parser(ctx: &ParseContext) -> impl Parser<char, Command, Error = 
             )))
             .map(RefTo),
         cmd!("decomp"; num() => Decomp),
+        cmd!("decompnew"; num() => DecompNew),
         cmd!("decompt"; num() => DecompType),
         cmd!("dump-types")
             .ignore_then(string.clone().or_not())

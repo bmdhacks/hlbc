@@ -141,8 +141,11 @@ impl FormatOptions {
     }
 
     pub fn inc_nesting(&self) -> Self {
+        let new_len = self.indent.len() + self.inc_indent;
+        // Clamp to INDENT length to avoid overflow on deeply nested code
+        let clamped_len = new_len.min(INDENT.len());
         FormatOptions {
-            indent: &INDENT[..self.indent.len() + self.inc_indent],
+            indent: &INDENT[..clamped_len],
             ..*self
         }
     }

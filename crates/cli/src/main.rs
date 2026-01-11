@@ -92,6 +92,10 @@ struct Args {
     /// Show verbose progress during decompilation
     #[clap(short, long)]
     verbose: bool,
+
+    /// Use new multi-pass SSA decompiler pipeline (experimental)
+    #[clap(long)]
+    new_decompiler: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -768,7 +772,7 @@ EXAMPLES
                     });
             }
         },
-        Command::Decomp(idx) => {
+        Command::Decomp(idx) | Command::DecompNew(idx) => {
             if let Some(fun) = RefFun(idx).as_fn(code) {
                 println!(
                     "{}",

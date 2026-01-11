@@ -24,6 +24,68 @@ pub struct SsaVar {
     pub version: u32,
 }
 
+/// Use-def information for an SSA variable (ILSpy-style analysis)
+#[derive(Debug, Clone, Default)]
+pub struct UseDefInfo {
+    /// Number of definitions (always 1 for proper SSA)
+    pub def_count: usize,
+    /// Number of times this variable is used in regular operations
+    pub use_count: usize,
+    /// Number of times this variable is used in φ-functions (cross-block use)
+    pub phi_use_count: usize,
+    /// True if the defining operation is a constant (Int, Float, Bool, String, Null)
+    pub is_constant: bool,
+    /// True if the defining operation is pure (no side effects)
+    /// Pure ops: constants, moves, arithmetic, field reads
+    /// Impure ops: function calls, field writes, array writes
+    pub is_pure: bool,
+}
+
+impl UseDefInfo {
+    /// Can this variable be inlined? Implements ILSpy-style safety guards:
+    ///
+    /// Guard 1 (Side-Effect Barrier): Pure expressions can be freely inlined.
+    ///         Impure expressions need adjacency check (not implemented here).
+    /// Guard 2 (Debug Name Barrier): User-named variables are preserved.
+    ///         (Checked separately in structurer since it has debug info access)
+    /// Guard 3 (Phi Node Barrier): Can't inline across block boundaries.
+    ///         Variables used by φ-functions are not inlinable.
+    ///
+    /// NOTE: Constants are NOT always inlinable - if they have phi_use_count > 0,
+    /// they shouldn't be inlined because that would lose the variable's identity
+    /// at the loop header.
+    pub fn can_inline(&self) -> bool {
+        // Guard 3: Can't inline if used by phi function (cross-block boundary)
+        if self.phi_use_count > 0 {
+            return false;
+        }
+
+        // Constants with only in-block uses can be inlined
+        if self.is_constant {
+            return true;
+        }
+
+        // Basic requirement: exactly one def, one use
+        if self.def_count != 1 || self.use_count != 1 {
+            return false;
+        }
+
+        // Guard 1: Only inline pure expressions freely
+        // (Impure expressions would need adjacency checking)
+        self.is_pure
+    }
+
+    /// Is this variable dead? (defined but never used)
+    pub fn is_dead(&self) -> bool {
+        self.def_count > 0 && self.use_count == 0 && self.phi_use_count == 0
+    }
+
+    /// Total uses (regular + phi)
+    pub fn total_uses(&self) -> usize {
+        self.use_count + self.phi_use_count
+    }
+}
+
 impl SsaVar {
     pub fn new(reg: Reg, version: u32) -> Self {
         SsaVar { reg, version }
@@ -355,6 +417,66 @@ impl SsaCfg {
         self.blocks.values().map(|b| b.phis.len()).sum()
     }
 
+    /// Compute use counts for all SSA variables.
+    /// Returns a map from SsaVar to UseDefInfo including purity information.
+    pub fn compute_use_counts(&self, f: &Function) -> HashMap<SsaVar, UseDefInfo> {
+        let mut info: HashMap<SsaVar, UseDefInfo> = HashMap::new();
+
+        // First, record all definitions and their purity
+        for block in self.blocks.values() {
+            // φ-functions define variables - they are NOT pure (can't inline directly)
+            // and NOT constants
+            for phi in &block.phis {
+                if let SsaInstr::Phi { dst, .. } = phi {
+                    let entry = info.entry(*dst).or_default();
+                    entry.def_count = 1;
+                    entry.is_constant = false;
+                    entry.is_pure = false; // φ-functions are not inlinable
+                }
+            }
+            // Regular operations - check opcode for purity
+            for op in &block.ops {
+                if let SsaInstr::Op { op_idx, dst: Some(dst), .. } = op {
+                    let opcode = &f.ops[*op_idx];
+                    let (is_const, is_pure) = classify_opcode_purity(opcode);
+                    let entry = info.entry(*dst).or_default();
+                    entry.def_count = 1;
+                    entry.is_constant = is_const;
+                    entry.is_pure = is_pure;
+                }
+            }
+        }
+
+        // Then, count all uses
+        for block in self.blocks.values() {
+            // Uses in φ-function sources - these are cross-block uses!
+            // Must track separately to prevent inlining across block boundaries.
+            for phi in &block.phis {
+                if let SsaInstr::Phi { sources, .. } = phi {
+                    for (_, src_var) in sources {
+                        // Skip version 0 (undefined/parameter)
+                        if src_var.version > 0 {
+                            info.entry(*src_var).or_default().phi_use_count += 1;
+                        }
+                    }
+                }
+            }
+            // Uses in regular operations - these are in-block uses
+            for op in &block.ops {
+                if let SsaInstr::Op { uses, .. } = op {
+                    for use_var in uses {
+                        // Skip version 0 (undefined/parameter)
+                        if use_var.version > 0 {
+                            info.entry(*use_var).or_default().use_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        info
+    }
+
     /// Debug: print SSA form
     #[allow(dead_code)]
     pub fn dump(&self, f: &Function, cfg: &Cfg) {
@@ -413,7 +535,7 @@ fn build_dominator_children(
 }
 
 /// Extract the destination register from an opcode (if any)
-fn get_dst_reg(op: &Opcode) -> Option<Reg> {
+pub fn get_dst_reg(op: &Opcode) -> Option<Reg> {
     use Opcode::*;
     match op {
         // Arithmetic
@@ -664,6 +786,68 @@ fn get_use_regs(op: &Opcode) -> Vec<Reg> {
         | Trap { .. }
         | Assert
         | Asm { .. } => vec![],
+    }
+}
+
+/// Classify an opcode's purity for inlining decisions.
+/// Returns (is_constant, is_pure).
+///
+/// - is_constant: true for literal constants (Int, Float, Bool, String, Null)
+///   Constants can ALWAYS be inlined regardless of use count.
+///
+/// - is_pure: true for operations with no side effects
+///   Pure operations can be inlined when they have single use.
+///   Examples: constants, moves, arithmetic, field reads
+///   Impure: function calls, object creation, field writes
+fn classify_opcode_purity(op: &Opcode) -> (bool, bool) {
+    use Opcode::*;
+    match op {
+        // Constants - always inlinable
+        Int { .. } | Float { .. } | Bool { .. } | String { .. } | Bytes { .. } | Null { .. } => {
+            (true, true)
+        }
+
+        // Pure operations - inlinable with single use
+        // Moves and casts
+        Mov { .. } | ToDyn { .. } | ToSFloat { .. } | ToUFloat { .. } | ToInt { .. }
+        | SafeCast { .. } | UnsafeCast { .. } | ToVirtual { .. } => (false, true),
+
+        // Arithmetic (no side effects)
+        Add { .. } | Sub { .. } | Mul { .. } | SDiv { .. } | UDiv { .. } | SMod { .. }
+        | UMod { .. } | Shl { .. } | SShr { .. } | UShr { .. } | And { .. } | Or { .. }
+        | Xor { .. } | Neg { .. } | Not { .. } => (false, true),
+
+        // Reads from memory (pure - don't modify state)
+        Field { .. } | GetThis { .. } | GetGlobal { .. } | DynGet { .. } | GetI8 { .. }
+        | GetI16 { .. } | GetMem { .. } | GetArray { .. } | ArraySize { .. } | EnumIndex { .. }
+        | EnumField { .. } | Type { .. } | GetType { .. } | GetTID { .. } | Ref { .. }
+        | Unref { .. } | RefData { .. } | RefOffset { .. } => (false, true),
+
+        // Incr/Decr - modifies register, but can be inlined with care
+        // Actually these are impure because they modify the destination in place
+        Incr { .. } | Decr { .. } => (false, false),
+
+        // IMPURE operations - have side effects, can't inline freely
+        // Function calls may have arbitrary side effects
+        Call0 { .. } | Call1 { .. } | Call2 { .. } | Call3 { .. } | Call4 { .. } | CallN { .. }
+        | CallMethod { .. } | CallThis { .. } | CallClosure { .. } => (false, false),
+
+        // Object creation - allocates memory, may have initializers
+        New { .. } | EnumAlloc { .. } | MakeEnum { .. } | InstanceClosure { .. }
+        | StaticClosure { .. } | VirtualClosure { .. } => (false, false),
+
+        // Memory writes - obvious side effects
+        SetGlobal { .. } | SetField { .. } | SetThis { .. } | DynSet { .. } | SetI8 { .. }
+        | SetI16 { .. } | SetMem { .. } | SetArray { .. } | SetEnumField { .. }
+        | Setref { .. } => (false, false),
+
+        // Control flow - not expressions, don't have destinations anyway
+        JTrue { .. } | JFalse { .. } | JNull { .. } | JNotNull { .. } | JSLt { .. }
+        | JSGte { .. } | JSGt { .. } | JSLte { .. } | JULt { .. } | JUGte { .. }
+        | JNotLt { .. } | JNotGte { .. } | JEq { .. } | JNotEq { .. } | JAlways { .. }
+        | Switch { .. } | Label | Nop | Ret { .. } | Throw { .. } | Rethrow { .. }
+        | Trap { .. } | EndTrap { .. } | NullCheck { .. } | Assert | Prefetch { .. }
+        | Asm { .. } => (false, false),
     }
 }
 
