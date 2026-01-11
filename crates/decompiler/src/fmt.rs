@@ -857,12 +857,7 @@ impl Statement {
                     ") {\n"
                     let indent2 = indent.inc_nesting();
                     let indent3 = indent2.inc_nesting();
-                    if !default.is_empty() {
-                        {indent2}"default:\n"
-                        for stmt in default {
-                            {indent3}{stmt.display(&indent3, code, f)}"\n"
-                        }
-                    }
+                    // Output numbered cases first, then default
                     for (patterns, stmts) in cases {
                         // Format combined cases: case 0, 1, 2: or case None, Some(_):
                         {indent2}"case "
@@ -890,6 +885,13 @@ impl Statement {
                         }
                         ":\n"
                         for stmt in stmts {
+                            {indent3}{stmt.display(&indent3, code, f)}"\n"
+                        }
+                    }
+                    // Default case comes last
+                    if !default.is_empty() {
+                        {indent2}"default:\n"
+                        for stmt in default {
                             {indent3}{stmt.display(&indent3, code, f)}"\n"
                         }
                     }

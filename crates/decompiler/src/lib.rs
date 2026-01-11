@@ -184,8 +184,14 @@ pub fn decompile_class(code: &Bytecode, obj: &TypeObj, static_inits: &StaticInit
         {
             continue;
         }
+        // Skip fields with empty names (interface implementation cache fields)
+        // Note: hlbc converts empty strings to "<none>"
+        let field_name = f.name(code);
+        if field_name.is_empty() || field_name.as_ref() == "<none>" {
+            continue;
+        }
         fields.push(ClassField {
-            name: f.name(code).to_owned(),
+            name: field_name.to_owned(),
             static_: false,
             ty: f.t,
             initializer: None, // Instance fields don't have initializers from entrypoint
@@ -204,10 +210,16 @@ pub fn decompile_class(code: &Bytecode, obj: &TypeObj, static_inits: &StaticInit
             if ty.bindings.contains_key(&field_idx) {
                 continue;
             }
+            // Skip fields with empty names (interface implementation cache fields)
+            // Note: hlbc converts empty strings to "<none>"
+            let field_name = f.name(code);
+            if field_name.is_empty() || field_name.as_ref() == "<none>" {
+                continue;
+            }
             // Look up initializer from entrypoint analysis
             let initializer = static_inits.get(&(static_global, field_idx)).cloned();
             fields.push(ClassField {
-                name: f.name(code).to_owned(),
+                name: field_name.to_owned(),
                 static_: true,
                 ty: f.t,
                 initializer,

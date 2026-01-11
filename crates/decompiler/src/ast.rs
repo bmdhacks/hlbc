@@ -147,6 +147,22 @@ impl Call {
             args,
         }
     }
+
+    /// Create a super constructor call: super(args)
+    pub fn new_super(args: Vec<Expr>) -> Self {
+        Self {
+            fun: Expr::Ident("super".into()),
+            args,
+        }
+    }
+
+    /// Create a super method call: super.method(args)
+    pub fn new_super_method(method: Str, args: Vec<Expr>) -> Self {
+        Self {
+            fun: Expr::Field(Box::new(Expr::Ident("super".into())), method),
+            args,
+        }
+    }
 }
 
 /// An expression with a value
