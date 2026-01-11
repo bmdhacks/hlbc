@@ -77,6 +77,39 @@ impl<'a> Structurer<'a> {
         }
     }
 
+    /// Create an assignment statement, tracking declaration status.
+    /// Returns a Statement::Assign with declaration=true if this is the first
+    /// assignment to this variable name.
+    fn make_assign(&mut self, variable: Expr, assign: Expr) -> Statement {
+        // Extract variable name to check if it's been declared
+        let is_declaration = match &variable {
+            Expr::Variable(_, Some(name)) => {
+                if self.declared_vars.contains(name) {
+                    false
+                } else {
+                    self.declared_vars.insert(name.clone());
+                    true
+                }
+            }
+            Expr::Ident(name) => {
+                if self.declared_vars.contains(name) {
+                    false
+                } else {
+                    self.declared_vars.insert(name.clone());
+                    true
+                }
+            }
+            // Field access, array index, etc. are never declarations
+            _ => false,
+        };
+
+        Statement::Assign {
+            declaration: is_declaration,
+            variable,
+            assign,
+        }
+    }
+
     /// Structure the entire function into statements
     pub fn structure(&mut self) -> Vec<Statement> {
         // Pre-scan all blocks for constant assignments
@@ -606,11 +639,7 @@ impl<'a> Structurer<'a> {
                     if let Some(then_node) = then_pred {
                         if let Some((_, src_var)) = sources.iter().find(|(pred, _)| *pred == then_node) {
                             let src_expr = Expr::Variable(src_var.reg, Some(self.get_var_name(*src_var)));
-                            then_assigns.push(Statement::Assign {
-                                declaration: false,
-                                variable: dst_expr.clone(),
-                                assign: src_expr,
-                            });
+                            then_assigns.push(self.make_assign(dst_expr.clone(), src_expr));
                         }
                     }
 
@@ -618,11 +647,7 @@ impl<'a> Structurer<'a> {
                     if let Some(else_node) = else_pred {
                         if let Some((_, src_var)) = sources.iter().find(|(pred, _)| *pred == else_node) {
                             let src_expr = Expr::Variable(src_var.reg, Some(self.get_var_name(*src_var)));
-                            else_assigns.push(Statement::Assign {
-                                declaration: false,
-                                variable: dst_expr,
-                                assign: src_expr,
-                            });
+                            else_assigns.push(self.make_assign(dst_expr, src_expr));
                         }
                     }
                 }
@@ -774,37 +799,37 @@ impl<'a> Structurer<'a> {
             Opcode::Mov { dst, src } => {
                 let var = self.reg_to_expr(*dst);
                 let expr = self.reg_to_expr(*src);
-                Some(Statement::Assign { declaration: false, variable: var, assign: expr })
+                Some(self.make_assign(var, expr))
             }
 
             Opcode::Int { dst, ptr } => {
                 let var = self.reg_to_expr(*dst);
                 let val = Expr::Constant(Constant::Int(*ptr));
-                Some(Statement::Assign { declaration: false, variable: var, assign: val })
+                Some(self.make_assign(var, val))
             }
 
             Opcode::Float { dst, ptr } => {
                 let var = self.reg_to_expr(*dst);
                 let val = Expr::Constant(Constant::Float(*ptr));
-                Some(Statement::Assign { declaration: false, variable: var, assign: val })
+                Some(self.make_assign(var, val))
             }
 
             Opcode::Bool { dst, value } => {
                 let var = self.reg_to_expr(*dst);
                 let val = Expr::Constant(Constant::Bool(*value));
-                Some(Statement::Assign { declaration: false, variable: var, assign: val })
+                Some(self.make_assign(var, val))
             }
 
             Opcode::String { dst, ptr } => {
                 let var = self.reg_to_expr(*dst);
                 let val = Expr::Constant(Constant::String(*ptr));
-                Some(Statement::Assign { declaration: false, variable: var, assign: val })
+                Some(self.make_assign(var, val))
             }
 
             Opcode::Null { dst } => {
                 let var = self.reg_to_expr(*dst);
                 let val = Expr::Constant(Constant::Null);
-                Some(Statement::Assign { declaration: false, variable: var, assign: val })
+                Some(self.make_assign(var, val))
             }
 
             Opcode::Add { dst, a, b } => {
@@ -813,7 +838,7 @@ impl<'a> Structurer<'a> {
                     Box::new(self.reg_to_expr(*a)),
                     Box::new(self.reg_to_expr(*b)),
                 ));
-                Some(Statement::Assign { declaration: false, variable: var, assign: expr })
+                Some(self.make_assign(var, expr))
             }
 
             Opcode::Sub { dst, a, b } => {
@@ -822,7 +847,7 @@ impl<'a> Structurer<'a> {
                     Box::new(self.reg_to_expr(*a)),
                     Box::new(self.reg_to_expr(*b)),
                 ));
-                Some(Statement::Assign { declaration: false, variable: var, assign: expr })
+                Some(self.make_assign(var, expr))
             }
 
             Opcode::Mul { dst, a, b } => {
@@ -831,7 +856,7 @@ impl<'a> Structurer<'a> {
                     Box::new(self.reg_to_expr(*a)),
                     Box::new(self.reg_to_expr(*b)),
                 ));
-                Some(Statement::Assign { declaration: false, variable: var, assign: expr })
+                Some(self.make_assign(var, expr))
             }
 
             Opcode::Incr { dst } => {
@@ -849,25 +874,25 @@ impl<'a> Structurer<'a> {
                 let obj_expr = self.reg_to_expr(*obj);
                 let field_name = self.get_field_name(*obj, *field);
                 let expr = Expr::Field(Box::new(obj_expr), field_name);
-                Some(Statement::Assign { declaration: false, variable: var, assign: expr })
+                Some(self.make_assign(var, expr))
             }
 
             Opcode::Call0 { dst, fun } => {
                 let var = self.reg_to_expr(*dst);
                 let call = Call::new_fun(*fun, vec![]);
-                Some(Statement::Assign { declaration: false, variable: var, assign: Expr::Call(Box::new(call)) })
+                Some(self.make_assign(var, Expr::Call(Box::new(call))))
             }
 
             Opcode::Call1 { dst, fun, arg0 } => {
                 let var = self.reg_to_expr(*dst);
                 let call = Call::new_fun(*fun, vec![self.reg_to_expr(*arg0)]);
-                Some(Statement::Assign { declaration: false, variable: var, assign: Expr::Call(Box::new(call)) })
+                Some(self.make_assign(var, Expr::Call(Box::new(call))))
             }
 
             Opcode::Call2 { dst, fun, arg0, arg1 } => {
                 let var = self.reg_to_expr(*dst);
                 let call = Call::new_fun(*fun, vec![self.reg_to_expr(*arg0), self.reg_to_expr(*arg1)]);
-                Some(Statement::Assign { declaration: false, variable: var, assign: Expr::Call(Box::new(call)) })
+                Some(self.make_assign(var, Expr::Call(Box::new(call))))
             }
 
             Opcode::Call3 { dst, fun, arg0, arg1, arg2 } => {
@@ -877,7 +902,7 @@ impl<'a> Structurer<'a> {
                     self.reg_to_expr(*arg1),
                     self.reg_to_expr(*arg2),
                 ]);
-                Some(Statement::Assign { declaration: false, variable: var, assign: Expr::Call(Box::new(call)) })
+                Some(self.make_assign(var, Expr::Call(Box::new(call))))
             }
 
             Opcode::Call4 { dst, fun, arg0, arg1, arg2, arg3 } => {
@@ -888,14 +913,14 @@ impl<'a> Structurer<'a> {
                     self.reg_to_expr(*arg2),
                     self.reg_to_expr(*arg3),
                 ]);
-                Some(Statement::Assign { declaration: false, variable: var, assign: Expr::Call(Box::new(call)) })
+                Some(self.make_assign(var, Expr::Call(Box::new(call))))
             }
 
             Opcode::CallN { dst, fun, args } => {
                 let var = self.reg_to_expr(*dst);
                 let arg_exprs: Vec<_> = args.iter().map(|r| self.reg_to_expr(*r)).collect();
                 let call = Call::new_fun(*fun, arg_exprs);
-                Some(Statement::Assign { declaration: false, variable: var, assign: Expr::Call(Box::new(call)) })
+                Some(self.make_assign(var, Expr::Call(Box::new(call))))
             }
 
             Opcode::CallMethod { dst, field, args } => {
@@ -908,7 +933,7 @@ impl<'a> Structurer<'a> {
                 let method = Expr::Field(Box::new(obj), field_name);
                 let arg_exprs: Vec<_> = args[1..].iter().map(|r| self.reg_to_expr(*r)).collect();
                 let call = Call { fun: method, args: arg_exprs };
-                Some(Statement::Assign { declaration: false, variable: var, assign: Expr::Call(Box::new(call)) })
+                Some(self.make_assign(var, Expr::Call(Box::new(call))))
             }
 
             Opcode::CallThis { dst, field, args } => {
@@ -918,7 +943,7 @@ impl<'a> Structurer<'a> {
                 let method = Expr::Field(Box::new(this), field_name);
                 let arg_exprs: Vec<_> = args.iter().map(|r| self.reg_to_expr(*r)).collect();
                 let call = Call { fun: method, args: arg_exprs };
-                Some(Statement::Assign { declaration: false, variable: var, assign: Expr::Call(Box::new(call)) })
+                Some(self.make_assign(var, Expr::Call(Box::new(call))))
             }
 
             Opcode::CallClosure { dst, fun, args } => {
@@ -926,19 +951,19 @@ impl<'a> Structurer<'a> {
                 let fun_expr = self.reg_to_expr(*fun);
                 let arg_exprs: Vec<_> = args.iter().map(|r| self.reg_to_expr(*r)).collect();
                 let call = Call { fun: fun_expr, args: arg_exprs };
-                Some(Statement::Assign { declaration: false, variable: var, assign: Expr::Call(Box::new(call)) })
+                Some(self.make_assign(var, Expr::Call(Box::new(call))))
             }
 
             Opcode::GetGlobal { dst, global } => {
                 let var = self.reg_to_expr(*dst);
                 let global_name = self.get_global_name(*global);
-                Some(Statement::Assign { declaration: false, variable: var, assign: Expr::Ident(global_name) })
+                Some(self.make_assign(var, Expr::Ident(global_name)))
             }
 
             Opcode::SetGlobal { global, src } => {
                 let global_name = self.get_global_name(*global);
                 let expr = self.reg_to_expr(*src);
-                Some(Statement::Assign { declaration: false, variable: Expr::Ident(global_name), assign: expr })
+                Some(self.make_assign(Expr::Ident(global_name), expr))
             }
 
             Opcode::SetField { obj, field, src } => {
@@ -946,14 +971,14 @@ impl<'a> Structurer<'a> {
                 let field_name = self.get_field_name(*obj, *field);
                 let target = Expr::Field(Box::new(obj_expr), field_name);
                 let expr = self.reg_to_expr(*src);
-                Some(Statement::Assign { declaration: false, variable: target, assign: expr })
+                Some(self.make_assign(target, expr))
             }
 
             Opcode::New { dst } => {
                 let var = self.reg_to_expr(*dst);
                 let type_ref = self.get_type_ref(*dst);
                 let ctor = ConstructorCall::new(type_ref, vec![]);
-                Some(Statement::Assign { declaration: false, variable: var, assign: Expr::Constructor(ctor) })
+                Some(self.make_assign(var, Expr::Constructor(ctor)))
             }
 
             Opcode::NullCheck { reg } => {
@@ -965,7 +990,7 @@ impl<'a> Structurer<'a> {
                 // ToVirtual is often just a cast, emit as assignment
                 let var = self.reg_to_expr(*dst);
                 let expr = self.reg_to_expr(*src);
-                Some(Statement::Assign { declaration: false, variable: var, assign: expr })
+                Some(self.make_assign(var, expr))
             }
 
             Opcode::SDiv { dst, a, b } | Opcode::UDiv { dst, a, b } => {
@@ -974,7 +999,7 @@ impl<'a> Structurer<'a> {
                     Box::new(self.reg_to_expr(*a)),
                     Box::new(self.reg_to_expr(*b)),
                 ));
-                Some(Statement::Assign { declaration: false, variable: var, assign: expr })
+                Some(self.make_assign(var, expr))
             }
 
             Opcode::SMod { dst, a, b } | Opcode::UMod { dst, a, b } => {
@@ -983,7 +1008,7 @@ impl<'a> Structurer<'a> {
                     Box::new(self.reg_to_expr(*a)),
                     Box::new(self.reg_to_expr(*b)),
                 ));
-                Some(Statement::Assign { declaration: false, variable: var, assign: expr })
+                Some(self.make_assign(var, expr))
             }
 
             Opcode::And { dst, a, b } => {
@@ -992,7 +1017,7 @@ impl<'a> Structurer<'a> {
                     Box::new(self.reg_to_expr(*a)),
                     Box::new(self.reg_to_expr(*b)),
                 ));
-                Some(Statement::Assign { declaration: false, variable: var, assign: expr })
+                Some(self.make_assign(var, expr))
             }
 
             Opcode::Or { dst, a, b } => {
@@ -1001,7 +1026,7 @@ impl<'a> Structurer<'a> {
                     Box::new(self.reg_to_expr(*a)),
                     Box::new(self.reg_to_expr(*b)),
                 ));
-                Some(Statement::Assign { declaration: false, variable: var, assign: expr })
+                Some(self.make_assign(var, expr))
             }
 
             Opcode::Xor { dst, a, b } => {
@@ -1010,7 +1035,7 @@ impl<'a> Structurer<'a> {
                     Box::new(self.reg_to_expr(*a)),
                     Box::new(self.reg_to_expr(*b)),
                 ));
-                Some(Statement::Assign { declaration: false, variable: var, assign: expr })
+                Some(self.make_assign(var, expr))
             }
 
             Opcode::Shl { dst, a, b } => {
@@ -1019,7 +1044,7 @@ impl<'a> Structurer<'a> {
                     Box::new(self.reg_to_expr(*a)),
                     Box::new(self.reg_to_expr(*b)),
                 ));
-                Some(Statement::Assign { declaration: false, variable: var, assign: expr })
+                Some(self.make_assign(var, expr))
             }
 
             Opcode::SShr { dst, a, b } => {
@@ -1028,7 +1053,7 @@ impl<'a> Structurer<'a> {
                     Box::new(self.reg_to_expr(*a)),
                     Box::new(self.reg_to_expr(*b)),
                 ));
-                Some(Statement::Assign { declaration: false, variable: var, assign: expr })
+                Some(self.make_assign(var, expr))
             }
 
             Opcode::UShr { dst, a, b } => {
@@ -1038,19 +1063,19 @@ impl<'a> Structurer<'a> {
                     Box::new(self.reg_to_expr(*a)),
                     Box::new(self.reg_to_expr(*b)),
                 ));
-                Some(Statement::Assign { declaration: false, variable: var, assign: expr })
+                Some(self.make_assign(var, expr))
             }
 
             Opcode::Neg { dst, src } => {
                 let var = self.reg_to_expr(*dst);
                 let expr = Expr::Op(Operation::Neg(Box::new(self.reg_to_expr(*src))));
-                Some(Statement::Assign { declaration: false, variable: var, assign: expr })
+                Some(self.make_assign(var, expr))
             }
 
             Opcode::Not { dst, src } => {
                 let var = self.reg_to_expr(*dst);
                 let expr = Expr::Op(Operation::Not(Box::new(self.reg_to_expr(*src))));
-                Some(Statement::Assign { declaration: false, variable: var, assign: expr })
+                Some(self.make_assign(var, expr))
             }
 
             Opcode::GetArray { dst, array, index } => {
@@ -1058,7 +1083,7 @@ impl<'a> Structurer<'a> {
                 let arr = self.reg_to_expr(*array);
                 let idx = self.reg_to_expr(*index);
                 let expr = Expr::Array(Box::new(arr), Box::new(idx));
-                Some(Statement::Assign { declaration: false, variable: var, assign: expr })
+                Some(self.make_assign(var, expr))
             }
 
             Opcode::SetArray { array, index, src } => {
@@ -1066,14 +1091,14 @@ impl<'a> Structurer<'a> {
                 let idx = self.reg_to_expr(*index);
                 let target = Expr::Array(Box::new(arr), Box::new(idx));
                 let expr = self.reg_to_expr(*src);
-                Some(Statement::Assign { declaration: false, variable: target, assign: expr })
+                Some(self.make_assign(target, expr))
             }
 
             Opcode::ArraySize { dst, array } => {
                 let var = self.reg_to_expr(*dst);
                 let arr = self.reg_to_expr(*array);
                 let expr = Expr::Field(Box::new(arr), "length".into());
-                Some(Statement::Assign { declaration: false, variable: var, assign: expr })
+                Some(self.make_assign(var, expr))
             }
 
             Opcode::GetThis { dst, field } => {
@@ -1081,7 +1106,7 @@ impl<'a> Structurer<'a> {
                 let this = Expr::Variable(Reg(0), Some("this".into()));
                 let field_name = self.get_field_name(Reg(0), *field);
                 let expr = Expr::Field(Box::new(this), field_name);
-                Some(Statement::Assign { declaration: false, variable: var, assign: expr })
+                Some(self.make_assign(var, expr))
             }
 
             Opcode::SetThis { field, src } => {
@@ -1089,34 +1114,34 @@ impl<'a> Structurer<'a> {
                 let field_name = self.get_field_name(Reg(0), *field);
                 let target = Expr::Field(Box::new(this), field_name);
                 let expr = self.reg_to_expr(*src);
-                Some(Statement::Assign { declaration: false, variable: target, assign: expr })
+                Some(self.make_assign(target, expr))
             }
 
             Opcode::Bytes { dst, ptr } => {
                 let var = self.reg_to_expr(*dst);
                 // Bytes constants are stored separately, emit as Unknown for now
                 let val = Expr::Unknown(format!("bytes@{}", ptr.0));
-                Some(Statement::Assign { declaration: false, variable: var, assign: val })
+                Some(self.make_assign(var, val))
             }
 
             Opcode::Ref { dst, src } => {
                 // Reference - creates a pointer to a value
                 let var = self.reg_to_expr(*dst);
                 let expr = self.reg_to_expr(*src);
-                Some(Statement::Assign { declaration: false, variable: var, assign: expr })
+                Some(self.make_assign(var, expr))
             }
 
             Opcode::Unref { dst, src } => {
                 // Dereference - reads from a pointer
                 let var = self.reg_to_expr(*dst);
                 let expr = self.reg_to_expr(*src);
-                Some(Statement::Assign { declaration: false, variable: var, assign: expr })
+                Some(self.make_assign(var, expr))
             }
 
             Opcode::Type { dst, ty } => {
                 let var = self.reg_to_expr(*dst);
                 let val = Expr::Constant(Constant::TypeRef(*ty));
-                Some(Statement::Assign { declaration: false, variable: var, assign: val })
+                Some(self.make_assign(var, val))
             }
 
             Opcode::DynGet { dst, obj, field } => {
@@ -1126,7 +1151,7 @@ impl<'a> Structurer<'a> {
                     .cloned()
                     .unwrap_or_else(|| format!("dyn_{}", field.0).into());
                 let expr = Expr::Field(Box::new(obj_expr), field_name);
-                Some(Statement::Assign { declaration: false, variable: var, assign: expr })
+                Some(self.make_assign(var, expr))
             }
 
             Opcode::DynSet { obj, field, src } => {
@@ -1136,7 +1161,7 @@ impl<'a> Structurer<'a> {
                     .unwrap_or_else(|| format!("dyn_{}", field.0).into());
                 let target = Expr::Field(Box::new(obj_expr), field_name);
                 let expr = self.reg_to_expr(*src);
-                Some(Statement::Assign { declaration: false, variable: target, assign: expr })
+                Some(self.make_assign(target, expr))
             }
 
             _ => Some(Statement::Comment(format!("// unhandled: {:?}", op))),
