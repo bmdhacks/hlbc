@@ -29,6 +29,10 @@ pub mod lifter;
 pub mod analyzer;
 /// Pass 3: SSA construction (φ-functions and variable versioning)
 pub mod ssa;
+/// Pass 4: Type propagation through SSA graph
+pub mod type_prop;
+/// Pass 5: Convert SSA-CFG to structured AST
+pub mod structurer;
 /// Liveness analysis for accurate variable naming
 mod liveness;
 /// AST post-processing

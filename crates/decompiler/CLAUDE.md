@@ -26,21 +26,24 @@ The decompiler transforms HashLink bytecode opcodes into an AST, then formats th
 Opcodes → DecompilerState → AST (Statement/Expr) → Formatted Output
 ```
 
-### Multi-Pass Architecture (In Progress)
+### Multi-Pass Architecture (Implemented)
 
-A new multi-pass architecture is being implemented:
+A new multi-pass architecture has been implemented:
 
 ```
-Bytecode → Lifter → CFG → Analyzer → SSA-CFG → Structurer → AST → Printer → Haxe
+Bytecode → Lifter → CFG → Analyzer → SSA Builder → Type Prop → Structurer → AST → Printer → Haxe
 ```
 
-| Pass | Module | Purpose |
-|------|--------|---------|
-| 1 | `lifter.rs` | Build petgraph CFG from bytecode |
-| 2 | `analyzer.rs` | Compute dominators, identify loops, detect reducibility |
-| 3 | `type_prop.rs` | (Planned) Infer types from usage |
-| 4 | `structurer.rs` | (Planned) Interval Analysis / Relooper |
-| 5 | `fmt.rs` | Print AST as Haxe code |
+| Pass | Module | Status | Purpose |
+|------|--------|--------|---------|
+| 1 | `lifter.rs` | ✅ Done | Build petgraph CFG from bytecode |
+| 2 | `analyzer.rs` | ✅ Done | Compute dominators, identify loops, detect reducibility |
+| 3 | `ssa.rs` | ✅ Done | SSA conversion with φ-functions (Cytron et al.) |
+| 4 | `type_prop.rs` | ✅ Done | Infer types from usage, unify φ-function types |
+| 5 | `structurer.rs` | ✅ Done | Convert SSA-CFG to structured AST |
+| 6 | `fmt.rs` | ✅ Exists | Print AST as Haxe code |
+
+**Next step:** Wire up new pipeline to replace current scope-based decompiler.
 
 ### Key Files
 
@@ -49,8 +52,11 @@ Bytecode → Lifter → CFG → Analyzer → SSA-CFG → Structurer → AST → 
 | `src/lib.rs` | Main decompilation loop, opcode handlers, `DecompilerState` |
 | `src/lifter.rs` | Pass 1: CFG construction using petgraph |
 | `src/analyzer.rs` | Pass 2: Dominator trees, natural loop detection |
+| `src/ssa.rs` | Pass 3: SSA construction with φ-functions |
+| `src/type_prop.rs` | Pass 4: Type inference through SSA graph |
+| `src/structurer.rs` | Pass 5: Convert SSA-CFG to structured AST |
 | `src/ast.rs` | AST types: `Statement`, `Expr`, `Constant` |
-| `src/scopes.rs` | Scope stack for control flow (if/else, loops, switch, try/catch) |
+| `src/scopes.rs` | Scope stack for control flow (legacy, to be replaced) |
 | `src/fmt.rs` | AST → string formatting with indentation |
 | `src/post.rs` | Post-processing visitors for AST cleanup |
 | `src/liveness/` | Live range analysis for variable naming |
