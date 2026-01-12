@@ -98,6 +98,19 @@ struct Args {
     new_decompiler: bool,
 }
 
+// Disable release builds - use debug builds for eprintln!() debugging
+#[cfg(not(debug_assertions))]
+compile_error!(
+    r#"
+╔═══════════════════════════════════════════════════════════════════════╗
+║  RELEASE BUILDS DISABLED                                              ║
+║                                                                       ║
+║  Use debug build instead:  cargo build -p hlbc-cli                    ║
+║  Binary will be at:        ./target/debug/hlbc                        ║
+╚═══════════════════════════════════════════════════════════════════════╝
+"#
+);
+
 fn main() -> anyhow::Result<()> {
     let args: Args = Args::parse();
 

@@ -24,6 +24,7 @@ use crate::type_prop::TypeInfo;
 use crate::ssa::UseDefInfo;
 
 use crate::closure_analysis::ClosureAnalysis;
+use crate::exception_analysis::{ExceptionAnalysis, TryRegion};
 
 /// Context for structuring
 pub struct Structurer<'a> {
@@ -65,6 +66,8 @@ pub struct Structurer<'a> {
     /// Shifted index tracking: maps shifted reg -> (original index reg, shift amount)
     /// Used to reverse index * 4 back to original index for array access
     shifted_indices: HashMap<Reg, (Reg, i32)>,
+    /// Exception region analysis for try/catch structuring
+    exception_analysis: ExceptionAnalysis,
 }
 
 impl<'a> Structurer<'a> {
@@ -105,6 +108,9 @@ impl<'a> Structurer<'a> {
             }
         }
 
+        // Analyze exception regions for try/catch structuring
+        let exception_analysis = ExceptionAnalysis::analyze(func);
+
         Structurer {
             code,
             func,
@@ -118,6 +124,7 @@ impl<'a> Structurer<'a> {
             var_counter: 0,
             use_info,
             inline_exprs: HashMap::new(),
+            exception_analysis,
             declared_vars,
             current_op: 0,
             method_info,
@@ -220,7 +227,14 @@ impl<'a> Structurer<'a> {
 
     /// Structure the entire function into statements
     pub fn structure(&mut self) -> Vec<Statement> {
-        let stmts = self.structure_from(self.cfg.entry, None);
+        // For functions with exception regions, use opcode-range-based structuring
+        // which handles nested Trap/EndTrap correctly without CFG edge interference.
+        // For functions without exceptions, use CFG-based structuring.
+        let stmts = if self.exception_analysis.has_exceptions() {
+            self.structure_block_range(0, self.func.ops.len())
+        } else {
+            self.structure_from(self.cfg.entry, None)
+        };
 
         // Prepend hoisted variable declarations (for vars first assigned inside scopes)
         let mut result = Vec::new();
@@ -364,10 +378,12 @@ impl<'a> Structurer<'a> {
             return self.structure_loop(&loop_info, stop_at);
         }
 
-        // Check if this block starts a try/catch (has exception handler edge)
-        if let Some(handler) = self.cfg.get_exception_handler(start) {
-            return self.structure_try_catch(start, handler, stop_at);
-        }
+        // NOTE: Old CFG-based try/catch handling disabled in favor of
+        // ExceptionAnalysis-based approach in structure_block/structure_block_range.
+        // The CFG exception edges don't correctly handle nested Trap/EndTrap pairs.
+        // if let Some(handler) = self.cfg.get_exception_handler(start) {
+        //     return self.structure_try_catch(start, handler, stop_at);
+        // }
 
         self.processed.insert(start);
         let mut stmts = self.structure_block(start);
@@ -586,11 +602,111 @@ impl<'a> Structurer<'a> {
     /// Structure a range of opcodes into statements (for header blocks)
     fn structure_block_range(&mut self, start: usize, end: usize) -> Vec<Statement> {
         let mut stmts = Vec::new();
-        for op_idx in start..end {  // Exclude the final jump
+        let mut op_idx = start;
+
+        while op_idx < end {
             self.current_op = op_idx;
+
+            // Check if this opcode starts an exception region
+            // Clone the region to avoid borrow checker issues
+            if let Some(region) = self.exception_analysis.region_starting_at(op_idx).cloned() {
+                // Compute catch_end: find next sequential region or use end
+                let catch_end = self.find_catch_end(region.handler_op, end);
+
+                // Structure the try/catch and skip past the entire region
+                let try_catch = self.structure_exception_region(&region, catch_end);
+                stmts.push(try_catch);
+                // Skip past the catch body to continue after the try/catch
+                op_idx = catch_end;
+                continue;
+            }
+
             if let Some(stmt) = self.opcode_to_statement(op_idx) {
                 stmts.push(stmt);
             }
+            op_idx += 1;
+        }
+        stmts
+    }
+
+    /// Find where a catch body ends
+    /// Returns the first opcode after the catch body
+    fn find_catch_end(&self, handler_start: usize, outer_end: usize) -> usize {
+        // Look for the next top-level try region that starts after handler_start
+        // That would be the start of the next sequential try/catch
+        let mut catch_end = outer_end;
+
+        for region in self.exception_analysis.top_level_regions() {
+            if region.trap_op > handler_start && region.trap_op < catch_end {
+                catch_end = region.trap_op;
+            }
+        }
+
+        catch_end
+    }
+
+    /// Structure a try/catch region using exception analysis
+    fn structure_exception_region(&mut self, region: &TryRegion, outer_end: usize) -> Statement {
+        // Get the exception variable name from the Trap opcode
+        let catch_var = self.reg_name(region.exc_reg).to_string();
+
+        // Try body: from trap+1 to end_trap (excluding EndTrap itself which is control flow)
+        // The EndTrap marks the end of the try body's normal exit path
+        self.scope_depth += 1;
+        let try_stmts = self.structure_opcode_range(
+            region.trap_op + 1,
+            region.end_trap_op, // End before EndTrap
+            &region.nested,
+        );
+        self.scope_depth -= 1;
+
+        // Catch body: from handler to computed end
+        // Catch body ends at: outer_end (for top-level), or function end
+        // For nested regions, catch body is inside outer region's try body
+        let catch_end = outer_end;
+
+        self.scope_depth += 1;
+        let catch_stmts = self.structure_opcode_range(
+            region.handler_op,
+            catch_end,
+            &[], // Nested regions in catch body would need separate tracking
+        );
+        self.scope_depth -= 1;
+
+        Statement::TryCatch {
+            try_stmts,
+            catch_var,
+            catch_stmts,
+        }
+    }
+
+    /// Structure a range of opcodes, handling nested exception regions
+    fn structure_opcode_range(
+        &mut self,
+        start: usize,
+        end: usize,
+        nested_regions: &[TryRegion],
+    ) -> Vec<Statement> {
+        let mut stmts = Vec::new();
+        let mut op_idx = start;
+
+        while op_idx < end {
+            self.current_op = op_idx;
+
+            // Check if this opcode starts a nested exception region
+            if let Some(region) = nested_regions.iter().find(|r| r.trap_op == op_idx) {
+                let try_catch = self.structure_exception_region(region, end);
+                stmts.push(try_catch);
+                // Skip past the entire nested try/catch including its catch body
+                // The catch body was processed from handler_op to 'end', so skip there
+                op_idx = end;
+                continue;
+            }
+
+            if let Some(stmt) = self.opcode_to_statement(op_idx) {
+                stmts.push(stmt);
+            }
+            op_idx += 1;
         }
         stmts
     }
@@ -1155,9 +1271,24 @@ impl<'a> Structurer<'a> {
             block.end
         };
 
-        for op_idx in block.start..=end {
+        let func_end = self.func.ops.len();
+        let mut op_idx = block.start;
+        while op_idx <= end {
             // Track current opcode for debug name lookup
             self.current_op = op_idx;
+
+            // Check if this opcode starts an exception region
+            if let Some(region) = self.exception_analysis.region_starting_at(op_idx).cloned() {
+                // Compute catch_end: find next sequential region or use function end
+                let catch_end = self.find_catch_end(region.handler_op, func_end);
+
+                // Structure the try/catch and skip past the entire region
+                let try_catch = self.structure_exception_region(&region, catch_end);
+                stmts.push(try_catch);
+                // Skip past the catch body to continue after the try/catch
+                op_idx = catch_end;
+                continue;
+            }
 
             // Check if this op has an SSA destination we can analyze
             let is_dead = if let Some(&ssa_dst) = op_to_ssa.get(&op_idx) {
@@ -1188,6 +1319,7 @@ impl<'a> Structurer<'a> {
             );
 
             if is_dead && !has_side_effects {
+                op_idx += 1;
                 continue;
             }
 
@@ -1195,6 +1327,7 @@ impl<'a> Structurer<'a> {
             if let Some(stmt) = self.opcode_to_statement(op_idx) {
                 stmts.push(stmt);
             }
+            op_idx += 1;
         }
 
         // Check for return/throw
@@ -1285,6 +1418,9 @@ impl<'a> Structurer<'a> {
             Opcode::Label | Opcode::Nop => None,
             Opcode::JTrue { .. } | Opcode::JFalse { .. } | Opcode::JNull { .. }
             | Opcode::JNotNull { .. } | Opcode::JAlways { .. } | Opcode::Ret { .. } => None,
+
+            // Exception handling opcodes are control flow - handled by structure_block_range
+            Opcode::Trap { .. } | Opcode::EndTrap { .. } => None,
 
             // Throw should be emitted (e.g., in try body)
             Opcode::Throw { exc } => Some(Statement::Throw(self.reg_to_expr(*exc))),
@@ -1468,7 +1604,7 @@ impl<'a> Structurer<'a> {
                     return Some(Statement::Comment("callmethod with no args".into()));
                 }
                 let obj = self.reg_to_expr(args[0]);
-                // For CallMethod, 'field' is a pindex (proto index), not a field index
+                // For CallMethod, 'field' is a proto array index (NOT a pindex or field index)
                 let method_name = self.get_proto_name(args[0], *field);
                 let method = Expr::Field(Box::new(obj), method_name);
                 let arg_exprs: Vec<_> = args[1..].iter().map(|r| self.reg_to_expr(*r)).collect();
@@ -1776,15 +1912,36 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::Ref { dst, src } => {
-                // Reference - creates a pointer to a value for internal use (output parameters)
-                // For nullable parameters (Null<Int>), the pattern is:
-                // 1. Int reg13 = 2
-                // 2. Ref reg10 = &reg13
-                // 3. Call(fun, reg10)
-                // We emit as a simple assignment so the value gets passed
-                let var = self.reg_to_expr_dst(*dst);
-                let expr = self.reg_to_expr(*src);
-                Some(self.make_assign(var, expr))
+                // Reference - creates a pointer to a value
+                // Two patterns:
+                // 1. OUTPUT ref: Ref reg10 = &reg9; ftos(float, reg10) - reg10 is output param
+                //    The ftos function writes through reg10 to set reg9. Skip this Ref.
+                // 2. INPUT ref: Ref reg4 = &reg9; Call(reg4) - passes nullable value
+                //    We need to emit dst = src so the value flows through.
+                //
+                // Detect OUTPUT pattern by looking at next opcode for ftos/itos/dtos calls
+                let is_output_ref = if let Some(next_op) = self.func.ops.get(op_idx + 1) {
+                    match next_op {
+                        Opcode::Call2 { fun, arg1, .. } if *arg1 == *dst => {
+                            // Check if it's a string conversion function (works for natives too)
+                            let name = fun.name(self.code);
+                            matches!(name.as_ref(), "ftos" | "itos" | "dtos")
+                        }
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+
+                if is_output_ref {
+                    // Skip - the ftos/itos/dtos call handles this
+                    None
+                } else {
+                    // Nullable input parameter - emit assignment
+                    let var = self.reg_to_expr_dst(*dst);
+                    let expr = self.reg_to_expr(*src);
+                    Some(self.make_assign(var, expr))
+                }
             }
 
             Opcode::Unref { dst, src } => {
@@ -2370,27 +2527,25 @@ impl<'a> Structurer<'a> {
         format!("__field_{}", field.0).into()
     }
 
-    /// Get method name from a proto index (pindex).
-    /// Used for CallMethod where 'field' is actually a pindex into the vtable.
-    fn get_proto_name(&self, obj_reg: Reg, pindex: hlbc::types::RefField) -> Str {
+    /// Get method name from a proto array index.
+    /// For CallMethod, 'field' is a direct index into the proto[] array.
+    fn get_proto_name(&self, obj_reg: Reg, proto_idx: hlbc::types::RefField) -> Str {
         let reg_idx = obj_reg.0 as usize;
         if reg_idx < self.func.regs.len() {
             let type_ref = self.func.regs[reg_idx];
             if let Some(ty) = self.code.types.get(type_ref.0) {
                 match ty {
                     hlbc::types::Type::Obj(obj) => {
-                        // Search protos for one with matching pindex
-                        for proto in &obj.protos {
-                            if proto.pindex == pindex.0 as i32 {
-                                if let Some(name) = self.code.strings.get(proto.name.0) {
-                                    return name.clone();
-                                }
+                        // Direct array index into protos
+                        if let Some(proto) = obj.protos.get(proto_idx.0) {
+                            if let Some(name) = self.code.strings.get(proto.name.0) {
+                                return name.clone();
                             }
                         }
                     }
                     hlbc::types::Type::Virtual { fields } => {
-                        // For Virtual types, pindex is a direct index into fields
-                        if let Some(f) = fields.get(pindex.0) {
+                        // For Virtual types, proto_idx is an index into fields
+                        if let Some(f) = fields.get(proto_idx.0) {
                             if let Some(name) = self.code.strings.get(f.name.0) {
                                 if !name.is_empty() {
                                     return name.clone();
@@ -2403,7 +2558,7 @@ impl<'a> Structurer<'a> {
             }
         }
         // Fallback
-        format!("method_{}", pindex.0).into()
+        format!("method_{}", proto_idx.0).into()
     }
 
     /// Look ahead from a New opcode to find the __constructor__ call arguments.

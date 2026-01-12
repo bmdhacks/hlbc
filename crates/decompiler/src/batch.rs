@@ -79,11 +79,13 @@ impl BatchOptions {
 fn matches_pattern(name: &str, pattern: &str) -> bool {
     if pattern.ends_with(".**") {
         // Match package and all subpackages
-        let prefix = &pattern[..pattern.len() - 3];
+        // pattern "h2d.**" should match "h2d.Foo" and "h2d.sub.Bar"
+        let prefix = &pattern[..pattern.len() - 2]; // Keep the dot: "h2d."
         name.starts_with(prefix)
     } else if pattern.ends_with(".*") {
-        // Match only direct children
-        let prefix = &pattern[..pattern.len() - 2];
+        // Match only direct children (no nested packages)
+        // pattern "h2d.*" should match "h2d.Foo" but not "h2d.sub.Bar"
+        let prefix = &pattern[..pattern.len() - 1]; // Keep the dot: "h2d."
         name.starts_with(prefix) && !name[prefix.len()..].contains('.')
     } else {
         // Exact match

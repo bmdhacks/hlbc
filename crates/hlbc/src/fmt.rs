@@ -191,6 +191,18 @@ pub trait BytecodeFmt {
         Display::fmt(&v, f)
     }
 
+    /// Format a proto/method reference by pindex (vtable index).
+    /// Used for CallMethod where field is actually a pindex.
+    fn fmt_refproto(
+        &self,
+        f: &mut Formatter,
+        ctx: &Bytecode,
+        pindex: RefField,
+        parent: &Type,
+    ) -> Result {
+        Display::fmt(&pindex, f)
+    }
+
     fn fmt_refenumconstruct(
         &self,
         f: &mut Formatter,
@@ -353,6 +365,29 @@ impl BytecodeFmt for EnhancedFmt {
         } else {
             Display::fmt(&v, f)
         }
+    }
+
+    fn fmt_refproto(
+        &self,
+        f: &mut Formatter,
+        ctx: &Bytecode,
+        proto_idx: RefField,
+        parent: &Type,
+    ) -> Result {
+        // For CallMethod, proto_idx is a direct array index into the proto[] array
+        if let Some(obj) = parent.get_type_obj() {
+            if let Some(proto) = obj.protos.get(proto_idx.0) {
+                return self.fmt_refstring(f, ctx, proto.name);
+            }
+        }
+        // For Virtual types, use field lookup (virtual method calls use field indices)
+        if let Type::Virtual { fields } = parent {
+            if let Some(field) = fields.get(proto_idx.0) {
+                return self.fmt_refstring(f, ctx, field.name);
+            }
+        }
+        // Fallback: display as method_N
+        write!(f, "method_{}", proto_idx.0)
     }
 
     fn fmt_refenumconstruct(
@@ -686,14 +721,14 @@ impl Opcode {
                 op!(
                     "{dst} = {}.{}({})",
                     arg0,
-                    field.display::<EnhancedFmt>(ctx, &ctx[parent[*arg0]]),
+                    fmtools::fmt!(|f| EnhancedFmt.fmt_refproto(f, ctx, *field, &ctx[parent[*arg0]])?;),
                     fmtools::join(", ", args)
                 )
             }
             Opcode::CallThis { dst, field, args } => {
                 op!(
                     "{dst} = reg0.{}({})",
-                    field.display::<EnhancedFmt>(ctx, &ctx[parent.regs[0]]),
+                    fmtools::fmt!(|f| EnhancedFmt.fmt_refproto(f, ctx, *field, &ctx[parent.regs[0]])?;),
                     fmtools::join(", ", args)
                 )
             }

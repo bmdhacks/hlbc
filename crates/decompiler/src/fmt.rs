@@ -606,10 +606,15 @@ impl Expr {
                             "__alloc__" => call.args.first().map(CallHandling::Elide).unwrap_or(CallHandling::Normal),
                             // thrown wraps an exception - use the argument
                             "thrown" => call.args.first().map(CallHandling::Elide).unwrap_or(CallHandling::Normal),
-                            // caught extracts exception from HL wrapper - use the argument
+                            // caught wraps a raw exception in haxe.Exception
+                            // With :Dynamic catch type, the value is already raw, so elide
                             "caught" => call.args.first().map(CallHandling::Elide).unwrap_or(CallHandling::Normal),
-                            // string converts to string - use the argument
-                            "string" => call.args.first().map(CallHandling::Elide).unwrap_or(CallHandling::Normal),
+                            // string converts dynamic to string - use Std.string()
+                            "string" => {
+                                call.args.first().map(|arg| {
+                                    CallHandling::SpecialFormat(format!("Std.string({})", arg.display(indent, code, f)))
+                                }).unwrap_or(CallHandling::Normal)
+                            }
                             // Internal array methods that shouldn't be visible
                             "__expand" | "__construct" => CallHandling::Skip,
                             // __constructor__ is called after new Type() - skip since object is already created
@@ -633,8 +638,17 @@ impl Expr {
                     } else if let Expr::Field(receiver, method) = &call.fun {
                         // Check for method calls that should be elided or skipped
                         match method.as_ref() {
-                            // __exceptionMessage extracts actual exception value - return receiver
-                            "__exceptionMessage" => CallHandling::Elide(receiver.as_ref()),
+                            // unwrap extracts the original thrown value from haxe.Exception
+                            // With :Dynamic catch type and caught() elided, just use the receiver
+                            "unwrap" => CallHandling::SpecialFormat(format!(
+                                "{}",
+                                receiver.display(indent, code, f)
+                            )),
+                            // __exceptionMessage is the old/internal name for the same thing
+                            "__exceptionMessage" => CallHandling::SpecialFormat(format!(
+                                "{}",
+                                receiver.display(indent, code, f)
+                            )),
                             // Internal array methods that shouldn't be visible
                             "__expand" | "__construct" => CallHandling::Skip,
                             // __constructor__ is called after new Type() - skip since object is already created
@@ -958,7 +972,8 @@ impl Statement {
                     for stmt in try_stmts {
                         {indent2}{stmt.display(&indent2, code, f)}"\n"
                     }
-                    {indent}"} catch ("{catch_var}") {\n"
+                    // Use :Dynamic to get raw exception value without haxe.Exception wrapping
+                    {indent}"} catch ("{catch_var}":Dynamic) {\n"
                     for stmt in catch_stmts {
                         {indent2}{stmt.display(&indent2, code, f)}"\n"
                     }

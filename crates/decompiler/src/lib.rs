@@ -34,9 +34,13 @@ pub mod structurer;
 mod post;
 /// Closure pattern detection and analysis
 pub mod closure_analysis;
+/// Exception region analysis for try/catch structuring
+pub mod exception_analysis;
 
 // Re-export ClosureAnalysis for convenience
 pub use closure_analysis::ClosureAnalysis;
+// Re-export ExceptionAnalysis for convenience
+pub use exception_analysis::ExceptionAnalysis;
 
 /// Map from (static_type_global, field_index) -> initialization Expr
 /// Used to track static field initializers extracted from the entrypoint function.
