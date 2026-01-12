@@ -442,7 +442,29 @@ impl<'a> Display for OperationDisplay<'a> {
             Xor(e1, e2) => write!(fmt, "({} ^ {})", disp(e1), disp(e2)),
             // Unary
             Neg(expr) => write!(fmt, "-{}", disp(expr)),
-            Not(expr) => write!(fmt, "!{}", disp(expr)),
+            Not(inner) => {
+                // Add parentheses for complex expressions (comparisons, binary ops)
+                // The inner is a Box<Expr>, so we need to check if it's an Op variant
+                let needs_parens = if let Expr::Op(op) = inner.as_ref() {
+                    matches!(op,
+                        Operation::Eq(..) | Operation::NotEq(..) |
+                        Operation::Lt(..) | Operation::Lte(..) |
+                        Operation::Gt(..) | Operation::Gte(..) |
+                        Operation::Add(..) | Operation::Sub(..) |
+                        Operation::Mul(..) | Operation::Div(..) |
+                        Operation::Mod(..) | Operation::Shl(..) |
+                        Operation::Shr(..) | Operation::And(..) |
+                        Operation::Or(..) | Operation::Xor(..)
+                    )
+                } else {
+                    false
+                };
+                if needs_parens {
+                    write!(fmt, "!({})", disp(inner))
+                } else {
+                    write!(fmt, "!{}", disp(inner))
+                }
+            }
             Incr(expr) => write!(fmt, "{}++", disp(expr)),
             Decr(expr) => write!(fmt, "{}--", disp(expr)),
             // Comparison
@@ -687,7 +709,20 @@ impl Expr {
                     {indent}"}"
                 }
                 Expr::EnumConstr(ty, constr, args) => {
-                    {constr.display::<EnhancedFmt>(code, &code[*ty])}"("{fmtools::join(", ", args.iter().map(|e| disp!(e)))}")"
+                    // Get the construct name and prefix with _ to avoid conflicts
+                    // with built-in types (e.g., "String" enum construct vs String class)
+                    let construct_name = if let Type::Enum { constructs, .. } = &code[*ty] {
+                        if let Some(c) = constructs.get(constr.0) {
+                            let name = c.name(code);
+                            // Prefix with _ to avoid conflicts with built-in types
+                            format!("_Enum{}", name)
+                        } else {
+                            format!("_EnumConstruct{}", constr.0)
+                        }
+                    } else {
+                        format!("_EnumConstruct{}", constr.0)
+                    };
+                    {construct_name}"("{fmtools::join(", ", args.iter().map(|e| disp!(e)))}")"
                 }
                 Expr::Field(receiver, name) => {
                     {disp!(receiver)}"."{name}
@@ -947,8 +982,8 @@ impl Statement {
                         if i < stmts.len() - 1 { "\n"{indent} }
                     }
                 }
-                Statement::VarDecl { name } => {
-                    "var "{name}";"
+                Statement::VarDecl { name, type_hint } => {
+                    "var "{name}if let Some(t) = type_hint { ":"{t} }";"
                 }
             }
         }

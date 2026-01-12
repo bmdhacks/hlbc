@@ -11,17 +11,19 @@ use petgraph::graph::NodeIndex;
 use std::collections::{HashMap, HashSet};
 
 use hlbc::opcodes::Opcode;
-use hlbc::types::{Function, Reg, RefFun, Type};
+use hlbc::types::{Function, Reg, RefFun, RefField, Type};
 use hlbc::{Bytecode, Str};
 
 use crate::analyzer::{CfgAnalysis, NaturalLoop};
 use crate::ast::{Call, Constant, ConstructorCall, Expr, Operation, Statement};
-use crate::lifter::Cfg;
+use crate::lifter::{Cfg, EdgeKind};
 use hlbc::types::RefType;
 use crate::ssa::{SsaCfg, SsaInstr, SsaVar, get_dst_reg as get_opcode_dst};
 use crate::type_prop::TypeInfo;
 
 use crate::ssa::UseDefInfo;
+
+use crate::closure_analysis::ClosureAnalysis;
 
 /// Context for structuring
 pub struct Structurer<'a> {
@@ -31,6 +33,8 @@ pub struct Structurer<'a> {
     analysis: &'a CfgAnalysis,
     ssa: &'a SsaCfg,
     _type_info: &'a TypeInfo,
+    /// Closure analysis for detecting/handling closures
+    closure_analysis: Option<&'a ClosureAnalysis>,
 
     /// Processed blocks (to avoid re-processing)
     processed: HashSet<NodeIndex>,
@@ -53,6 +57,8 @@ pub struct Structurer<'a> {
     scope_depth: u32,
     /// Variables that need hoisting to function scope (declared inside nested scope)
     hoisted_vars: HashSet<Str>,
+    /// Hoisted vars that need :Dynamic type (assigned empty anonymous objects)
+    needs_dynamic_type: HashSet<Str>,
     /// Array bytes tracking: maps bytes register -> array register
     /// Used to reconstruct arr[i] from bytes[shifted_i] pattern
     array_bytes_source: HashMap<Reg, Reg>,
@@ -70,11 +76,34 @@ impl<'a> Structurer<'a> {
         ssa: &'a SsaCfg,
         type_info: &'a TypeInfo,
     ) -> Self {
+        Self::new_with_closures(code, func, cfg, analysis, ssa, type_info, None)
+    }
+
+    pub fn new_with_closures(
+        code: &'a Bytecode,
+        func: &'a Function,
+        cfg: &'a Cfg,
+        analysis: &'a CfgAnalysis,
+        ssa: &'a SsaCfg,
+        type_info: &'a TypeInfo,
+        closure_analysis: Option<&'a ClosureAnalysis>,
+    ) -> Self {
         // Compute use counts for inlining decisions (needs func for purity info)
         let use_info = ssa.compute_use_counts(func);
 
         // Build method info map from all types' protos
         let method_info = Self::build_method_info(code);
+
+        // Pre-populate declared_vars with parameter names so we don't hoist them
+        let mut declared_vars = HashSet::new();
+        if let Some(Type::Fun(fun_type) | Type::Method(fun_type)) = code.types.get(func.t.0) {
+            let num_args = fun_type.args.len();
+            for i in 0..num_args {
+                if let Some(param_name) = func.arg_name(code, i) {
+                    declared_vars.insert(param_name.into());
+                }
+            }
+        }
 
         Structurer {
             code,
@@ -83,16 +112,18 @@ impl<'a> Structurer<'a> {
             analysis,
             ssa,
             _type_info: type_info,
+            closure_analysis,
             processed: HashSet::new(),
             var_names: HashMap::new(),
             var_counter: 0,
             use_info,
             inline_exprs: HashMap::new(),
-            declared_vars: HashSet::new(),
+            declared_vars,
             current_op: 0,
             method_info,
             scope_depth: 0,
             hoisted_vars: HashSet::new(),
+            needs_dynamic_type: HashSet::new(),
             array_bytes_source: HashMap::new(),
             shifted_indices: HashMap::new(),
         }
@@ -135,12 +166,19 @@ impl<'a> Structurer<'a> {
         let is_declaration = match &variable {
             Expr::Variable(_, Some(name)) | Expr::Ident(name) => {
                 if self.declared_vars.contains(name) {
-                    // Already declared
+                    // Already declared - but if assigning empty object, track for :Dynamic
+                    if Self::is_empty_anonymous(&assign) {
+                        self.needs_dynamic_type.insert(name.clone());
+                    }
                     false
                 } else if self.scope_depth > 0 {
                     // Inside a scope - don't declare inline, hoist instead
                     self.hoisted_vars.insert(name.clone());
                     self.declared_vars.insert(name.clone());
+                    // Track if this hoisted var needs :Dynamic
+                    if Self::is_empty_anonymous(&assign) {
+                        self.needs_dynamic_type.insert(name.clone());
+                    }
                     false
                 } else {
                     // At function level - declare normally
@@ -163,6 +201,11 @@ impl<'a> Structurer<'a> {
         }
     }
 
+    /// Check if an expression is an empty anonymous object (needs :Dynamic type)
+    fn is_empty_anonymous(expr: &Expr) -> bool {
+        matches!(expr, Expr::Anonymous(_, fields) if fields.is_empty())
+    }
+
     /// Create a call statement, handling void return types correctly.
     /// For void functions, we emit just the call as an expression statement.
     /// For non-void functions, we assign the result to a variable.
@@ -182,7 +225,13 @@ impl<'a> Structurer<'a> {
         // Prepend hoisted variable declarations (for vars first assigned inside scopes)
         let mut result = Vec::new();
         for name in &self.hoisted_vars {
-            result.push(Statement::VarDecl { name: name.clone() });
+            // Add :Dynamic type hint for vars that will hold empty anonymous objects
+            let type_hint = if self.needs_dynamic_type.contains(name) {
+                Some("Dynamic".into())
+            } else {
+                None
+            };
+            result.push(Statement::VarDecl { name: name.clone(), type_hint });
         }
         result.extend(stmts);
 
@@ -249,6 +298,61 @@ impl<'a> Structurer<'a> {
         None
     }
 
+    /// Check if a register is a closure context (EnumAlloc result for a closure)
+    fn is_closure_context_reg(&self, reg: Reg) -> bool {
+        if let Some(analysis) = self.closure_analysis {
+            analysis.is_context_reg(self.func.findex, reg)
+        } else {
+            false
+        }
+    }
+
+    /// Get closure info if the current opcode is an InstanceClosure that we should inline
+    fn get_closure_at_current_op(&self) -> Option<&crate::closure_analysis::CaptureInfo> {
+        if let Some(analysis) = self.closure_analysis {
+            analysis.get_closure_at(self.func.findex, self.current_op)
+        } else {
+            None
+        }
+    }
+
+    /// Get the current function's reference
+    fn current_fun(&self) -> RefFun {
+        self.func.findex
+    }
+
+    /// Check if the current function is a closure (inner function with capture context)
+    fn is_current_function_closure(&self) -> bool {
+        if let Some(analysis) = self.closure_analysis {
+            analysis.is_closure(self.func.findex)
+        } else {
+            false
+        }
+    }
+
+    /// Get capture info for the current function if it's a closure
+    fn get_current_capture_info(&self) -> Option<&crate::closure_analysis::CaptureInfo> {
+        if let Some(analysis) = self.closure_analysis {
+            analysis.get_capture_info(self.func.findex)
+        } else {
+            None
+        }
+    }
+
+    /// Get captured variable name from an EnumField access in a closure body
+    fn get_captured_var_name(&self, field: RefField) -> Option<Str> {
+        if let Some(capture_info) = self.get_current_capture_info() {
+            for cap in &capture_info.captures {
+                if cap.field_index == field {
+                    if let Some(ref name) = cap.name {
+                        return Some(name.clone().into());
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Structure code starting from a given block
     fn structure_from(&mut self, start: NodeIndex, stop_at: Option<NodeIndex>) -> Vec<Statement> {
         if Some(start) == stop_at || self.processed.contains(&start) {
@@ -258,6 +362,11 @@ impl<'a> Structurer<'a> {
         // Check if this is a loop header
         if let Some(loop_info) = self.analysis.loops.iter().find(|l| l.header == start).cloned() {
             return self.structure_loop(&loop_info, stop_at);
+        }
+
+        // Check if this block starts a try/catch (has exception handler edge)
+        if let Some(handler) = self.cfg.get_exception_handler(start) {
+            return self.structure_try_catch(start, handler, stop_at);
         }
 
         self.processed.insert(start);
@@ -284,6 +393,122 @@ impl<'a> Structurer<'a> {
         }
     }
 
+    /// Structure a try/catch block
+    fn structure_try_catch(&mut self, try_start: NodeIndex, catch_handler: NodeIndex, stop_at: Option<NodeIndex>) -> Vec<Statement> {
+        self.processed.insert(try_start);
+
+        // Find the exception register from the Trap opcode
+        let try_block = &self.cfg.graph[try_start];
+        let catch_var = if let Some(Opcode::Trap { exc, .. }) = self.func.ops.get(try_block.start) {
+            self.reg_name(*exc).to_string()
+        } else {
+            "e".to_string()
+        };
+
+        // Structure try body - follow normal flow, not the exception handler
+        // Find the non-exception successor
+        let normal_succs: Vec<NodeIndex> = self.cfg.successors_with_edges(try_start)
+            .into_iter()
+            .filter(|(_, kind)| !matches!(kind, crate::lifter::EdgeKind::ExceptionHandler))
+            .map(|(n, _)| n)
+            .collect();
+
+        // Structure the try block itself (excluding Trap opcode which is control flow)
+        self.scope_depth += 1;
+        let mut try_stmts = self.structure_block_range(try_block.start + 1, try_block.end + 1);
+
+        // Continue structuring try body following normal flow
+        // Stop at the catch handler (we'll handle that separately)
+        for succ in normal_succs {
+            if succ != catch_handler && !self.processed.contains(&succ) {
+                try_stmts.extend(self.structure_try_body(succ, catch_handler));
+            }
+        }
+        self.scope_depth -= 1;
+
+        // Structure catch body
+        self.scope_depth += 1;
+        let catch_stmts = self.structure_catch_body(catch_handler, stop_at);
+        self.scope_depth -= 1;
+
+        // Create TryCatch statement
+        let try_catch = Statement::TryCatch {
+            try_stmts,
+            catch_var,
+            catch_stmts,
+        };
+
+        // Find where control flow continues after try/catch
+        // This is typically where EndTrap jumps to
+        let mut result = vec![try_catch];
+
+        // Continue after the catch handler if there's more code
+        // The catch handler's successor (if not already processed) continues the function
+        let catch_succs = self.cfg.successors(catch_handler);
+        for succ in catch_succs {
+            if !self.processed.contains(&succ) && Some(succ) != stop_at {
+                result.extend(self.structure_from(succ, stop_at));
+            }
+        }
+
+        result
+    }
+
+    /// Structure the try body, stopping when we hit EndTrap or the catch handler
+    fn structure_try_body(&mut self, start: NodeIndex, catch_handler: NodeIndex) -> Vec<Statement> {
+        if start == catch_handler || self.processed.contains(&start) {
+            return vec![];
+        }
+
+        self.processed.insert(start);
+        let block = &self.cfg.graph[start];
+
+        // Check if this block ends with EndTrap (end of try body)
+        let ends_with_endtrap = matches!(
+            self.func.ops.get(block.end),
+            Some(Opcode::EndTrap { .. })
+        );
+
+        let mut stmts = if ends_with_endtrap {
+            // Structure up to but not including EndTrap
+            self.structure_block_range(block.start, block.end)
+        } else {
+            self.structure_block(start)
+        };
+
+        // If we haven't hit EndTrap, continue following normal flow
+        if !ends_with_endtrap {
+            let succs = self.cfg.successors(start);
+            for succ in succs {
+                if succ != catch_handler {
+                    stmts.extend(self.structure_try_body(succ, catch_handler));
+                }
+            }
+        }
+
+        stmts
+    }
+
+    /// Structure the catch body
+    fn structure_catch_body(&mut self, handler: NodeIndex, stop_at: Option<NodeIndex>) -> Vec<Statement> {
+        if self.processed.contains(&handler) {
+            return vec![];
+        }
+
+        self.processed.insert(handler);
+        let mut stmts = self.structure_block(handler);
+
+        // Continue structuring catch body
+        let succs = self.cfg.successors(handler);
+        if succs.len() == 1 && !self.processed.contains(&succs[0]) && Some(succs[0]) != stop_at {
+            // Check if the successor might be the merge point (shared with try body)
+            // For now, just continue until we hit something already processed
+            stmts.extend(self.structure_from(succs[0], stop_at));
+        }
+
+        stmts
+    }
+
     /// Structure a loop
     fn structure_loop(&mut self, loop_info: &NaturalLoop, stop_at: Option<NodeIndex>) -> Vec<Statement> {
         let header = loop_info.header;
@@ -291,6 +516,13 @@ impl<'a> Structurer<'a> {
 
         // Extract condition and body start
         let (condition, body_start, exit_target) = self.extract_loop_condition(loop_info);
+
+        // Get header block statements (these compute the loop condition and need to be inside the loop)
+        // Process with incremented scope_depth since they'll be inside the while(true) body
+        let header_block = &self.cfg.graph[header];
+        self.scope_depth += 1;
+        let header_stmts = self.structure_block_range(header_block.start, header_block.end);
+        self.scope_depth -= 1;
 
         // Structure body (increment scope depth to avoid declaring vars inside loop)
         let body = if let Some(body_node) = body_start {
@@ -313,10 +545,33 @@ impl<'a> Structurer<'a> {
             vec![]
         };
 
-        let mut result = vec![Statement::While {
-            cond: condition,
-            stmts: body,
-        }];
+        // Build the loop structure
+        let loop_stmt = if header_stmts.is_empty() {
+            // No header statements - simple while(condition)
+            Statement::While {
+                cond: condition,
+                stmts: body,
+            }
+        } else {
+            // Header has statements that compute the condition
+            // Use while(true) { header_stmts; if (!cond) break; body; }
+            // The condition is the "continue condition" so we break when it's false
+            let break_cond = Expr::Op(Operation::Not(Box::new(condition)));
+            let break_stmt = Statement::IfElse {
+                cond: break_cond,
+                if_: vec![Statement::Break],
+                else_: vec![],
+            };
+            let mut loop_body = header_stmts;
+            loop_body.push(break_stmt);
+            loop_body.extend(body);
+            Statement::While {
+                cond: Expr::Constant(Constant::Bool(true)),
+                stmts: loop_body,
+            }
+        };
+
+        let mut result = vec![loop_stmt];
 
         // Continue after loop
         if let Some(exit) = exit_target {
@@ -326,6 +581,18 @@ impl<'a> Structurer<'a> {
         }
 
         result
+    }
+
+    /// Structure a range of opcodes into statements (for header blocks)
+    fn structure_block_range(&mut self, start: usize, end: usize) -> Vec<Statement> {
+        let mut stmts = Vec::new();
+        for op_idx in start..end {  // Exclude the final jump
+            self.current_op = op_idx;
+            if let Some(stmt) = self.opcode_to_statement(op_idx) {
+                stmts.push(stmt);
+            }
+        }
+        stmts
     }
 
     /// Extract loop condition
@@ -779,8 +1046,14 @@ impl<'a> Structurer<'a> {
                         if let Some(name) = extract_var_name(&variable) {
                             if !hoisted.contains(&name) {
                                 hoisted.insert(name.clone());
-                                // Create a declaration without initialization: "var x;"
-                                decls.push(Statement::VarDecl { name });
+                                // Check if assign is empty anonymous object - needs :Dynamic
+                                let type_hint = if matches!(&assign, Expr::Anonymous(_, fields) if fields.is_empty()) {
+                                    Some("Dynamic".into())
+                                } else {
+                                    None
+                                };
+                                // Create a declaration without initialization: "var x;" or "var x:Dynamic;"
+                                decls.push(Statement::VarDecl { name, type_hint });
                             }
                         }
                         // Convert to non-declaration assignment
@@ -1011,10 +1284,16 @@ impl<'a> Structurer<'a> {
         match op {
             Opcode::Label | Opcode::Nop => None,
             Opcode::JTrue { .. } | Opcode::JFalse { .. } | Opcode::JNull { .. }
-            | Opcode::JNotNull { .. } | Opcode::JAlways { .. } | Opcode::Ret { .. }
-            | Opcode::Throw { .. } => None,
+            | Opcode::JNotNull { .. } | Opcode::JAlways { .. } | Opcode::Ret { .. } => None,
+
+            // Throw should be emitted (e.g., in try body)
+            Opcode::Throw { exc } => Some(Statement::Throw(self.reg_to_expr(*exc))),
 
             Opcode::Mov { dst, src } => {
+                // Suppress self-assignments (b = b) that arise from default parameter handling
+                if dst == src {
+                    return None;
+                }
                 let var = self.reg_to_expr_dst(*dst);
                 let expr = self.reg_to_expr(*src);
                 Some(self.make_assign(var, expr))
@@ -1088,6 +1367,15 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::Field { dst, obj, field } => {
+                // Check if this is an interface cache field (empty name)
+                // These are internal HashLink fields - emit null to initialize the register
+                // (the real value will come from ToVirtual, but we need the register initialized
+                // for the subsequent JNotNull check)
+                if self.is_interface_cache_field(*obj, *field) {
+                    let var = self.reg_to_expr_dst(*dst);
+                    return Some(self.make_assign(var, Expr::Constant(Constant::Null)));
+                }
+
                 let field_name = self.get_field_name(*obj, *field);
 
                 // Check if this is a .bytes access on an array type
@@ -1222,6 +1510,12 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::SetField { obj, field, src } => {
+                // Check if this is an interface cache field (empty name)
+                // These are internal HashLink fields - suppress them
+                if self.is_interface_cache_field(*obj, *field) {
+                    return None;
+                }
+
                 let obj_expr = self.reg_to_expr(*obj);
                 let field_name = self.get_field_name(*obj, *field);
                 let target = Expr::Field(Box::new(obj_expr), field_name);
@@ -1482,7 +1776,12 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::Ref { dst, src } => {
-                // Reference - creates a pointer to a value
+                // Reference - creates a pointer to a value for internal use (output parameters)
+                // For nullable parameters (Null<Int>), the pattern is:
+                // 1. Int reg13 = 2
+                // 2. Ref reg10 = &reg13
+                // 3. Call(fun, reg10)
+                // We emit as a simple assignment so the value gets passed
                 let var = self.reg_to_expr_dst(*dst);
                 let expr = self.reg_to_expr(*src);
                 Some(self.make_assign(var, expr))
@@ -1490,8 +1789,17 @@ impl<'a> Structurer<'a> {
 
             Opcode::Unref { dst, src } => {
                 // Dereference - reads from a pointer
+                // For nullable default parameters, this is used to "unwrap" the value
+                // When the names match (e.g., b = *b), it's a no-op for the source code
                 let var = self.reg_to_expr_dst(*dst);
                 let expr = self.reg_to_expr(*src);
+                // Suppress if this would generate a self-assignment (same variable name)
+                if let (Expr::Ident(dst_name) | Expr::Variable(_, Some(dst_name)),
+                        Expr::Ident(src_name) | Expr::Variable(_, Some(src_name))) = (&var, &expr) {
+                    if dst_name == src_name {
+                        return None;
+                    }
+                }
                 Some(self.make_assign(var, expr))
             }
 
@@ -1523,31 +1831,109 @@ impl<'a> Structurer<'a> {
 
             Opcode::StaticClosure { dst, fun } => {
                 let var = self.reg_to_expr_dst(*dst);
-                // For closures, use a placeholder function reference
-                // The actual function body would need separate decompilation
-                // For now, emit as a function reference comment
-                let fun_name = self.get_function_name(*fun)
-                    .unwrap_or_else(|| format!("fun_{}", fun.0).into());
-                // Check if the function name looks like a compiler-generated name
-                // (single type name like "String", "Int", etc.) and use a better name
-                let expr = if fun_name == "String" || fun_name == "Int" || fun_name == "Float"
-                    || fun_name == "Bool" || fun_name == "Void" || fun_name.starts_with("$") {
-                    // Use the variable name from the destination as the closure name
-                    // or generate a closure identifier
-                    Expr::Ident(format!("/* closure@{} */", fun.0).into())
-                } else {
-                    Expr::Ident(fun_name)
-                };
+
+                // StaticClosure has no captured variables, just inline the function body
+                if let Some(inner_func) = fun.as_fn(self.code) {
+                    // Decompile the inner function (no closure analysis needed since no captures)
+                    let inner_stmts = crate::decompile_code_with_closures(
+                        self.code,
+                        inner_func,
+                        self.closure_analysis,
+                    );
+                    let expr = Expr::Closure(*fun, inner_stmts);
+                    return Some(self.make_assign(var, expr));
+                }
+
+                // Fallback: placeholder body if function not found
+                let comment = Statement::Comment(format!("// TODO: inline closure body from fun@{}", fun.0));
+                let expr = Expr::Closure(*fun, vec![comment]);
                 Some(self.make_assign(var, expr))
             }
 
             Opcode::InstanceClosure { dst, fun, obj } => {
                 let var = self.reg_to_expr_dst(*dst);
+
+                // Check if this is a detected closure that we should inline
+                if let Some(_capture_info) = self.get_closure_at_current_op() {
+                    // This is a closure with captured variables
+                    // Get the inner function and decompile it
+                    if let Some(inner_func) = fun.as_fn(self.code) {
+                        // Decompile the inner function with closure context
+                        let inner_stmts = crate::decompile_code_with_closures(
+                            self.code,
+                            inner_func,
+                            self.closure_analysis,
+                        );
+
+                        // Create a lambda expression with the decompiled body
+                        let expr = Expr::Closure(*fun, inner_stmts);
+                        return Some(self.make_assign(var, expr));
+                    }
+                }
+
+                // Fallback: Method reference syntax (obj.methodName)
                 let obj_expr = self.reg_to_expr(*obj);
                 // Method reference: obj.methodName
                 let method_name = self.get_function_name(*fun)
                     .unwrap_or_else(|| format!("method_{}", fun.0).into());
                 let expr = Expr::Field(Box::new(obj_expr), method_name);
+                Some(self.make_assign(var, expr))
+            }
+
+            // Enum opcodes for closure support
+            Opcode::EnumAlloc { dst, construct } => {
+                // Suppress closure context allocations
+                if self.is_closure_context_reg(*dst) {
+                    None // Don't emit - this is part of closure machinery
+                } else {
+                    let var = self.reg_to_expr_dst(*dst);
+                    let type_ref = self.get_type_ref(*dst);
+                    // Create new enum variant instance
+                    let expr = Expr::EnumConstr(type_ref, *construct, vec![]);
+                    Some(self.make_assign(var, expr))
+                }
+            }
+
+            Opcode::SetEnumField { value, field, src } => {
+                // Suppress closure context field writes
+                if self.is_closure_context_reg(*value) {
+                    None // Don't emit - captured variable is stored in closure machinery
+                } else {
+                    let obj_expr = self.reg_to_expr(*value);
+                    let field_name = format!("field_{}", field.0);
+                    let target = Expr::Field(Box::new(obj_expr), field_name.into());
+                    let expr = self.reg_to_expr(*src);
+                    Some(self.make_assign(target, expr))
+                }
+            }
+
+            Opcode::EnumField { dst, value, construct, field } => {
+                // Check if we're in a closure reading from the capture context (reg 0)
+                if self.is_current_function_closure() && *value == Reg(0) {
+                    // Try to get the captured variable name
+                    if let Some(captured_name) = self.get_captured_var_name(*field) {
+                        // Emit assignment using the captured variable name directly
+                        let var = self.reg_to_expr_dst(*dst);
+                        let expr = Expr::Ident(captured_name);
+                        return Some(self.make_assign(var, expr));
+                    }
+                }
+                // Normal enum field access
+                let var = self.reg_to_expr_dst(*dst);
+                let obj_expr = self.reg_to_expr(*value);
+                let field_name = format!("field_{}", field.0);
+                let expr = Expr::Field(Box::new(obj_expr), field_name.into());
+                // Could add cast annotation: (obj as ConstructName).field
+                let _ = construct; // suppress unused warning for now
+                Some(self.make_assign(var, expr))
+            }
+
+            Opcode::VirtualClosure { dst, obj, field } => {
+                let var = self.reg_to_expr_dst(*dst);
+                let obj_expr = self.reg_to_expr(*obj);
+                let field_expr = self.reg_to_expr(*field);
+                // Dynamic method lookup: obj[field] or obj.getMethod(field)
+                let expr = Expr::Array(Box::new(obj_expr), Box::new(field_expr));
                 Some(self.make_assign(var, expr))
             }
 
@@ -1620,6 +2006,31 @@ impl<'a> Structurer<'a> {
         } else {
             Expr::Ident(self.get_global_name(global))
         }
+    }
+
+    /// Get the name of an enum construct variant.
+    /// Uses the destination register's type to find the parent enum.
+    fn get_enum_construct_name(&self, dst: Reg, construct: hlbc::types::RefEnumConstruct) -> Str {
+        let reg_idx = dst.0 as usize;
+        if reg_idx < self.func.regs.len() {
+            let type_ref = self.func.regs[reg_idx];
+            if let Some(ty) = self.code.types.get(type_ref.0) {
+                if let hlbc::types::Type::Enum { name, constructs, .. } = ty {
+                    // Get the enum type name
+                    let enum_name = self.code.strings.get(name.0)
+                        .cloned()
+                        .unwrap_or_else(|| "Enum".into());
+                    // Get the specific construct name if valid
+                    if let Some(c) = constructs.get(construct.0) {
+                        if let Some(cname) = self.code.strings.get(c.name.0) {
+                            return format!("{}.{}", enum_name, cname).into();
+                        }
+                    }
+                    return enum_name;
+                }
+            }
+        }
+        format!("EnumConstruct_{}", construct.0).into()
     }
 
     fn get_type_ref(&self, reg: Reg) -> RefType {
@@ -1787,6 +2198,27 @@ impl<'a> Structurer<'a> {
                         return Some(name.to_string());
                     }
                 }
+
+                // For closure inner functions (first param is enum context),
+                // generate synthetic names that match fmt.rs output.
+                // fmt.rs uses arg{counter} where counter increments for each param without debug name.
+                // Since closures typically have no debug names, this is arg0, arg1, etc.
+                if self.is_current_function_closure() {
+                    // Count how many params before this one have no debug name
+                    let mut counter = 0;
+                    for i in 0..=reg_idx {
+                        if self.func.arg_name(self.code, i).is_none() {
+                            if i == reg_idx {
+                                return Some(format!("arg{}", counter));
+                            }
+                            counter += 1;
+                        } else if i == reg_idx {
+                            // This param has a debug name but we didn't return it above
+                            // (probably invalid identifier), fall through
+                            break;
+                        }
+                    }
+                }
             }
         }
 
@@ -1842,6 +2274,12 @@ impl<'a> Structurer<'a> {
                     }
                 }
             }
+            // Don't use a name that would shadow a parameter
+            if let Some(ref name) = best_name {
+                if self.name_conflicts_with_param(name) {
+                    return None;
+                }
+            }
             return best_name;
         }
         None
@@ -1865,17 +2303,64 @@ impl<'a> Structurer<'a> {
         name.chars().all(|c| c.is_alphanumeric() || c == '_')
     }
 
+    /// Check if a name conflicts with a function parameter name.
+    /// Returns true if the name would shadow a parameter.
+    fn name_conflicts_with_param(&self, name: &str) -> bool {
+        if let Some(Type::Fun(fun_type) | Type::Method(fun_type)) = self.code.types.get(self.func.t.0) {
+            let num_args = fun_type.args.len();
+            for i in 0..num_args {
+                if let Some(param_name) = self.func.arg_name(self.code, i) {
+                    if param_name == name {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Check if a field is an interface implementation cache field (has empty name).
+    /// These are internal HashLink fields used to cache interface vtable lookups.
+    fn is_interface_cache_field(&self, obj_reg: Reg, field: hlbc::types::RefField) -> bool {
+        let reg_idx = obj_reg.0 as usize;
+        if reg_idx < self.func.regs.len() {
+            let type_ref = self.func.regs[reg_idx];
+            if let Some(ty) = self.code.types.get(type_ref.0) {
+                let fields: Option<&[hlbc::types::ObjField]> = match ty {
+                    hlbc::types::Type::Obj(obj) => Some(&obj.fields),
+                    _ => None,
+                };
+                if let Some(fields) = fields {
+                    if let Some(f) = fields.get(field.0) {
+                        if let Some(name) = self.code.strings.get(f.name.0) {
+                            return name.is_empty();
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
     fn get_field_name(&self, obj_reg: Reg, field: hlbc::types::RefField) -> Str {
         // Try to look up field name from type
         let reg_idx = obj_reg.0 as usize;
         if reg_idx < self.func.regs.len() {
             let type_ref = self.func.regs[reg_idx];
-            if let Some(hlbc::types::Type::Obj(obj)) = self.code.types.get(type_ref.0) {
-                if let Some(f) = obj.fields.get(field.0) {
-                    if let Some(name) = self.code.strings.get(f.name.0) {
-                        // Empty names are interface implementation cache fields
-                        if !name.is_empty() {
-                            return name.clone();
+            if let Some(ty) = self.code.types.get(type_ref.0) {
+                // Get fields from either Obj or Virtual types
+                let fields: Option<&[hlbc::types::ObjField]> = match ty {
+                    hlbc::types::Type::Obj(obj) => Some(&obj.fields),
+                    hlbc::types::Type::Virtual { fields } => Some(fields),
+                    _ => None,
+                };
+                if let Some(fields) = fields {
+                    if let Some(f) = fields.get(field.0) {
+                        if let Some(name) = self.code.strings.get(f.name.0) {
+                            // Empty names are interface implementation cache fields
+                            if !name.is_empty() {
+                                return name.clone();
+                            }
                         }
                     }
                 }
@@ -1891,14 +2376,29 @@ impl<'a> Structurer<'a> {
         let reg_idx = obj_reg.0 as usize;
         if reg_idx < self.func.regs.len() {
             let type_ref = self.func.regs[reg_idx];
-            if let Some(hlbc::types::Type::Obj(obj)) = self.code.types.get(type_ref.0) {
-                // Search protos for one with matching pindex
-                for proto in &obj.protos {
-                    if proto.pindex == pindex.0 as i32 {
-                        if let Some(name) = self.code.strings.get(proto.name.0) {
-                            return name.clone();
+            if let Some(ty) = self.code.types.get(type_ref.0) {
+                match ty {
+                    hlbc::types::Type::Obj(obj) => {
+                        // Search protos for one with matching pindex
+                        for proto in &obj.protos {
+                            if proto.pindex == pindex.0 as i32 {
+                                if let Some(name) = self.code.strings.get(proto.name.0) {
+                                    return name.clone();
+                                }
+                            }
                         }
                     }
+                    hlbc::types::Type::Virtual { fields } => {
+                        // For Virtual types, pindex is a direct index into fields
+                        if let Some(f) = fields.get(pindex.0) {
+                            if let Some(name) = self.code.strings.get(f.name.0) {
+                                if !name.is_empty() {
+                                    return name.clone();
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }

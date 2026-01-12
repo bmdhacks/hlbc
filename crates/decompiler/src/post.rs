@@ -591,7 +591,7 @@ impl AstVisitor for SwitchExpressions {
 
             // Add declarations for hoisted variables (no initializer)
             for (name, _reg) in vars {
-                stmts.push(Statement::VarDecl { name: name.into() });
+                stmts.push(Statement::VarDecl { name: name.into(), type_hint: None });
             }
 
             stmts.push(switch_stmt);

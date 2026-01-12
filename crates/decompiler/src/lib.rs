@@ -32,6 +32,11 @@ pub mod type_prop;
 pub mod structurer;
 /// AST post-processing
 mod post;
+/// Closure pattern detection and analysis
+pub mod closure_analysis;
+
+// Re-export ClosureAnalysis for convenience
+pub use closure_analysis::ClosureAnalysis;
 
 /// Map from (static_type_global, field_index) -> initialization Expr
 /// Used to track static field initializers extracted from the entrypoint function.
@@ -136,6 +141,20 @@ fn global_to_expr(code: &Bytecode, global: RefGlobal) -> Option<Expr> {
 ///
 /// Pipeline: Bytecode → Lifter → CFG → Analyzer → SSA Builder → Type Prop → Structurer → AST
 pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
+    decompile_code_with_closures(code, f, None)
+}
+
+/// Decompile a function with closure analysis context.
+///
+/// When `closure_analysis` is provided, the decompiler can:
+/// - Detect closure-creating functions and suppress internal enum machinery
+/// - Identify captured variables and remap them to original names in inner functions
+/// - Inline closure bodies at InstanceClosure sites
+pub fn decompile_code_with_closures(
+    code: &Bytecode,
+    f: &Function,
+    closure_analysis: Option<&ClosureAnalysis>,
+) -> Vec<Statement> {
     use crate::lifter::Cfg;
     use crate::analyzer::CfgAnalysis;
     use crate::ssa::SsaCfg;
@@ -155,8 +174,10 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
     let propagator = TypePropagator::new(code, f, &cfg, &ssa);
     let type_info = propagator.propagate();
 
-    // Pass 5: Structure into AST
-    let mut structurer = Structurer::new(code, f, &cfg, &analysis, &ssa, &type_info);
+    // Pass 5: Structure into AST (with optional closure context)
+    let mut structurer = Structurer::new_with_closures(
+        code, f, &cfg, &analysis, &ssa, &type_info, closure_analysis
+    );
     structurer.structure()
 }
 
@@ -171,9 +192,34 @@ pub fn decompile_function(code: &Bytecode, f: &Function) -> Method {
     }
 }
 
+/// Decompile a function with closure analysis, returning a Method.
+pub fn decompile_function_with_closures(
+    code: &Bytecode,
+    f: &Function,
+    closure_analysis: Option<&ClosureAnalysis>,
+) -> Method {
+    Method {
+        fun: f.findex,
+        static_: true,
+        dynamic: false,
+        override_: false,
+        statements: decompile_code_with_closures(code, f, closure_analysis),
+    }
+}
+
 
 /// Decompile a class with its static and instance fields and methods.
 pub fn decompile_class(code: &Bytecode, obj: &TypeObj, static_inits: &StaticInitMap) -> Class {
+    decompile_class_with_closures(code, obj, static_inits, None)
+}
+
+/// Decompile a class with closure analysis context.
+pub fn decompile_class_with_closures(
+    code: &Bytecode,
+    obj: &TypeObj,
+    static_inits: &StaticInitMap,
+    closure_analysis: Option<&ClosureAnalysis>,
+) -> Class {
     let static_type = obj.get_static_type(code);
 
     let mut fields = Vec::new();
@@ -259,7 +305,7 @@ pub fn decompile_class(code: &Bytecode, obj: &TypeObj, static_inits: &StaticInit
                 static_: false,
                 dynamic: true,
                 override_: false, // Bindings don't override
-                statements: decompile_code(code, func),
+                statements: decompile_code_with_closures(code, func, closure_analysis),
             })
         }
     }
@@ -272,7 +318,7 @@ pub fn decompile_class(code: &Bytecode, obj: &TypeObj, static_inits: &StaticInit
                     static_: true,
                     dynamic: false,
                     override_: false, // Static methods don't override
-                    statements: decompile_code(code, func),
+                    statements: decompile_code_with_closures(code, func, closure_analysis),
                 })
             }
         }
@@ -285,7 +331,7 @@ pub fn decompile_class(code: &Bytecode, obj: &TypeObj, static_inits: &StaticInit
                 static_: false,
                 dynamic: false,
                 override_: is_override(proto),
-                statements: decompile_code(code, func),
+                statements: decompile_code_with_closures(code, func, closure_analysis),
             })
         }
     }

@@ -14,7 +14,8 @@ use hlbc::types::Type;
 use hlbc::{Bytecode, Resolve};
 
 use crate::fmt::FormatOptions;
-use crate::{decompile_class, decompile_function, extract_static_initializers, StaticInitMap};
+use crate::closure_analysis::ClosureAnalysis;
+use crate::{decompile_class_with_closures, decompile_function_with_closures, extract_static_initializers, StaticInitMap};
 
 /// Index file containing mappings from names to bytecode indices.
 #[cfg(feature = "batch")]
@@ -96,6 +97,7 @@ pub struct BatchDecompiler<'a> {
     opts: FormatOptions,
     batch_opts: BatchOptions,
     static_inits: StaticInitMap,
+    closure_analysis: ClosureAnalysis,
 }
 
 impl<'a> BatchDecompiler<'a> {
@@ -106,6 +108,7 @@ impl<'a> BatchDecompiler<'a> {
             opts: FormatOptions::with_fun_indices(2),
             batch_opts: BatchOptions::default(),
             static_inits: extract_static_initializers(code),
+            closure_analysis: ClosureAnalysis::analyze(code),
         }
     }
 
@@ -116,6 +119,7 @@ impl<'a> BatchDecompiler<'a> {
             opts: FormatOptions::with_fun_indices(2),
             batch_opts,
             static_inits: extract_static_initializers(code),
+            closure_analysis: ClosureAnalysis::analyze(code),
         }
     }
 
@@ -149,8 +153,9 @@ impl<'a> BatchDecompiler<'a> {
 
                 // Decompile and write (with panic recovery)
                 let static_inits = &self.static_inits;
+                let closure_analysis = &self.closure_analysis;
                 let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                    let class = decompile_class(self.code, obj, static_inits);
+                    let class = decompile_class_with_closures(self.code, obj, static_inits, Some(closure_analysis));
                     let display = class.display_with_index(self.code, &self.opts, Some(type_idx));
                     let s = display.to_string();
                     s
@@ -235,8 +240,9 @@ impl<'a> BatchDecompiler<'a> {
                 continue;
             }
 
+            let closure_analysis = &self.closure_analysis;
             let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                let method = decompile_function(self.code, fun);
+                let method = decompile_function_with_closures(self.code, fun, Some(closure_analysis));
                 let display = method.display(self.code, &self.opts);
                 let s = display.to_string();
                 s

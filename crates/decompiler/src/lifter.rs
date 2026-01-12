@@ -8,6 +8,7 @@
 //! computation and graph traversal in subsequent passes.
 
 use petgraph::graph::{DiGraph, NodeIndex};
+use petgraph::visit::EdgeRef;
 use std::collections::{HashMap, HashSet};
 
 use hlbc::opcodes::Opcode;
@@ -133,6 +134,24 @@ impl Cfg {
         self.graph
             .neighbors_directed(node, petgraph::Direction::Incoming)
             .collect()
+    }
+
+    /// Get all successors with their edge kinds
+    pub fn successors_with_edges(&self, node: NodeIndex) -> Vec<(NodeIndex, EdgeKind)> {
+        self.graph
+            .edges(node)
+            .map(|e| (e.target(), *e.weight()))
+            .collect()
+    }
+
+    /// Get the exception handler target for a block (if any)
+    pub fn get_exception_handler(&self, node: NodeIndex) -> Option<NodeIndex> {
+        for edge in self.graph.edges(node) {
+            if matches!(edge.weight(), EdgeKind::ExceptionHandler) {
+                return Some(edge.target());
+            }
+        }
+        None
     }
 
     /// Number of basic blocks
@@ -345,6 +364,22 @@ fn create_blocks(
                 if fall_through < ops.len() {
                     if let Some(&target_node) = block_map.get(&fall_through) {
                         graph.add_edge(node, target_node, EdgeKind::FallThrough);
+                    }
+                }
+            }
+        }
+
+        // Special handling for Trap opcodes - they can appear anywhere in a block
+        // (not just at the end), so we need to scan the entire block
+        let block_start = leader;
+        for op_idx in block_start..=block_end {
+            if let Opcode::Trap { offset, .. } = &ops[op_idx] {
+                if let Some(target) = compute_target(op_idx, *offset, ops.len()) {
+                    if let Some(&target_node) = block_map.get(&target) {
+                        // Only add if not already present
+                        if !graph.edges(node).any(|e| e.target() == target_node && matches!(e.weight(), EdgeKind::ExceptionHandler)) {
+                            graph.add_edge(node, target_node, EdgeKind::ExceptionHandler);
+                        }
                     }
                 }
             }

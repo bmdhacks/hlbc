@@ -12,7 +12,7 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HLBC_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 HAXE="/home/bmd/haxe_heaps_gles/haxe/haxe"
-HLBC="$HLBC_ROOT/target/release/hlbc"
+HLBC="$HLBC_ROOT/target/debug/hlbc"
 HL="/home/bmd/haxe_heaps_gles/hashlink/build/bin/hl"
 
 # Directories
@@ -40,7 +40,7 @@ check_deps() {
     fi
     if [ ! -x "$HLBC" ]; then
         echo -e "${RED}ERROR: HLBC not found at $HLBC${NC}"
-        echo "Run: cargo build -p hlbc-cli --release"
+        echo "Run: cargo build -p hlbc-cli"
         missing=1
     fi
     if [ ! -x "$HL" ]; then

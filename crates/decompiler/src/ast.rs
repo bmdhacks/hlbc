@@ -380,9 +380,11 @@ pub enum Statement {
     Sequence {
         stmts: Vec<Statement>,
     },
-    /// Variable declaration without initialization (e.g., `var x;`)
+    /// Variable declaration without initialization (e.g., `var x;` or `var x:Dynamic;`)
     VarDecl {
         name: Str,
+        /// Optional type hint (e.g., "Dynamic" for vars that will hold anonymous objects)
+        type_hint: Option<Str>,
     },
 }
 

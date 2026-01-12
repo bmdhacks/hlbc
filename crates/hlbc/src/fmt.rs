@@ -365,7 +365,9 @@ impl BytecodeFmt for EnhancedFmt {
         match parent {
             Type::Enum { constructs, .. } => {
                 let name = constructs[v.0].name;
-                if name.0 != 0 {
+                // Check if the string is non-empty, not just if the index is non-zero
+                // (index 0 can be a valid string like "String")
+                if ctx.strings.get(name.0).map(|s| !s.is_empty()).unwrap_or(false) {
                     self.fmt_refstring(f, ctx, name)
                 } else {
                     Display::fmt(&v, f)
