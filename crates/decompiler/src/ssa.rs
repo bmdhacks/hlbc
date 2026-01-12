@@ -477,6 +477,36 @@ impl SsaCfg {
         info
     }
 
+    /// Get the SsaInstr for a given opcode index.
+    /// Returns the destination and uses for that operation.
+    pub fn get_instr_for_op(&self, op_idx: usize) -> Option<(Option<SsaVar>, &Vec<SsaVar>)> {
+        for block in self.blocks.values() {
+            for op in &block.ops {
+                if let SsaInstr::Op { op_idx: idx, dst, uses } = op {
+                    if *idx == op_idx {
+                        return Some((*dst, uses));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Find the defining opcode index for an SSA variable.
+    /// Returns the op_idx where this variable was defined, or None if it's a φ or undefined.
+    pub fn find_def(&self, var: SsaVar) -> Option<usize> {
+        for block in self.blocks.values() {
+            for op in &block.ops {
+                if let SsaInstr::Op { op_idx, dst: Some(dst), .. } = op {
+                    if *dst == var {
+                        return Some(*op_idx);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Debug: print SSA form
     #[allow(dead_code)]
     pub fn dump(&self, f: &Function, cfg: &Cfg) {

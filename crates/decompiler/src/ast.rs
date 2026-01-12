@@ -203,6 +203,8 @@ pub enum Expr {
     Variable(Reg, Option<Str>),
     /// Simple identifier (super, this, etc.)
     Ident(Str),
+    /// Type cast: cast(expr, Type)
+    Cast(Box<Expr>, Str),
 }
 
 pub const fn cst_int(cst: RefInt) -> Expr {

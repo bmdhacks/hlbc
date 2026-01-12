@@ -225,6 +225,9 @@ pub(crate) fn visit_expr(code: &Bytecode, expr: &mut Expr, visitors: &mut [Box<d
         Expr::Unknown(_) => {}
         Expr::Variable(_, _) => {}
         Expr::Ident(_) => {}
+        Expr::Cast(inner, _) => {
+            rec!(inner);
+        }
     }
     for visitor in visitors.iter_mut() {
         visitor.visit_expr(code, expr);

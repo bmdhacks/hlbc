@@ -38,8 +38,6 @@ pub struct Structurer<'a> {
     var_names: HashMap<SsaVar, Str>,
     /// Counter for generating variable names
     var_counter: u32,
-    /// Known constant values for registers (for constant propagation)
-    constants: HashMap<Reg, Constant>,
     /// Use-def info for inlining decisions (ILSpy-style)
     use_info: HashMap<SsaVar, UseDefInfo>,
     /// Expressions to inline (single-use variables)
@@ -51,6 +49,16 @@ pub struct Structurer<'a> {
     /// Method info: maps function references to (owner_type, method_name)
     /// Used to convert f(obj, args) to obj.f(args) syntax
     method_info: HashMap<RefFun, (RefType, Str)>,
+    /// Current scope depth (0 = function level, >0 = inside loop/if/switch)
+    scope_depth: u32,
+    /// Variables that need hoisting to function scope (declared inside nested scope)
+    hoisted_vars: HashSet<Str>,
+    /// Array bytes tracking: maps bytes register -> array register
+    /// Used to reconstruct arr[i] from bytes[shifted_i] pattern
+    array_bytes_source: HashMap<Reg, Reg>,
+    /// Shifted index tracking: maps shifted reg -> (original index reg, shift amount)
+    /// Used to reverse index * 4 back to original index for array access
+    shifted_indices: HashMap<Reg, (Reg, i32)>,
 }
 
 impl<'a> Structurer<'a> {
@@ -78,12 +86,15 @@ impl<'a> Structurer<'a> {
             processed: HashSet::new(),
             var_names: HashMap::new(),
             var_counter: 0,
-            constants: HashMap::new(),
             use_info,
             inline_exprs: HashMap::new(),
             declared_vars: HashSet::new(),
             current_op: 0,
             method_info,
+            scope_depth: 0,
+            hoisted_vars: HashSet::new(),
+            array_bytes_source: HashMap::new(),
+            shifted_indices: HashMap::new(),
         }
     }
 
@@ -109,23 +120,30 @@ impl<'a> Structurer<'a> {
     /// Create an assignment statement, tracking declaration status.
     /// Returns a Statement::Assign with declaration=true if this is the first
     /// assignment to this variable name.
+    ///
+    /// IMPORTANT: Variables are only declared (with `var`) at scope depth 0 to avoid
+    /// scoping issues where a variable declared inside a loop is not visible outside.
     fn make_assign(&mut self, variable: Expr, assign: Expr) -> Statement {
         // Extract variable name to check if it's been declared
         // ONLY simple variables can have declarations (var x = ...)
         // Field access, array index, etc. are NEVER declarations
+        //
+        // Haxe has block-level scoping. Variables declared inside a loop/if are
+        // NOT visible outside. So if we're inside a scope (scope_depth > 0),
+        // we don't emit `var` inline - instead we track it for hoisting to
+        // function level.
         let is_declaration = match &variable {
-            Expr::Variable(_, Some(name)) => {
+            Expr::Variable(_, Some(name)) | Expr::Ident(name) => {
                 if self.declared_vars.contains(name) {
+                    // Already declared
                     false
-                } else {
+                } else if self.scope_depth > 0 {
+                    // Inside a scope - don't declare inline, hoist instead
+                    self.hoisted_vars.insert(name.clone());
                     self.declared_vars.insert(name.clone());
-                    true
-                }
-            }
-            Expr::Ident(name) => {
-                if self.declared_vars.contains(name) {
                     false
                 } else {
+                    // At function level - declare normally
                     self.declared_vars.insert(name.clone());
                     true
                 }
@@ -152,19 +170,24 @@ impl<'a> Structurer<'a> {
         if self.is_void_type(dst) {
             Statement::ExprStatement(Expr::Call(Box::new(call)))
         } else {
-            let var = self.reg_to_expr(dst);
+            let var = self.reg_to_expr_dst(dst);
             self.make_assign(var, Expr::Call(Box::new(call)))
         }
     }
 
     /// Structure the entire function into statements
     pub fn structure(&mut self) -> Vec<Statement> {
-        // Pre-scan all blocks for constant assignments
-        self.scan_all_constants();
-
         let stmts = self.structure_from(self.cfg.entry, None);
+
+        // Prepend hoisted variable declarations (for vars first assigned inside scopes)
+        let mut result = Vec::new();
+        for name in &self.hoisted_vars {
+            result.push(Statement::VarDecl { name: name.clone() });
+        }
+        result.extend(stmts);
+
         // Post-process to simplify
-        simplify_statements(stmts)
+        simplify_statements(result)
     }
 
     /// Check if an SSA variable can be inlined.
@@ -226,99 +249,6 @@ impl<'a> Structurer<'a> {
         None
     }
 
-    /// Scan all blocks for constant assignments to build the constants map.
-    /// Only keeps constants for registers assigned exactly once with a constant value.
-    fn scan_all_constants(&mut self) {
-        // First pass: count assignments per register and track constant values
-        let mut assign_counts: HashMap<Reg, usize> = HashMap::new();
-        let mut constant_values: HashMap<Reg, Constant> = HashMap::new();
-
-        for node in self.cfg.graph.node_indices() {
-            let block = &self.cfg.graph[node];
-            for op_idx in block.start..=block.end {
-                match &self.func.ops[op_idx] {
-                    Opcode::Int { dst, ptr } => {
-                        *assign_counts.entry(*dst).or_insert(0) += 1;
-                        constant_values.insert(*dst, Constant::Int(*ptr));
-                    }
-                    Opcode::Float { dst, ptr } => {
-                        *assign_counts.entry(*dst).or_insert(0) += 1;
-                        constant_values.insert(*dst, Constant::Float(*ptr));
-                    }
-                    Opcode::Bool { dst, value } => {
-                        *assign_counts.entry(*dst).or_insert(0) += 1;
-                        constant_values.insert(*dst, Constant::Bool(*value));
-                    }
-                    Opcode::String { dst, ptr } => {
-                        *assign_counts.entry(*dst).or_insert(0) += 1;
-                        constant_values.insert(*dst, Constant::String(*ptr));
-                    }
-                    Opcode::Null { dst } => {
-                        *assign_counts.entry(*dst).or_insert(0) += 1;
-                        constant_values.insert(*dst, Constant::Null);
-                    }
-                    // Any non-constant assignment invalidates the register
-                    Opcode::Incr { dst } | Opcode::Decr { dst } => {
-                        *assign_counts.entry(*dst).or_insert(0) += 1;
-                        constant_values.remove(dst);
-                    }
-                    Opcode::Mov { dst, .. } |
-                    Opcode::Add { dst, .. } |
-                    Opcode::Sub { dst, .. } |
-                    Opcode::Mul { dst, .. } |
-                    Opcode::Field { dst, .. } |
-                    Opcode::Call0 { dst, .. } |
-                    Opcode::Call1 { dst, .. } |
-                    Opcode::Call2 { dst, .. } |
-                    Opcode::Call3 { dst, .. } |
-                    Opcode::Call4 { dst, .. } |
-                    Opcode::CallN { dst, .. } |
-                    Opcode::CallMethod { dst, .. } |
-                    Opcode::CallThis { dst, .. } |
-                    Opcode::CallClosure { dst, .. } |
-                    Opcode::GetGlobal { dst, .. } |
-                    Opcode::New { dst, .. } |
-                    Opcode::GetArray { dst, .. } |
-                    Opcode::GetThis { dst, .. } |
-                    Opcode::SDiv { dst, .. } |
-                    Opcode::UDiv { dst, .. } |
-                    Opcode::SMod { dst, .. } |
-                    Opcode::UMod { dst, .. } |
-                    Opcode::And { dst, .. } |
-                    Opcode::Or { dst, .. } |
-                    Opcode::Xor { dst, .. } |
-                    Opcode::Shl { dst, .. } |
-                    Opcode::SShr { dst, .. } |
-                    Opcode::UShr { dst, .. } |
-                    Opcode::Neg { dst, .. } |
-                    Opcode::Not { dst, .. } |
-                    Opcode::ToVirtual { dst, .. } |
-                    Opcode::ToSFloat { dst, .. } |
-                    Opcode::ToUFloat { dst, .. } |
-                    Opcode::ToInt { dst, .. } |
-                    Opcode::ToDyn { dst, .. } |
-                    Opcode::SafeCast { dst, .. } |
-                    Opcode::UnsafeCast { dst, .. } |
-                    Opcode::Ref { dst, .. } |
-                    Opcode::Unref { dst, .. } |
-                    Opcode::Type { dst, .. } |
-                    Opcode::DynGet { dst, .. } => {
-                        *assign_counts.entry(*dst).or_insert(0) += 1;
-                        constant_values.remove(dst);
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // Second pass: only keep constants for registers assigned exactly once
-        for (reg, constant) in constant_values {
-            if assign_counts.get(&reg) == Some(&1) {
-                self.constants.insert(reg, constant);
-            }
-        }
-    }
-
     /// Structure code starting from a given block
     fn structure_from(&mut self, start: NodeIndex, stop_at: Option<NodeIndex>) -> Vec<Statement> {
         if Some(start) == stop_at || self.processed.contains(&start) {
@@ -362,7 +292,7 @@ impl<'a> Structurer<'a> {
         // Extract condition and body start
         let (condition, body_start, exit_target) = self.extract_loop_condition(loop_info);
 
-        // Structure body
+        // Structure body (increment scope depth to avoid declaring vars inside loop)
         let body = if let Some(body_node) = body_start {
             // Temporarily allow processing body nodes
             let old_processed = self.processed.clone();
@@ -371,7 +301,9 @@ impl<'a> Structurer<'a> {
                     self.processed.remove(&node);
                 }
             }
+            self.scope_depth += 1;
             let body_stmts = self.structure_from(body_node, Some(header));
+            self.scope_depth -= 1;
             self.processed = old_processed;
             for &node in &loop_info.body {
                 self.processed.insert(node);
@@ -552,7 +484,8 @@ impl<'a> Structurer<'a> {
         // Find merge point
         let merge = self.find_merge_point(then_target, else_target);
 
-        // Structure branches
+        // Structure branches (increment scope depth for block scoping)
+        self.scope_depth += 1;
         let mut then_stmts = if let Some(t) = then_target {
             if Some(t) != merge && !self.processed.contains(&t) {
                 self.structure_from(t, merge)
@@ -572,6 +505,7 @@ impl<'a> Structurer<'a> {
         } else {
             vec![]
         };
+        self.scope_depth -= 1;
 
         // φ-elimination: insert assignments at branch ends for merge point φ-functions
         if let Some(merge_node) = merge {
@@ -686,22 +620,32 @@ impl<'a> Structurer<'a> {
         if let Some(ssa_block) = self.ssa.blocks.get(&merge) {
             for phi in &ssa_block.phis {
                 if let SsaInstr::Phi { dst, sources } = phi {
-                    let dst_name = self.get_var_name(*dst);
+                    // Use register name for phi destination (consistent with how we name vars)
+                    let dst_name = self.reg_name(dst.reg);
                     let dst_expr = Expr::Variable(dst.reg, Some(dst_name.clone()));
 
                     // Find source for then branch
                     if let Some(then_node) = then_pred {
                         if let Some((_, src_var)) = sources.iter().find(|(pred, _)| *pred == then_node) {
-                            let src_expr = Expr::Variable(src_var.reg, Some(self.get_var_name(*src_var)));
-                            then_assigns.push(self.make_assign(dst_expr.clone(), src_expr));
+                            // Skip if source is same register as destination (self-assignment)
+                            // This happens because phi merges different versions of same register
+                            if src_var.reg != dst.reg {
+                                let src_name = self.reg_name(src_var.reg);
+                                let src_expr = Expr::Variable(src_var.reg, Some(src_name));
+                                then_assigns.push(self.make_assign(dst_expr.clone(), src_expr));
+                            }
                         }
                     }
 
                     // Find source for else branch
                     if let Some(else_node) = else_pred {
                         if let Some((_, src_var)) = sources.iter().find(|(pred, _)| *pred == else_node) {
-                            let src_expr = Expr::Variable(src_var.reg, Some(self.get_var_name(*src_var)));
-                            else_assigns.push(self.make_assign(dst_expr, src_expr));
+                            // Skip if source is same register as destination
+                            if src_var.reg != dst.reg {
+                                let src_name = self.reg_name(src_var.reg);
+                                let src_expr = Expr::Variable(src_var.reg, Some(src_name));
+                                else_assigns.push(self.make_assign(dst_expr, src_expr));
+                            }
                         }
                     }
                 }
@@ -751,7 +695,8 @@ impl<'a> Structurer<'a> {
         // This is typically the op after the last JAlways in any case
         let merge_point = self.find_switch_merge_point(block);
 
-        // Structure default case (fall-through)
+        // Structure default case (fall-through) - increment scope depth for case bodies
+        self.scope_depth += 1;
         let default_stmts = if let Some(default_block) = self.cfg.block_for_op(default_op) {
             if !target_to_cases.contains_key(&default_op) && !self.processed.contains(&default_block) {
                 self.structure_from(default_block, merge_point)
@@ -804,6 +749,7 @@ impl<'a> Structurer<'a> {
 
             cases.push((case_vals, stmts));
         }
+        self.scope_depth -= 1;
 
         // Hoist variable declarations from cases to before the switch
         // This is needed because Haxe switch cases share scope but VarDecl
@@ -924,22 +870,10 @@ impl<'a> Structurer<'a> {
         };
 
         // Note: φ-functions are handled via φ-elimination in structure_conditional
-        // We emit variable declarations here for any φ destinations that need them
-        if let Some(ssa_block) = self.ssa.blocks.get(&node) {
-            for phi in &ssa_block.phis {
-                if let SsaInstr::Phi { dst, .. } = phi {
-                    // Skip dead φ variables
-                    if !self.is_dead_var(*dst) {
-                        let name = self.get_var_name(*dst);
-                        // Skip if already declared (e.g., hoisted from switch)
-                        if !self.declared_vars.contains(&name) {
-                            self.declared_vars.insert(name.clone());
-                            stmts.push(Statement::VarDecl { name });
-                        }
-                    }
-                }
-            }
-        }
+        // We don't emit separate variable declarations for φ destinations here because:
+        // 1. Same-register phis (different versions of same reg) don't need declarations
+        // 2. Different-register phis get assignments emitted by structure_conditional
+        // 3. The register will be declared when first assigned in regular code
 
         // Process opcodes
         let end = if self.is_control_flow_op(block.end) {
@@ -1081,43 +1015,43 @@ impl<'a> Structurer<'a> {
             | Opcode::Throw { .. } => None,
 
             Opcode::Mov { dst, src } => {
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let expr = self.reg_to_expr(*src);
                 Some(self.make_assign(var, expr))
             }
 
             Opcode::Int { dst, ptr } => {
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let val = Expr::Constant(Constant::Int(*ptr));
                 Some(self.make_assign(var, val))
             }
 
             Opcode::Float { dst, ptr } => {
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let val = Expr::Constant(Constant::Float(*ptr));
                 Some(self.make_assign(var, val))
             }
 
             Opcode::Bool { dst, value } => {
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let val = Expr::Constant(Constant::Bool(*value));
                 Some(self.make_assign(var, val))
             }
 
             Opcode::String { dst, ptr } => {
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let val = Expr::Constant(Constant::String(*ptr));
                 Some(self.make_assign(var, val))
             }
 
             Opcode::Null { dst } => {
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let val = Expr::Constant(Constant::Null);
                 Some(self.make_assign(var, val))
             }
 
             Opcode::Add { dst, a, b } => {
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let expr = Expr::Op(Operation::Add(
                     Box::new(self.reg_to_expr(*a)),
                     Box::new(self.reg_to_expr(*b)),
@@ -1126,7 +1060,7 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::Sub { dst, a, b } => {
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let expr = Expr::Op(Operation::Sub(
                     Box::new(self.reg_to_expr(*a)),
                     Box::new(self.reg_to_expr(*b)),
@@ -1135,7 +1069,7 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::Mul { dst, a, b } => {
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let expr = Expr::Op(Operation::Mul(
                     Box::new(self.reg_to_expr(*a)),
                     Box::new(self.reg_to_expr(*b)),
@@ -1144,19 +1078,30 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::Incr { dst } => {
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 Some(Statement::ExprStatement(Expr::Op(Operation::Incr(Box::new(var)))))
             }
 
             Opcode::Decr { dst } => {
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 Some(Statement::ExprStatement(Expr::Op(Operation::Decr(Box::new(var)))))
             }
 
             Opcode::Field { dst, obj, field } => {
-                let var = self.reg_to_expr(*dst);
-                let obj_expr = self.reg_to_expr(*obj);
                 let field_name = self.get_field_name(*obj, *field);
+
+                // Check if this is a .bytes access on an array type
+                // Instead of emitting (which would fail in Haxe), track the source
+                // and reconstruct proper array access in GetMem/SetMem
+                if field_name == "bytes" && self.is_array_type(*obj) {
+                    // Track: bytes register came from this array register
+                    self.array_bytes_source.insert(*dst, *obj);
+                    // Don't emit any statement - the access will be reconstructed later
+                    return None;
+                }
+
+                let var = self.reg_to_expr_dst(*dst);
+                let obj_expr = self.reg_to_expr(*obj);
                 let expr = Expr::Field(Box::new(obj_expr), field_name);
                 Some(self.make_assign(var, expr))
             }
@@ -1260,7 +1205,7 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::GetGlobal { dst, global } => {
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 // Check if this is a string constant global
                 if let Some(string_ref) = self.get_global_string_value(*global) {
                     Some(self.make_assign(var, Expr::Constant(Constant::String(string_ref))))
@@ -1285,7 +1230,7 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::New { dst } => {
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let type_ref = self.get_type_ref(*dst);
                 // For Virtual types (anonymous objects), use empty object literal
                 if matches!(&self.code.types[type_ref.0], hlbc::types::Type::Virtual { .. }) {
@@ -1305,21 +1250,21 @@ impl<'a> Structurer<'a> {
 
             Opcode::ToVirtual { dst, src } => {
                 // ToVirtual is often just a cast, emit as assignment
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let expr = self.reg_to_expr(*src);
                 Some(self.make_assign(var, expr))
             }
 
             Opcode::ToSFloat { dst, src } | Opcode::ToUFloat { dst, src } => {
                 // Convert int to float - emit as assignment (implicit cast in Haxe)
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let expr = self.reg_to_expr(*src);
                 Some(self.make_assign(var, expr))
             }
 
             Opcode::ToInt { dst, src } => {
                 // Convert float to int - emit as Std.int(src) call
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let src_expr = self.reg_to_expr(*src);
                 let call = Expr::Call(Box::new(Call {
                     fun: Expr::Field(Box::new(Expr::Ident("Std".into())), "int".into()),
@@ -1330,14 +1275,14 @@ impl<'a> Structurer<'a> {
 
             Opcode::ToDyn { dst, src } => {
                 // Convert to Dynamic - emit as simple assignment
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let expr = self.reg_to_expr(*src);
                 Some(self.make_assign(var, expr))
             }
 
             Opcode::SafeCast { dst, src } | Opcode::UnsafeCast { dst, src } => {
                 // Cast to destination type - emit as simple assignment for now
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let expr = self.reg_to_expr(*src);
                 Some(self.make_assign(var, expr))
             }
@@ -1347,7 +1292,7 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::SDiv { dst, a, b } | Opcode::UDiv { dst, a, b } => {
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let expr = Expr::Op(Operation::Div(
                     Box::new(self.reg_to_expr(*a)),
                     Box::new(self.reg_to_expr(*b)),
@@ -1356,7 +1301,7 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::SMod { dst, a, b } | Opcode::UMod { dst, a, b } => {
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let expr = Expr::Op(Operation::Mod(
                     Box::new(self.reg_to_expr(*a)),
                     Box::new(self.reg_to_expr(*b)),
@@ -1365,7 +1310,7 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::And { dst, a, b } => {
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let expr = Expr::Op(Operation::And(
                     Box::new(self.reg_to_expr(*a)),
                     Box::new(self.reg_to_expr(*b)),
@@ -1374,7 +1319,7 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::Or { dst, a, b } => {
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let expr = Expr::Op(Operation::Or(
                     Box::new(self.reg_to_expr(*a)),
                     Box::new(self.reg_to_expr(*b)),
@@ -1383,7 +1328,7 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::Xor { dst, a, b } => {
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let expr = Expr::Op(Operation::Xor(
                     Box::new(self.reg_to_expr(*a)),
                     Box::new(self.reg_to_expr(*b)),
@@ -1392,16 +1337,30 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::Shl { dst, a, b } => {
-                let var = self.reg_to_expr(*dst);
+                // Check if this is a shift by constant 2 or 3 (array index * 4 or * 8)
+                // If so, track it for array access reconstruction and suppress the statement
+                // Use SSA to find the value of b at this point
+                let shift_amount = self.get_ssa_constant_value(*b, self.current_op);
+                if let Some(shift) = shift_amount {
+                    if shift == 2 || shift == 3 {
+                        // Track: shifted index came from original index with this shift
+                        self.shifted_indices.insert(*dst, (*a, shift));
+                        // Don't emit the shift statement - it will be absorbed by array access
+                        return None;
+                    }
+                }
+                let var = self.reg_to_expr_dst(*dst);
+                let a_expr = self.reg_to_expr(*a);
+                let b_expr = self.reg_to_expr(*b);
                 let expr = Expr::Op(Operation::Shl(
-                    Box::new(self.reg_to_expr(*a)),
-                    Box::new(self.reg_to_expr(*b)),
+                    Box::new(a_expr),
+                    Box::new(b_expr),
                 ));
                 Some(self.make_assign(var, expr))
             }
 
             Opcode::SShr { dst, a, b } => {
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let expr = Expr::Op(Operation::Shr(
                     Box::new(self.reg_to_expr(*a)),
                     Box::new(self.reg_to_expr(*b)),
@@ -1410,7 +1369,7 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::UShr { dst, a, b } => {
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 // UShr is unsigned shift right, displayed as >>> in Haxe
                 let expr = Expr::Op(Operation::Shr(
                     Box::new(self.reg_to_expr(*a)),
@@ -1420,19 +1379,19 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::Neg { dst, src } => {
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let expr = Expr::Op(Operation::Neg(Box::new(self.reg_to_expr(*src))));
                 Some(self.make_assign(var, expr))
             }
 
             Opcode::Not { dst, src } => {
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let expr = Expr::Op(Operation::Not(Box::new(self.reg_to_expr(*src))));
                 Some(self.make_assign(var, expr))
             }
 
             Opcode::GetArray { dst, array, index } => {
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let arr = self.reg_to_expr(*array);
                 let idx = self.reg_to_expr(*index);
                 let expr = Expr::Array(Box::new(arr), Box::new(idx));
@@ -1448,14 +1407,14 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::ArraySize { dst, array } => {
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let arr = self.reg_to_expr(*array);
                 let expr = Expr::Field(Box::new(arr), "length".into());
                 Some(self.make_assign(var, expr))
             }
 
             Opcode::GetThis { dst, field } => {
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let this = Expr::Variable(Reg(0), Some("this".into()));
                 let field_name = self.get_field_name(Reg(0), *field);
                 let expr = Expr::Field(Box::new(this), field_name);
@@ -1471,34 +1430,79 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::Bytes { dst, ptr } => {
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 // Bytes constants are stored separately, emit as Unknown for now
                 let val = Expr::Unknown(format!("bytes@{}", ptr.0));
                 Some(self.make_assign(var, val))
             }
 
+            Opcode::GetMem { dst, bytes, index } => {
+                let var = self.reg_to_expr_dst(*dst);
+
+                // Determine the target (array or bytes)
+                let target_expr = if let Some(array_reg) = self.array_bytes_source.get(bytes).copied() {
+                    // Bytes came from an array - use the array itself
+                    self.reg_to_expr(array_reg)
+                } else {
+                    // Raw bytes access
+                    self.reg_to_expr(*bytes)
+                };
+
+                // Always unshift the index if it was tracked
+                let index_expr = if let Some((orig_idx, _shift)) = self.shifted_indices.get(index).copied() {
+                    self.reg_to_expr(orig_idx)
+                } else {
+                    self.reg_to_expr(*index)
+                };
+
+                let expr = Expr::Array(Box::new(target_expr), Box::new(index_expr));
+                Some(self.make_assign(var, expr))
+            }
+
+            Opcode::SetMem { bytes, index, src } => {
+                // Determine the target (array or bytes)
+                let target_expr = if let Some(array_reg) = self.array_bytes_source.get(bytes).copied() {
+                    // Bytes came from an array - use the array itself
+                    self.reg_to_expr(array_reg)
+                } else {
+                    // Raw bytes access
+                    self.reg_to_expr(*bytes)
+                };
+
+                // Always unshift the index if it was tracked
+                let index_expr = if let Some((orig_idx, _shift)) = self.shifted_indices.get(index).copied() {
+                    self.reg_to_expr(orig_idx)
+                } else {
+                    self.reg_to_expr(*index)
+                };
+
+                let target = Expr::Array(Box::new(target_expr), Box::new(index_expr));
+                let expr = self.reg_to_expr(*src);
+                Some(self.make_assign(target, expr))
+            }
+
             Opcode::Ref { dst, src } => {
                 // Reference - creates a pointer to a value
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let expr = self.reg_to_expr(*src);
                 Some(self.make_assign(var, expr))
             }
 
             Opcode::Unref { dst, src } => {
                 // Dereference - reads from a pointer
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let expr = self.reg_to_expr(*src);
                 Some(self.make_assign(var, expr))
             }
 
             Opcode::Type { dst, ty } => {
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let val = Expr::Constant(Constant::TypeRef(*ty));
                 Some(self.make_assign(var, val))
             }
 
             Opcode::DynGet { dst, obj, field } => {
-                let var = self.reg_to_expr(*dst);
+                let var = self.reg_to_expr_dst(*dst);
                 let obj_expr = self.reg_to_expr(*obj);
                 let field_name = self.code.strings.get(field.0)
                     .cloned()
@@ -1515,6 +1519,36 @@ impl<'a> Structurer<'a> {
                 let target = Expr::Field(Box::new(obj_expr), field_name);
                 let expr = self.reg_to_expr(*src);
                 Some(self.make_assign(target, expr))
+            }
+
+            Opcode::StaticClosure { dst, fun } => {
+                let var = self.reg_to_expr_dst(*dst);
+                // For closures, use a placeholder function reference
+                // The actual function body would need separate decompilation
+                // For now, emit as a function reference comment
+                let fun_name = self.get_function_name(*fun)
+                    .unwrap_or_else(|| format!("fun_{}", fun.0).into());
+                // Check if the function name looks like a compiler-generated name
+                // (single type name like "String", "Int", etc.) and use a better name
+                let expr = if fun_name == "String" || fun_name == "Int" || fun_name == "Float"
+                    || fun_name == "Bool" || fun_name == "Void" || fun_name.starts_with("$") {
+                    // Use the variable name from the destination as the closure name
+                    // or generate a closure identifier
+                    Expr::Ident(format!("/* closure@{} */", fun.0).into())
+                } else {
+                    Expr::Ident(fun_name)
+                };
+                Some(self.make_assign(var, expr))
+            }
+
+            Opcode::InstanceClosure { dst, fun, obj } => {
+                let var = self.reg_to_expr_dst(*dst);
+                let obj_expr = self.reg_to_expr(*obj);
+                // Method reference: obj.methodName
+                let method_name = self.get_function_name(*fun)
+                    .unwrap_or_else(|| format!("method_{}", fun.0).into());
+                let expr = Expr::Field(Box::new(obj_expr), method_name);
+                Some(self.make_assign(var, expr))
             }
 
             _ => Some(Statement::Comment(format!("// unhandled: {:?}", op))),
@@ -1630,6 +1664,23 @@ impl<'a> Structurer<'a> {
         matches!(&self.code.types[type_ref.0], hlbc::types::Type::Void)
     }
 
+    /// Check if a register holds an array type (hl.types.ArrayBytes_*, etc.)
+    fn is_array_type(&self, reg: Reg) -> bool {
+        let reg_idx = reg.0 as usize;
+        if reg_idx < self.func.regs.len() {
+            let type_ref = self.func.regs[reg_idx];
+            if let Some(ty) = self.code.types.get(type_ref.0) {
+                if let hlbc::types::Type::Obj(obj) = ty {
+                    if let Some(name) = self.code.strings.get(obj.name.0) {
+                        // HashLink array types have names like "hl.types.ArrayBytes_Int"
+                        return name.contains("Array");
+                    }
+                }
+            }
+        }
+        false
+    }
+
     fn get_type_name(&self, reg: Reg) -> Str {
         let reg_idx = reg.0 as usize;
         if reg_idx < self.func.regs.len() {
@@ -1655,7 +1706,8 @@ impl<'a> Structurer<'a> {
         if let Some(name) = self.var_names.get(&var) {
             return name.clone();
         }
-        let name: Str = self.get_debug_name(var.reg)
+        // For SSA variable names, use the destination context (not for_source)
+        let name: Str = self.get_debug_name(var.reg, false)
             .unwrap_or_else(|| format!("v{}", { self.var_counter += 1; self.var_counter - 1 }))
             .into();
         self.var_names.insert(var, name.clone());
@@ -1663,12 +1715,35 @@ impl<'a> Structurer<'a> {
     }
 
     fn reg_name(&self, reg: Reg) -> Str {
-        self.get_debug_name(reg)
+        self.get_debug_name(reg, false)
             .unwrap_or_else(|| format!("r{}", reg.0))
             .into()
     }
 
-    fn get_debug_name(&self, reg: Reg) -> Option<String> {
+    /// Get register name for source context (reading from register).
+    /// Only uses debug names assigned BEFORE current_op.
+    fn reg_name_for_source(&self, reg: Reg) -> Str {
+        self.get_debug_name_at(reg, self.current_op, true)
+            .unwrap_or_else(|| format!("r{}", reg.0))
+            .into()
+    }
+
+    /// Get register name for source context at a specific opcode position.
+    fn reg_name_at(&self, reg: Reg, at_op: usize) -> Str {
+        self.get_debug_name_at(reg, at_op, true)
+            .unwrap_or_else(|| format!("r{}", reg.0))
+            .into()
+    }
+
+    /// Get debug name for a register, optionally for source context.
+    /// When `for_source` is true, only returns names assigned BEFORE current_op.
+    /// This prevents using a name before it's been assigned (e.g., `var dx = dx - r3`).
+    fn get_debug_name(&self, reg: Reg, for_source: bool) -> Option<String> {
+        self.get_debug_name_at(reg, self.current_op, for_source)
+    }
+
+    /// Get debug name for a register at a specific opcode position.
+    fn get_debug_name_at(&self, reg: Reg, at_op: usize, for_source: bool) -> Option<String> {
         let reg_idx = reg.0 as usize;
 
         // First, check if this is a function parameter
@@ -1736,9 +1811,17 @@ impl<'a> Structurer<'a> {
                 // The definition is at the previous opcode
                 let def_idx = op_idx.saturating_sub(1);
 
-                // Only consider assignments at or before current_op
-                if def_idx > self.current_op {
-                    continue;
+                // For source registers, only use names assigned BEFORE at_op
+                // For destination registers, use names assigned at or before at_op
+                // This prevents `var dx = dx - r3` when dx is being defined at at_op
+                if for_source {
+                    if def_idx >= at_op {
+                        continue;
+                    }
+                } else {
+                    if def_idx > at_op {
+                        continue;
+                    }
                 }
 
                 if def_idx < self.func.ops.len() {
@@ -1980,49 +2063,95 @@ impl<'a> Structurer<'a> {
             .cloned()
     }
 
+    /// Get expression for reading from a register (source context).
+    /// Uses debug names assigned BEFORE current_op to prevent using a name
+    /// before it's assigned (e.g., `var dx = dx - r3` when dx is defined here).
     fn reg_to_expr(&self, reg: Reg) -> Expr {
-        // NOTE: We previously checked inline_exprs here, but the lookup was broken:
-        // it found ANY SSA version with matching reg, not the correct version.
-        // For now, we just return a variable reference. Proper SSA-aware inlining
-        // would require tracking which version is "current" at each use site.
-        //
-        // TODO: Implement proper SSA version tracking for expression inlining
+        let name = self.reg_name_for_source(reg);
+        Expr::Variable(reg, Some(name))
+    }
+
+    /// Get expression for writing to a register (destination context).
+    /// Uses debug names assigned at or before current_op, so the new name
+    /// is used for the variable being defined.
+    fn reg_to_expr_dst(&self, reg: Reg) -> Expr {
         let name = self.reg_name(reg);
         Expr::Variable(reg, Some(name))
     }
 
-    /// Get expression for a register, checking for constants defined in a specific block.
-    /// This is useful for loop conditions where the constant may be re-assigned elsewhere.
+    /// Get expression for a register at the END of a block (for loop conditions).
+    /// Uses SSA to find the correct value - the one used by the conditional jump.
     fn reg_to_expr_in_block(&self, reg: Reg, block: NodeIndex) -> Expr {
-        // First check for constants defined in this specific block
         let blk = &self.cfg.graph[block];
-        for op_idx in blk.start..=blk.end {
-            match &self.func.ops[op_idx] {
-                Opcode::Int { dst, ptr } if *dst == reg => {
-                    return Expr::Constant(Constant::Int(*ptr));
+
+        // Use SSA: look up which version of this register is used at block.end
+        // The conditional jump is at block.end, so we want the SSA variable used there
+        if let Some((_dst, uses)) = self.ssa.get_instr_for_op(blk.end) {
+            for ssa_var in uses {
+                if ssa_var.reg == reg {
+                    // Found the SSA variable for this register at block end
+                    // Now find its definition to see if it's a constant
+                    if let Some(def_op_idx) = self.ssa.find_def(*ssa_var) {
+                        match &self.func.ops[def_op_idx] {
+                            Opcode::Int { ptr, .. } => {
+                                return Expr::Constant(Constant::Int(*ptr));
+                            }
+                            Opcode::Float { ptr, .. } => {
+                                return Expr::Constant(Constant::Float(*ptr));
+                            }
+                            Opcode::Bool { value, .. } => {
+                                return Expr::Constant(Constant::Bool(*value));
+                            }
+                            Opcode::String { ptr, .. } => {
+                                return Expr::Constant(Constant::String(*ptr));
+                            }
+                            Opcode::Null { .. } => {
+                                return Expr::Constant(Constant::Null);
+                            }
+                            _ => {
+                                // Not a constant - return as variable with proper name
+                                let name = self.reg_name_at(reg, blk.end);
+                                return Expr::Variable(reg, Some(name));
+                            }
+                        }
+                    }
+                    break;
                 }
-                Opcode::Float { dst, ptr } if *dst == reg => {
-                    return Expr::Constant(Constant::Float(*ptr));
-                }
-                Opcode::Bool { dst, value } if *dst == reg => {
-                    return Expr::Constant(Constant::Bool(*value));
-                }
-                Opcode::String { dst, ptr } if *dst == reg => {
-                    return Expr::Constant(Constant::String(*ptr));
-                }
-                Opcode::Null { dst } if *dst == reg => {
-                    return Expr::Constant(Constant::Null);
-                }
-                _ => {}
             }
         }
-        // Fall back to normal lookup
-        self.reg_to_expr(reg)
+
+        // Fallback: return as variable
+        let name = self.reg_name_at(reg, blk.end);
+        Expr::Variable(reg, Some(name))
     }
 
     fn compute_target(&self, op_idx: usize, offset: i32) -> Option<NodeIndex> {
         let target_idx = (op_idx as i64 + offset as i64 + 1) as usize;
         self.cfg.block_for_op(target_idx)
+    }
+
+    /// Get the constant value of a register at a specific opcode using SSA information.
+    /// Looks up which SSA variable is used for this register at this op,
+    /// then finds its definition and checks if it's a constant.
+    fn get_ssa_constant_value(&self, reg: Reg, at_op: usize) -> Option<i32> {
+        // Get the SSA instruction for this opcode
+        if let Some((_dst, uses)) = self.ssa.get_instr_for_op(at_op) {
+            // Find the SSA variable for this register in the uses
+            for ssa_var in uses {
+                if ssa_var.reg == reg {
+                    // Found the SSA variable for this register
+                    // Now find its defining instruction
+                    if let Some(def_op_idx) = self.ssa.find_def(*ssa_var) {
+                        // Check if the defining instruction is a constant
+                        if let Opcode::Int { ptr, .. } = &self.func.ops[def_op_idx] {
+                            return self.code.ints.get(ptr.0).map(|&v| v);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        None
     }
 }
 
@@ -2188,6 +2317,7 @@ fn is_var_used_in_expr(reg: &Reg, expr: &Expr) -> bool {
         Expr::ArrayLiteral(elems) => elems.iter().any(|e| is_var_used_in_expr(reg, e)),
         Expr::EnumConstr(_, _, args) => args.iter().any(|a| is_var_used_in_expr(reg, a)),
         Expr::Closure(_, stmts) => stmts.iter().any(|s| is_var_used_in_stmt(reg, s)),
+        Expr::Cast(inner, _) => is_var_used_in_expr(reg, inner),
         // These don't contain variable references
         Expr::Constant(_) | Expr::Ident(_) | Expr::FunRef(_) | Expr::Unknown(_) => false,
     }

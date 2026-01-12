@@ -754,6 +754,9 @@ impl Expr {
                 Expr::Ident(name) => {{
                     name.clone()
                 }}
+                Expr::Cast(expr, type_name) => {
+                    "cast("{disp!(expr)}", "{type_name}")"
+                }
             }
         }
     }
