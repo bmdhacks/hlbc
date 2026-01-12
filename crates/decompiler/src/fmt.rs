@@ -723,20 +723,24 @@ impl Expr {
                     {indent}"}"
                 }
                 Expr::EnumConstr(ty, constr, args) => {
-                    // Get the construct name and prefix with _ to avoid conflicts
-                    // with built-in types (e.g., "String" enum construct vs String class)
-                    let construct_name = if let Type::Enum { constructs, .. } = &code[*ty] {
+                    // Emit EnumName.ConstructorName(args) syntax
+                    if let Type::Enum { name, constructs, .. } = &code[*ty] {
+                        let enum_name = code.strings.get(name.0)
+                            .map(|s| s.as_ref())
+                            .unwrap_or("Enum");
                         if let Some(c) = constructs.get(constr.0) {
-                            let name = c.name(code);
-                            // Prefix with _ to avoid conflicts with built-in types
-                            format!("_Enum{}", name)
+                            let construct_name = c.name(code);
+                            if args.is_empty() {
+                                {enum_name}"."{construct_name}
+                            } else {
+                                {enum_name}"."{construct_name}"("{fmtools::join(", ", args.iter().map(|e| disp!(e)))}")"
+                            }
                         } else {
-                            format!("_EnumConstruct{}", constr.0)
+                            {enum_name}".Construct"{constr.0}"("{fmtools::join(", ", args.iter().map(|e| disp!(e)))}")"
                         }
                     } else {
-                        format!("_EnumConstruct{}", constr.0)
-                    };
-                    {construct_name}"("{fmtools::join(", ", args.iter().map(|e| disp!(e)))}")"
+                        "EnumConstruct"{constr.0}"("{fmtools::join(", ", args.iter().map(|e| disp!(e)))}")"
+                    }
                 }
                 Expr::Field(receiver, name) => {
                     {disp!(receiver)}"."{name}

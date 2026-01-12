@@ -63,11 +63,15 @@ pub struct Structurer<'a> {
     /// Array bytes tracking: maps bytes register -> array register
     /// Used to reconstruct arr[i] from bytes[shifted_i] pattern
     array_bytes_source: HashMap<Reg, Reg>,
-    /// Shifted index tracking: maps shifted reg -> (original index reg, shift amount)
+    /// Shifted index tracking: maps shifted reg -> (original index expression, shift amount)
     /// Used to reverse index * 4 back to original index for array access
-    shifted_indices: HashMap<Reg, (Reg, i32)>,
+    /// We store the Expr (not Reg) to capture the correct SSA version at shift time
+    shifted_indices: HashMap<Reg, (Expr, i32)>,
     /// Exception region analysis for try/catch structuring
     exception_analysis: ExceptionAnalysis,
+    /// Enum global -> (enum type, constructor index) mapping
+    /// Built by analyzing the entry point function's enum initialization pattern
+    enum_global_map: HashMap<hlbc::types::RefGlobal, (RefType, usize)>,
 }
 
 impl<'a> Structurer<'a> {
@@ -133,7 +137,89 @@ impl<'a> Structurer<'a> {
             needs_dynamic_type: HashSet::new(),
             array_bytes_source: HashMap::new(),
             shifted_indices: HashMap::new(),
+            enum_global_map: Self::build_enum_global_map(code),
         }
+    }
+
+    /// Build a map from enum globals to their (enum type, constructor index).
+    /// This analyzes the entry point function to find the pattern:
+    ///   initEnum(type, enumType) -> enum_obj
+    ///   enum_obj.__evalues__ -> evalues_array
+    ///   evalues_array[N] -> value
+    ///   global@X = value   // global X is constructor N
+    fn build_enum_global_map(code: &Bytecode) -> HashMap<hlbc::types::RefGlobal, (RefType, usize)> {
+        let mut map = HashMap::new();
+
+        // Get the entry point function using the proper lookup
+        let entry_func = code.entrypoint();
+
+        // Track the last known array index and the enum type being initialized
+        let mut current_index: Option<usize> = None;
+        let mut enum_type_reg: Option<Reg> = None;
+        let mut evalues_reg: Option<Reg> = None;
+        let mut current_enum_type: Option<RefType> = None;
+
+        for op in entry_func.ops.iter() {
+            match op {
+                // Track: Type reg = enum<...>
+                Opcode::Type { dst, ty } => {
+                    if let Some(Type::Enum { .. }) = code.types.get(ty.0) {
+                        enum_type_reg = Some(*dst);
+                        current_enum_type = Some(*ty);
+                    }
+                }
+                // Track: Call2 initEnum(_, enumType) -> reg
+                // The result has __evalues__ field
+                Opcode::Call2 { dst: _, fun, arg0: _, arg1 } => {
+                    // Check if this is initEnum by looking at the function name
+                    if let Some(f) = code.functions.get(fun.0) {
+                        let name = f.name(code);
+                        if name.as_ref() == "initEnum" {
+                            // arg1 is the enum type register
+                            if enum_type_reg == Some(*arg1) {
+                                // dst now holds the hl.Enum object - track for Field access
+                                evalues_reg = None; // Reset until we see Field
+                            }
+                        }
+                    }
+                }
+                // Track: Field reg = enumObj.__evalues__
+                Opcode::Field { dst, obj: _, field } => {
+                    if let Some(field_name) = code.strings.get(field.0) {
+                        if field_name.as_ref() == "__evalues__" {
+                            evalues_reg = Some(*dst);
+                        }
+                    }
+                }
+                // Track: Int reg = N (the constructor index)
+                Opcode::Int { dst: _, ptr } => {
+                    if let Some(val) = code.ints.get(ptr.0) {
+                        current_index = Some(*val as usize);
+                    }
+                }
+                // Track: GetArray result = evalues[index]
+                Opcode::GetArray { dst: _, array, index: _ } => {
+                    if evalues_reg == Some(*array) {
+                        // Good - we're reading from __evalues__ with current_index
+                    }
+                }
+                // Track: SetGlobal global = value
+                Opcode::SetGlobal { global, src: _ } => {
+                    // If we have a valid enum type and index, record the mapping
+                    if let (Some(idx), Some(enum_t)) = (current_index, current_enum_type) {
+                        // Verify this global has the enum type
+                        if let Some(global_type) = code.globals.get(global.0) {
+                            if *global_type == enum_t {
+                                map.insert(*global, (enum_t, idx));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        map
     }
 
     /// Build a map from function references to their owner types and method names.
@@ -968,6 +1054,36 @@ impl<'a> Structurer<'a> {
                 ));
                 (cond, target(*offset), fall)
             }
+            // Unsigned comparisons (used for array bounds checking)
+            Opcode::JULt { a, b, offset } => {
+                let cond = Expr::Op(Operation::Lt(
+                    Box::new(self.reg_to_expr(*a)),
+                    Box::new(self.reg_to_expr(*b)),
+                ));
+                (cond, target(*offset), fall)
+            }
+            Opcode::JUGte { a, b, offset } => {
+                let cond = Expr::Op(Operation::Gte(
+                    Box::new(self.reg_to_expr(*a)),
+                    Box::new(self.reg_to_expr(*b)),
+                ));
+                (cond, target(*offset), fall)
+            }
+            Opcode::JSLte { a, b, offset } => {
+                let cond = Expr::Op(Operation::Lte(
+                    Box::new(self.reg_to_expr(*a)),
+                    Box::new(self.reg_to_expr(*b)),
+                ));
+                (cond, target(*offset), fall)
+            }
+            Opcode::JNotLt { a, b, offset } => {
+                // not(a < b) is equivalent to a >= b
+                let cond = Expr::Op(Operation::Gte(
+                    Box::new(self.reg_to_expr(*a)),
+                    Box::new(self.reg_to_expr(*b)),
+                ));
+                (cond, target(*offset), fall)
+            }
             _ => (Expr::Constant(Constant::Bool(true)), fall, None),
         }
     }
@@ -1388,6 +1504,11 @@ impl<'a> Structurer<'a> {
                 | Opcode::JNotNull { .. }
                 | Opcode::JSLt { .. }
                 | Opcode::JSGte { .. }
+                | Opcode::JSLte { .. }
+                | Opcode::JSGt { .. }
+                | Opcode::JULt { .. }
+                | Opcode::JUGte { .. }
+                | Opcode::JNotLt { .. }
                 | Opcode::JEq { .. }
                 | Opcode::JNotEq { .. }
                 | Opcode::JAlways { .. }
@@ -1416,8 +1537,12 @@ impl<'a> Structurer<'a> {
 
         match op {
             Opcode::Label | Opcode::Nop => None,
+            // Control flow opcodes - handled by structuring, not statement generation
             Opcode::JTrue { .. } | Opcode::JFalse { .. } | Opcode::JNull { .. }
-            | Opcode::JNotNull { .. } | Opcode::JAlways { .. } | Opcode::Ret { .. } => None,
+            | Opcode::JNotNull { .. } | Opcode::JAlways { .. } | Opcode::Ret { .. }
+            | Opcode::JSLt { .. } | Opcode::JSGte { .. } | Opcode::JSLte { .. }
+            | Opcode::JSGt { .. } | Opcode::JEq { .. } | Opcode::JNotEq { .. }
+            | Opcode::JULt { .. } | Opcode::JUGte { .. } | Opcode::JNotLt { .. } => None,
 
             // Exception handling opcodes are control flow - handled by structure_block_range
             Opcode::Trap { .. } | Opcode::EndTrap { .. } => None,
@@ -1536,6 +1661,18 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::Call1 { dst, fun, arg0 } => {
+                // Check for constructor call: Call1 following New with same register
+                // Pattern: New reg0 = new Type; Call1 void = Constructor(reg0)
+                // Skip since the New already creates the object
+                if op_idx > 0 {
+                    if let Some(Opcode::New { dst: new_dst }) = self.func.ops.get(op_idx - 1) {
+                        if *new_dst == *arg0 {
+                            // This is a constructor call following New - skip it
+                            return None;
+                        }
+                    }
+                }
+
                 // Check for super method call: calling parent's method with same name, this as arg
                 if *arg0 == Reg(0) && self.is_super_method_call(*fun) {
                     if let Some(method_name) = self.get_function_name(*fun) {
@@ -1686,10 +1823,12 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::ToSFloat { dst, src } | Opcode::ToUFloat { dst, src } => {
-                // Convert int to float - emit as assignment (implicit cast in Haxe)
+                // Convert int to float - emit explicit cast to preserve type across inlining
                 let var = self.reg_to_expr_dst(*dst);
-                let expr = self.reg_to_expr(*src);
-                Some(self.make_assign(var, expr))
+                let src_expr = self.reg_to_expr(*src);
+                // Wrap in cast: cast(src, Float) or (src : Float)
+                let cast_expr = Expr::Cast(Box::new(src_expr), "Float".into());
+                Some(self.make_assign(var, cast_expr))
             }
 
             Opcode::ToInt { dst, src } => {
@@ -1774,7 +1913,18 @@ impl<'a> Structurer<'a> {
                 if let Some(shift) = shift_amount {
                     if shift == 2 || shift == 3 {
                         // Track: shifted index came from original index with this shift
-                        self.shifted_indices.insert(*dst, (*a, shift));
+                        // Use SSA to get the actual value if it's a constant
+                        // For non-constants, use the correct SSA name via SSA lookup to avoid
+                        // getting names from other control flow paths (bounds check branches)
+                        let index_expr = if let Some(const_val) = self.get_ssa_constant_value(*a, self.current_op) {
+                            Expr::Constant(Constant::InlineInt(const_val as usize))
+                        } else {
+                            // Get the correct SSA variable name by looking at SSA uses
+                            // This avoids the issue where debug names from other branches
+                            // incorrectly apply to this control flow path
+                            self.get_ssa_based_expr(*a, self.current_op)
+                        };
+                        self.shifted_indices.insert(*dst, (index_expr, shift));
                         // Don't emit the shift statement - it will be absorbed by array access
                         return None;
                     }
@@ -1879,8 +2029,9 @@ impl<'a> Structurer<'a> {
                 };
 
                 // Always unshift the index if it was tracked
-                let index_expr = if let Some((orig_idx, _shift)) = self.shifted_indices.get(index).copied() {
-                    self.reg_to_expr(orig_idx)
+                // Use the stored Expr directly to preserve the correct SSA version
+                let index_expr = if let Some((orig_expr, _shift)) = self.shifted_indices.get(index).cloned() {
+                    orig_expr
                 } else {
                     self.reg_to_expr(*index)
                 };
@@ -1900,8 +2051,9 @@ impl<'a> Structurer<'a> {
                 };
 
                 // Always unshift the index if it was tracked
-                let index_expr = if let Some((orig_idx, _shift)) = self.shifted_indices.get(index).copied() {
-                    self.reg_to_expr(orig_idx)
+                // Use the stored Expr directly to preserve the correct SSA version
+                let index_expr = if let Some((orig_expr, _shift)) = self.shifted_indices.get(index).cloned() {
+                    orig_expr
                 } else {
                     self.reg_to_expr(*index)
                 };
@@ -2051,6 +2203,30 @@ impl<'a> Structurer<'a> {
                 }
             }
 
+            Opcode::MakeEnum { dst, construct, args } => {
+                // Create an enum variant with arguments
+                // e.g., Option.Some(42)
+                let var = self.reg_to_expr_dst(*dst);
+                let type_ref = self.get_type_ref(*dst);
+                // Convert args to expressions
+                let arg_exprs: Vec<Expr> = args.iter().map(|r| self.reg_to_expr(*r)).collect();
+                let expr = Expr::EnumConstr(type_ref, *construct, arg_exprs);
+                Some(self.make_assign(var, expr))
+            }
+
+            Opcode::EnumIndex { dst, value } => {
+                // Get the constructor index of an enum value (for switch statements)
+                // This is used internally by switch on enum, typically followed by Switch opcode
+                // We emit the assignment so the switch can use it
+                let var = self.reg_to_expr_dst(*dst);
+                let val_expr = self.reg_to_expr(*value);
+                // Use Type.enumIndex(val) which gets the constructor ordinal
+                let type_expr = Expr::Ident("Type".into());
+                let method_expr = Expr::Field(Box::new(type_expr), "enumIndex".into());
+                let expr = Expr::Call(Box::new(Call::new(method_expr, vec![val_expr])));
+                Some(self.make_assign(var, expr))
+            }
+
             Opcode::SetEnumField { value, field, src } => {
                 // Suppress closure context field writes
                 if self.is_closure_context_reg(*value) {
@@ -2075,13 +2251,17 @@ impl<'a> Structurer<'a> {
                         return Some(self.make_assign(var, expr));
                     }
                 }
-                // Normal enum field access
+                // Normal enum field access - use Type.enumParameters(value)[index]
+                // This is the proper Haxe way to extract enum parameters dynamically
                 let var = self.reg_to_expr_dst(*dst);
-                let obj_expr = self.reg_to_expr(*value);
-                let field_name = format!("field_{}", field.0);
-                let expr = Expr::Field(Box::new(obj_expr), field_name.into());
-                // Could add cast annotation: (obj as ConstructName).field
-                let _ = construct; // suppress unused warning for now
+                let val_expr = self.reg_to_expr(*value);
+                // Type.enumParameters(val)[field_index]
+                let type_expr = Expr::Ident("Type".into());
+                let method_expr = Expr::Field(Box::new(type_expr), "enumParameters".into());
+                let params_call = Expr::Call(Box::new(Call::new(method_expr, vec![val_expr])));
+                let field_idx = Expr::Constant(Constant::InlineInt(field.0));
+                let expr = Expr::Array(Box::new(params_call), Box::new(field_idx));
+                let _ = construct; // suppress unused warning - construct info not needed for dynamic access
                 Some(self.make_assign(var, expr))
             }
 
@@ -2114,6 +2294,42 @@ impl<'a> Structurer<'a> {
                         .cloned()
                         .unwrap_or_else(|| format!("global_{}", global.0).into());
                     return self.clean_internal_name(&raw_name);
+                }
+                hlbc::types::Type::Enum { name, constructs, .. } => {
+                    // For enum globals, look up the constructor from the constants table
+                    let enum_name = self.code.strings.get(name.0)
+                        .cloned()
+                        .unwrap_or_else(|| "Enum".into());
+
+                    // Check if we have constant initializer data for this global
+                    if let Some(&const_idx) = self.code.globals_initializers.get(&global) {
+                        if let Some(constants) = &self.code.constants {
+                            if let Some(const_def) = constants.get(const_idx) {
+                                // First field is the constructor index
+                                if let Some(&construct_idx) = const_def.fields.first() {
+                                    if let Some(construct) = constructs.get(construct_idx) {
+                                        let construct_name = self.code.strings.get(construct.name.0)
+                                            .cloned()
+                                            .unwrap_or_else(|| format!("Construct{}", construct_idx).into());
+                                        return format!("{}.{}", enum_name, construct_name).into();
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Check if we have enum_global_map entry (from init function analysis)
+                    if let Some((_enum_type, construct_idx)) = self.enum_global_map.get(&global) {
+                        if let Some(construct) = constructs.get(*construct_idx) {
+                            let construct_name = self.code.strings.get(construct.name.0)
+                                .cloned()
+                                .unwrap_or_else(|| format!("Construct{}", construct_idx).into());
+                            return format!("{}.{}", enum_name, construct_name).into();
+                        }
+                    }
+
+                    // Fallback: just use enum name
+                    return enum_name.into();
                 }
                 _ => {}
             }
@@ -2807,6 +3023,34 @@ impl<'a> Structurer<'a> {
             }
         }
         None
+    }
+
+    /// Get an expression for a register using SSA information to find the correct definition.
+    /// This is used when debug names might be unreliable due to control flow (e.g., bounds check branches).
+    /// Returns an expression based on where the SSA variable is actually defined.
+    fn get_ssa_based_expr(&self, reg: Reg, at_op: usize) -> Expr {
+        // Get the SSA instruction for this opcode
+        if let Some((_dst, uses)) = self.ssa.get_instr_for_op(at_op) {
+            // Find the SSA variable for this register in the uses
+            for ssa_var in uses {
+                if ssa_var.reg == reg {
+                    // Found the SSA variable for this register
+                    // Now find its defining instruction
+                    if let Some(def_op_idx) = self.ssa.find_def(*ssa_var) {
+                        // Get the name at the definition point, which is in the correct control flow path
+                        let name = self.reg_name_at(reg, def_op_idx);
+                        return Expr::Variable(reg, Some(name));
+                    }
+                    // No def found - probably a phi-function (loop variable)
+                    // Fall through to use normal naming which should work for loop indices
+                    break;
+                }
+            }
+        }
+        // Fallback: use normal naming. This works for:
+        // - Loop variables (phi-defined) where the debug name is valid at this point
+        // - Cases where SSA doesn't have the information
+        self.reg_to_expr(reg)
     }
 }
 
