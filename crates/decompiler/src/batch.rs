@@ -9,9 +9,13 @@ use std::fs;
 use std::io;
 use std::panic;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hlbc::types::Type;
 use hlbc::{Bytecode, Resolve};
+
+#[cfg(feature = "batch")]
+use rayon::prelude::*;
 
 use crate::fmt::FormatOptions;
 use crate::closure_analysis::ClosureAnalysis;
@@ -46,6 +50,10 @@ pub struct BatchOptions {
     pub exclude: Vec<String>,
     /// Show progress during decompilation
     pub verbose: bool,
+    /// Include metadata files (_natives.hx, _globals.hx, _standalone.hx)
+    pub include_metadata: bool,
+    /// Number of parallel jobs (None = use all CPUs)
+    pub jobs: Option<usize>,
 }
 
 impl Default for BatchOptions {
@@ -54,6 +62,8 @@ impl Default for BatchOptions {
             include: vec![],
             exclude: vec![],
             verbose: false,
+            include_metadata: false,
+            jobs: None,
         }
     }
 }
@@ -77,7 +87,11 @@ impl BatchOptions {
 
 /// Simple glob-style pattern matching.
 fn matches_pattern(name: &str, pattern: &str) -> bool {
-    if pattern.ends_with(".**") {
+    if pattern == "_*.**" {
+        // Special pattern to match types with underscore-prefixed segments
+        // "_*.**" should match "_Xml.Foo", "h3d.scene._Graphics.GPoint", etc.
+        name.starts_with('_') || name.contains("._")
+    } else if pattern.ends_with(".**") {
         // Match package and all subpackages
         // pattern "h2d.**" should match "h2d.Foo" and "h2d.sub.Bar"
         let prefix = &pattern[..pattern.len() - 2]; // Keep the dot: "h2d."
@@ -88,8 +102,9 @@ fn matches_pattern(name: &str, pattern: &str) -> bool {
         let prefix = &pattern[..pattern.len() - 1]; // Keep the dot: "h2d."
         name.starts_with(prefix) && !name[prefix.len()..].contains('.')
     } else if pattern == "$*" {
-        // Special pattern to match all $-prefixed types (internal static holders)
-        name.starts_with('$')
+        // Special pattern to match all types containing $ (internal static holders)
+        // This catches both top-level $String and nested h3d.scene.$Skin
+        name.contains('$')
     } else {
         // Exact match
         name == pattern
@@ -131,89 +146,118 @@ impl<'a> BatchDecompiler<'a> {
     /// Decompile all types to the output directory.
     #[cfg(feature = "batch")]
     pub fn decompile_all(&self, output_dir: &Path) -> io::Result<IndexFile> {
+        // Configure rayon thread pool if jobs specified
+        if let Some(jobs) = self.batch_opts.jobs {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(jobs)
+                .build_global()
+                .ok(); // Ignore error if pool already initialized
+        }
+
         let mut index = IndexFile::new();
-        let mut count = 0;
-        let total = self.code.types.iter().filter(|t| t.get_type_obj().is_some()).count();
 
         // Create output directory
         fs::create_dir_all(output_dir)?;
 
-        // Process all object types (classes)
-        for (type_idx, ty) in self.code.types.iter().enumerate() {
-            if let Some(obj) = ty.get_type_obj() {
-                let name = obj.name(self.code).to_string();
+        // Collect types to decompile
+        let types_to_decompile: Vec<_> = self.code.types.iter().enumerate()
+            .filter_map(|(type_idx, ty)| {
+                ty.get_type_obj().and_then(|obj| {
+                    let name = obj.name(self.code).to_string();
+                    if self.batch_opts.should_include(&name) {
+                        Some((type_idx, obj, name))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
 
-                // Check if we should process this type
-                if !self.batch_opts.should_include(&name) {
-                    continue;
-                }
+        let total = types_to_decompile.len();
+        let count = AtomicUsize::new(0);
 
-                let path = type_name_to_path(&name);
+        // Create all parent directories upfront (sequential)
+        for (_, _, name) in &types_to_decompile {
+            let path = type_name_to_path(name);
+            let full_path = output_dir.join(&path);
+            if let Some(parent) = full_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+
+        // Decompile in parallel
+        let results: Vec<_> = types_to_decompile.par_iter()
+            .map(|(type_idx, obj, name)| {
+                let path = type_name_to_path(name);
                 let full_path = output_dir.join(&path);
 
-                // Create parent directories
-                if let Some(parent) = full_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-
-                // Decompile and write (with panic recovery)
+                // Decompile with panic recovery
                 let static_inits = &self.static_inits;
                 let closure_analysis = &self.closure_analysis;
                 let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                    let class = decompile_class_with_closures(self.code, obj, static_inits, Some(closure_analysis));
-                    let display = class.display_with_index(self.code, &self.opts, Some(type_idx));
-                    let s = display.to_string();
-                    s
+                    let class = decompile_class_with_closures(self.code, *obj, static_inits, Some(closure_analysis));
+                    let display = class.display_with_index(self.code, &self.opts, Some(*type_idx));
+                    display.to_string()
                 }));
 
                 let content = match result {
                     Ok(content) => content,
                     Err(_) => {
-                        // Decompilation panicked, write a stub file
-                        if self.batch_opts.verbose {
-                            eprintln!("  WARNING: decompilation failed, writing stub");
-                        }
                         format!(
                             "// type@{}\n// Decompilation failed for {}\n// Reason: internal decompiler error\n\nclass {} {{\n    // Could not decompile\n}}\n",
-                            type_idx, name, name.split('.').last().unwrap_or(&name)
+                            type_idx, name, name.split('.').last().unwrap_or(name)
                         )
                     }
                 };
-                fs::write(&full_path, &content)?;
 
-                // Record in index
-                index.types.insert(name.clone(), type_idx);
+                // Write file
+                let _ = fs::write(&full_path, &content);
 
-                // Record functions
+                // Progress
+                if self.batch_opts.verbose {
+                    let c = count.fetch_add(1, Ordering::Relaxed) + 1;
+                    eprintln!("[{}/{}] {}", c, total, name);
+                }
+
+                // Return index data
+                let mut funcs = Vec::new();
                 for proto in &obj.protos {
                     let fun_name = format!("{}::{}", name, proto.name(self.code));
-                    index.functions.insert(fun_name, proto.findex.0);
+                    funcs.push((fun_name, proto.findex.0));
                 }
                 for (_, findex) in &obj.bindings {
                     if let Some(fun) = findex.as_fn(self.code) {
                         let fun_name = format!("{}::{}", name, fun.name(self.code));
-                        index.functions.insert(fun_name, findex.0);
+                        funcs.push((fun_name, findex.0));
                     }
                 }
 
-                count += 1;
-                if self.batch_opts.verbose {
-                    eprintln!("[{}/{}] {}", count, total, name);
-                }
+                (name.clone(), *type_idx, funcs)
+            })
+            .collect();
+
+        // Merge results into index (sequential)
+        for (name, type_idx, funcs) in results {
+            index.types.insert(name, type_idx);
+            for (fun_name, fun_idx) in funcs {
+                index.functions.insert(fun_name, fun_idx);
             }
         }
 
         // Write enum types
         self.write_enums(output_dir, &mut index)?;
 
-        // Write standalone functions (not part of a class)
-        self.write_standalone_functions(output_dir, &mut index)?;
+        // Write metadata files only if requested (they can break recompilation)
+        if self.batch_opts.include_metadata {
+            // Write standalone functions (not part of a class)
+            self.write_standalone_functions(output_dir, &mut index)?;
 
-        // Write natives
-        self.write_natives(output_dir)?;
+            // Write natives
+            self.write_natives(output_dir)?;
 
-        // Write globals
-        self.write_globals(output_dir, &mut index)?;
+            // Write globals
+            self.write_globals(output_dir, &mut index)?;
+        }
 
         // Write index file
         let index_path = output_dir.join("_index.json");
@@ -222,7 +266,7 @@ impl<'a> BatchDecompiler<'a> {
         fs::write(index_path, index_json)?;
 
         if self.batch_opts.verbose {
-            eprintln!("Decompiled {} types", count);
+            eprintln!("Decompiled {} types", count.load(Ordering::Relaxed));
         }
 
         Ok(index)

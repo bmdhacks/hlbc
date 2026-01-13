@@ -884,6 +884,122 @@ fn is_empty_anonymous(expr: &Expr) -> bool {
     matches!(expr, Expr::Anonymous(_, fields) if fields.is_empty())
 }
 
+use hlbc::types::EnumConstruct;
+
+/// Format a switch case pattern, handling enum constructor names when applicable
+fn format_switch_pattern<'a>(
+    pattern: &'a Expr,
+    enum_constructs: Option<&'a [EnumConstruct]>,
+    indent: &FormatOptions,
+    code: &'a Bytecode,
+    f: &'a Function,
+) -> impl Display + 'a {
+    struct PatternFormatter<'a> {
+        pattern: &'a Expr,
+        enum_constructs: Option<&'a [EnumConstruct]>,
+        indent: FormatOptions,
+        code: &'a Bytecode,
+        f: &'a Function,
+    }
+
+    impl<'a> Display for PatternFormatter<'a> {
+        fn fmt(&self, fmt: &mut Formatter<'_>) -> fmt::Result {
+            // Try to use enum constructor name if this is an enum switch
+            if let Some(constructs) = self.enum_constructs {
+                // Extract integer index from pattern expression
+                let idx = match self.pattern {
+                    Expr::Constant(Constant::InlineInt(n)) => Some(*n),
+                    Expr::Constant(Constant::Int(ptr)) => Some(self.code.ints[ptr.0] as usize),
+                    _ => None,
+                };
+                if let Some(idx) = idx {
+                    if let Some(construct) = constructs.get(idx) {
+                        write!(fmt, "{}", self.code.get(construct.name))?;
+                        // Add wildcard parameters for constructors with params
+                        if !construct.params.is_empty() {
+                            write!(fmt, "(")?;
+                            for (pi, _) in construct.params.iter().enumerate() {
+                                if pi > 0 {
+                                    write!(fmt, ", ")?;
+                                }
+                                write!(fmt, "_")?;
+                            }
+                            write!(fmt, ")")?;
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+            // Fallback: display pattern as expression
+            write!(fmt, "{}", self.pattern.display(&self.indent, self.code, self.f))
+        }
+    }
+
+    PatternFormatter {
+        pattern,
+        enum_constructs,
+        indent: indent.clone(),
+        code,
+        f,
+    }
+}
+
+/// Helper struct to format else-if chains iteratively (avoids stack overflow from recursion)
+struct ElseChainFormatter<'a> {
+    else_stmts: &'a [Statement],
+    indent: &'a FormatOptions,
+    code: &'a Bytecode,
+    f: &'a Function,
+}
+
+impl<'a> Display for ElseChainFormatter<'a> {
+    fn fmt(&self, fmt: &mut Formatter<'_>) -> fmt::Result {
+        let mut current = self.else_stmts;
+        let indent2 = self.indent.inc_nesting();
+
+        while !current.is_empty() {
+            if current.len() == 1 {
+                if let Statement::IfElse { cond, if_, else_ } = &current[0] {
+                    // Continue the else-if chain
+                    write!(fmt, " else if ({}) {{\n", cond.display(self.indent, self.code, self.f))?;
+                    for stmt in if_ {
+                        write!(fmt, "{}{}\n", indent2, stmt.display(&indent2, self.code, self.f))?;
+                    }
+                    write!(fmt, "{}}}", self.indent)?;
+                    // Move to the next else clause (iteration, not recursion)
+                    current = else_;
+                } else {
+                    // Single non-if statement - emit else block and stop
+                    write!(fmt, " else {{\n")?;
+                    for stmt in current {
+                        write!(fmt, "{}{}\n", indent2, stmt.display(&indent2, self.code, self.f))?;
+                    }
+                    write!(fmt, "{}}}", self.indent)?;
+                    break;
+                }
+            } else {
+                // Multiple statements - emit else block and stop
+                write!(fmt, " else {{\n")?;
+                for stmt in current {
+                    write!(fmt, "{}{}\n", indent2, stmt.display(&indent2, self.code, self.f))?;
+                }
+                write!(fmt, "{}}}", self.indent)?;
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn format_else_chain<'a>(
+    else_stmts: &'a [Statement],
+    indent: &'a FormatOptions,
+    code: &'a Bytecode,
+    f: &'a Function,
+) -> impl Display + 'a {
+    ElseChainFormatter { else_stmts, indent, code, f }
+}
+
 impl Statement {
     pub fn display<'a>(
         &'a self,
@@ -921,6 +1037,49 @@ impl Statement {
                         {indent2}{stmt.display(&indent2, code, f)}"\n"
                     }
                     {indent}"}"
+                    if !else_.is_empty() {
+                        // Check if else_ is a single IfElse - if so, flatten to "else if"
+                        if else_.len() == 1 {
+                            if let Statement::IfElse { cond: else_cond, if_: else_if, else_: else_else } = &else_[0] {
+                                // Emit "else if" without extra nesting - use the SAME indent level
+                                " else if ("{disp!(else_cond)}") {\n"
+                                for stmt in else_if {
+                                    {indent2}{stmt.display(&indent2, code, f)}"\n"
+                                }
+                                {indent}"}"
+                                // Recursively handle the else-else chain
+                                {format_else_chain(else_else, indent, code, f)}
+                            } else {
+                                // Single non-if statement in else
+                                " else {\n"
+                                for stmt in else_ {
+                                    {indent2}{stmt.display(&indent2, code, f)}"\n"
+                                }
+                                {indent}"}"
+                            }
+                        } else {
+                            // Multiple statements in else block
+                            " else {\n"
+                            for stmt in else_ {
+                                {indent2}{stmt.display(&indent2, code, f)}"\n"
+                            }
+                            {indent}"}"
+                        }
+                    }
+                }
+                Statement::IfElseChain { branches, else_ } => {
+                    let indent2 = indent.inc_nesting();
+                    for (i, (cond, body)) in branches.iter().enumerate() {
+                        if i == 0 {
+                            "if ("{disp!(cond)}") {\n"
+                        } else {
+                            " else if ("{disp!(cond)}") {\n"
+                        }
+                        for stmt in body {
+                            {indent2}{stmt.display(&indent2, code, f)}"\n"
+                        }
+                        {indent}"}"
+                    }
                     if !else_.is_empty() {
                         " else {\n"
                         for stmt in else_ {
@@ -983,25 +1142,7 @@ impl Statement {
                         {indent2}"case "
                         for (i, pattern) in patterns.iter().enumerate() {
                             if i > 0 { ", " }
-                            // If this is an enum switch, use constructor name instead of index
-                            if let Some(constructs) = enum_constructs {
-                                if let Some(construct) = constructs.get(*pattern) {
-                                    {code.get(construct.name)}
-                                    // Add wildcard parameters for constructors with params
-                                    if !construct.params.is_empty() {
-                                        "("
-                                        for (pi, _) in construct.params.iter().enumerate() {
-                                            if pi > 0 { ", " }
-                                            "_"
-                                        }
-                                        ")"
-                                    }
-                                } else {
-                                    {pattern}
-                                }
-                            } else {
-                                {pattern}
-                            }
+                            {format_switch_pattern(pattern, enum_constructs, indent, code, f)}
                         }
                         ":\n"
                         for stmt in stmts {

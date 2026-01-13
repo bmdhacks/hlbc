@@ -21,9 +21,11 @@ petgraph = { workspace = true }
 # Serialization for index files
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }
+# Parallel iteration for batch decompilation
+rayon = { version = "1.10", optional = true }
 
 [features]
 default = []
 alt = []
 alt-graph = ["alt"]
-batch = ["serde", "serde_json"]
+batch = ["serde", "serde_json", "rayon"]

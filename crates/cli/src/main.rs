@@ -89,6 +89,14 @@ struct Args {
     #[clap(long)]
     include_stdlib: bool,
 
+    /// Include metadata files (_natives.hx, _globals.hx, _standalone.hx) that can break recompilation
+    #[clap(long)]
+    include_metadata: bool,
+
+    /// Number of parallel jobs for decompilation (default: number of CPUs)
+    #[clap(short = 'j', long = "jobs")]
+    jobs: Option<usize>,
+
     /// Show verbose progress during decompilation
     #[clap(short, long)]
     verbose: bool,
@@ -209,19 +217,23 @@ fn main() -> anyhow::Result<()> {
             // (they have intrinsic implementations and conflict with Haxe's stdlib)
             let stdlib_patterns = [
                 "$*",           // All internal static type holders ($String, $Std, etc.)
+                "_*.**",        // All underscore-prefixed packages (internal implementations)
                 "haxe.**",      // Haxe standard library
                 "sys.**",       // System library (with package prefix)
                 "hl.**",        // HashLink types (with package prefix)
                 "Std",          // Std class (top-level)
                 "String",       // String class (intrinsic)
                 "StringBuf",    // StringBuf class
+                "StringTools",  // StringTools class
                 "Type",         // Type class (intrinsic)
+                "ValueType",    // ValueType enum
                 "Reflect",      // Reflect class (intrinsic)
                 "Sys",          // Sys class (top-level)
                 "Date",         // Date class
                 "Math",         // Math class (intrinsic)
                 "EReg",         // EReg class
                 "Xml",          // Xml class
+                "Lambda",       // Lambda class
                 "SysError",     // SysError exception type
             ];
             for pattern in stdlib_patterns {
@@ -235,12 +247,16 @@ fn main() -> anyhow::Result<()> {
             include: args.type_filter.clone(),
             exclude,
             verbose: args.verbose,
+            include_metadata: args.include_metadata,
+            jobs: args.jobs,
         };
 
         let decompiler = BatchDecompiler::with_options(&code, batch_opts);
+        let decompile_start = std::time::Instant::now();
         let index = decompiler.decompile_all(output_dir)?;
+        let decompile_time = decompile_start.elapsed();
 
-        println!("Decompilation complete!");
+        println!("Decompilation complete! ({:.2}s)", decompile_time.as_secs_f64());
         println!("  Types: {}", index.types.len());
         println!("  Functions: {}", index.functions.len());
         println!("  Globals: {}", index.globals.len());

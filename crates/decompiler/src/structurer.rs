@@ -11,8 +11,8 @@ use petgraph::graph::NodeIndex;
 use std::collections::{HashMap, HashSet};
 
 use hlbc::opcodes::Opcode;
-use hlbc::types::{Function, Reg, RefFun, RefField, Type};
-use hlbc::{Bytecode, Str};
+use hlbc::types::{Function, Reg, RefFun, RefField, RefString, Type};
+use hlbc::{Bytecode, Resolve, Str};
 
 use crate::analyzer::{CfgAnalysis, NaturalLoop};
 use crate::ast::{Call, Constant, ConstructorCall, Expr, Operation, Statement};
@@ -25,6 +25,30 @@ use crate::ssa::UseDefInfo;
 
 use crate::closure_analysis::ClosureAnalysis;
 use crate::exception_analysis::{ExceptionAnalysis, TryRegion};
+
+/// A detected string switch case
+#[derive(Debug, Clone)]
+struct StringSwitchCase {
+    /// The string literal for this case
+    string_ref: RefString,
+    /// Opcode index of the handler (where JEq jumps to)
+    handler_op: usize,
+}
+
+/// A detected string switch region in bytecode
+#[derive(Debug, Clone)]
+struct StringSwitchRegion {
+    /// First opcode of the switch (the first JNull)
+    start_op: usize,
+    /// Last opcode of the switch pattern (before handlers/default)
+    end_op: usize,
+    /// The register holding the string being switched on
+    switch_arg_reg: Reg,
+    /// All detected cases with their string values and handler targets
+    cases: Vec<StringSwitchCase>,
+    /// Opcode index of the default case handler
+    default_op: usize,
+}
 
 /// Context for structuring
 pub struct Structurer<'a> {
@@ -85,6 +109,8 @@ pub struct Structurer<'a> {
     /// Current SSA source variables (set when processing each opcode)
     /// Used for SSA-versioned naming of source operands
     current_ssa_uses: Vec<SsaVar>,
+    /// Detected string switch regions (from bytecode pattern analysis)
+    string_switches: Vec<StringSwitchRegion>,
 }
 
 impl<'a> Structurer<'a> {
@@ -154,7 +180,206 @@ impl<'a> Structurer<'a> {
             iterator_regs: HashSet::new(),
             current_ssa_dst: None,
             current_ssa_uses: Vec::new(),
+            string_switches: Self::detect_string_switches(code, func),
         }
+    }
+
+    /// Detect string switch patterns in bytecode.
+    /// Pattern per case (9 ops):
+    ///   JNull reg0 -> next_case        // null check
+    ///   Field reg2 = reg0.length
+    ///   Int reg3 = N                   // expected length
+    ///   JNotEq reg2 reg3 -> next_case  // length check
+    ///   Field reg4 = reg0.bytes
+    ///   String reg5 = "literal"        // case string
+    ///   Call3 reg2 = string_compare(...)
+    ///   Int reg3 = 0
+    ///   JEq reg2 reg3 -> handler       // match check
+    fn detect_string_switches(code: &Bytecode, func: &Function) -> Vec<StringSwitchRegion> {
+        let mut switches = Vec::new();
+        let ops = &func.ops;
+
+        if ops.len() < 9 {
+            return switches;
+        }
+
+        let mut i = 0;
+        while i + 8 < ops.len() {
+            // Try to detect a string switch starting at position i
+            if let Some(region) = Self::try_detect_string_switch_at(code, func, i) {
+                let end = region.end_op;
+                switches.push(region);
+                // Skip past this switch
+                i = end + 1;
+            } else {
+                i += 1;
+            }
+        }
+
+        switches
+    }
+
+    /// Try to detect a string switch starting at the given opcode index.
+    /// Returns None if the pattern doesn't match.
+    fn try_detect_string_switch_at(code: &Bytecode, func: &Function, start: usize) -> Option<StringSwitchRegion> {
+        let ops = &func.ops;
+
+        // First case must start with JNull
+        let switch_arg_reg = match &ops[start] {
+            Opcode::JNull { reg, .. } => *reg,
+            _ => return None,
+        };
+
+        let mut cases = Vec::new();
+        let mut pos = start;
+
+        // Collect cases
+        loop {
+            if pos + 8 >= ops.len() {
+                break;
+            }
+
+            // Check for the 9-opcode pattern
+            let case_info = Self::try_parse_string_case(code, func, pos, switch_arg_reg)?;
+
+            cases.push(StringSwitchCase {
+                string_ref: case_info.0,
+                handler_op: case_info.1,
+            });
+
+            // Next case starts at the JNull jump target (or after the JEq)
+            let next_case_start = case_info.2;
+
+            // Check if there's another case starting at next_case_start
+            if next_case_start >= ops.len() {
+                break;
+            }
+
+            // If the next position doesn't start with JNull for the same register, we're done
+            match &ops[next_case_start] {
+                Opcode::JNull { reg, .. } if *reg == switch_arg_reg => {
+                    pos = next_case_start;
+                }
+                _ => {
+                    // This is the default case position
+                    break;
+                }
+            }
+        }
+
+        // Need at least 2 cases to be considered a switch
+        if cases.len() < 2 {
+            return None;
+        }
+
+        // Find the end_op and default_op
+        // The last case's "next case start" points to the default handler
+        let last_case_end = pos + 8; // After the last JEq
+        let default_op = if let Opcode::JNull { offset, .. } = &ops[pos] {
+            // The JNull jumps to the next case or default
+            (pos as isize + *offset as isize + 1) as usize
+        } else {
+            last_case_end + 1
+        };
+
+        Some(StringSwitchRegion {
+            start_op: start,
+            end_op: last_case_end,
+            switch_arg_reg,
+            cases,
+            default_op,
+        })
+    }
+
+    /// Try to parse a single string case at the given position.
+    /// Returns Some((string_ref, handler_op, next_case_start)) if successful.
+    fn try_parse_string_case(
+        code: &Bytecode,
+        func: &Function,
+        pos: usize,
+        expected_arg_reg: Reg,
+    ) -> Option<(RefString, usize, usize)> {
+        let ops = &func.ops;
+
+        if pos + 8 >= ops.len() {
+            return None;
+        }
+
+        // Op 0: JNull reg0 -> next_case
+        let next_case_from_null = match &ops[pos] {
+            Opcode::JNull { reg, offset } if *reg == expected_arg_reg => {
+                (pos as isize + *offset as isize + 1) as usize
+            }
+            _ => return None,
+        };
+
+        // Op 1: Field reg2 = reg0.length
+        match &ops[pos + 1] {
+            Opcode::Field { obj, .. } if *obj == expected_arg_reg => {}
+            _ => return None,
+        }
+
+        // Op 2: Int reg3 = N (expected length)
+        match &ops[pos + 2] {
+            Opcode::Int { .. } => {}
+            _ => return None,
+        }
+
+        // Op 3: JNotEq reg2 reg3 -> next_case
+        match &ops[pos + 3] {
+            Opcode::JNotEq { .. } => {}
+            _ => return None,
+        }
+
+        // Op 4: Field reg4 = reg0.bytes
+        match &ops[pos + 4] {
+            Opcode::Field { obj, .. } if *obj == expected_arg_reg => {}
+            _ => return None,
+        }
+
+        // Op 5: String reg5 = "literal"
+        let string_ref = match &ops[pos + 5] {
+            Opcode::String { ptr, .. } => *ptr,
+            _ => return None,
+        };
+
+        // Op 6: Call3 to string_compare
+        match &ops[pos + 6] {
+            Opcode::Call3 { fun, .. } => {
+                // Verify it's string_compare
+                use hlbc::types::FunPtr;
+                if let FunPtr::Native(native) = code.get(*fun) {
+                    let lib = code.get(native.lib);
+                    let name = code.get(native.name);
+                    if lib != "std" || name != "string_compare" {
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+
+        // Op 7: Int reg3 = 0
+        match &ops[pos + 7] {
+            Opcode::Int { ptr, .. } => {
+                if code.ints[ptr.0] != 0 {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+
+        // Op 8: JEq reg2 reg3 -> handler
+        let handler_op = match &ops[pos + 8] {
+            Opcode::JEq { offset, .. } => {
+                (pos as isize + 8 + *offset as isize + 1) as usize
+            }
+            _ => return None,
+        };
+
+        Some((string_ref, handler_op, next_case_from_null))
     }
 
     /// Build a map from enum globals to their (enum type, constructor index).
@@ -435,6 +660,13 @@ impl<'a> Structurer<'a> {
             return vec![];
         }
 
+        let block_start_op = self.cfg.graph[start].start;
+
+        // Check if this block starts a string switch
+        if let Some(switch_region) = self.string_switches.iter().find(|s| s.start_op == block_start_op).cloned() {
+            return self.structure_string_switch(&switch_region, stop_at);
+        }
+
         // Check if this is a loop header
         if let Some(loop_info) = self.analysis.loops.iter().find(|l| l.header == start).cloned() {
             return self.structure_loop(&loop_info, stop_at);
@@ -469,6 +701,74 @@ impl<'a> Structurer<'a> {
                 stmts
             }
         }
+    }
+
+    /// Structure a detected string switch pattern
+    fn structure_string_switch(
+        &mut self,
+        region: &StringSwitchRegion,
+        _stop_at: Option<NodeIndex>,
+    ) -> Vec<Statement> {
+        // Mark all blocks that contain the switch pattern as processed
+        // But NOT the handler blocks (which might share a block with pattern ops)
+        let handler_ops: std::collections::HashSet<usize> = region.cases.iter()
+            .map(|c| c.handler_op)
+            .chain(std::iter::once(region.default_op))
+            .collect();
+
+        for op_idx in region.start_op..=region.end_op {
+            if let Some(&block) = self.cfg.op_to_block.get(&op_idx) {
+                let block_start = self.cfg.graph[block].start;
+                // Only mark as processed if this block doesn't start a handler
+                if !handler_ops.contains(&block_start) {
+                    self.processed.insert(block);
+                }
+            }
+        }
+
+        // Build the switch argument expression (the string being compared)
+        let switch_arg = self.reg_to_expr(region.switch_arg_reg);
+
+        // Build cases
+        let mut cases = Vec::new();
+        for case in &region.cases {
+            let case_value = Expr::Constant(Constant::String(case.string_ref));
+
+            // Structure the case handler
+            // Find the block that contains the handler opcode
+            let handler_body = if let Some(&handler_block) = self.cfg.op_to_block.get(&case.handler_op) {
+                if !self.processed.contains(&handler_block) {
+                    // Note: structure_from will mark the block as processed
+                    self.structure_from(handler_block, None)
+                } else {
+                    vec![]
+                }
+            } else {
+                // Fallback: structure the handler as a block range
+                self.structure_block_range(case.handler_op, self.func.ops.len())
+            };
+
+            cases.push((vec![case_value], handler_body));
+        }
+
+        // Structure the default case
+        let default_body = if let Some(&default_block) = self.cfg.op_to_block.get(&region.default_op) {
+            if !self.processed.contains(&default_block) {
+                // Note: structure_from will mark the block as processed
+                self.structure_from(default_block, None)
+            } else {
+                vec![]
+            }
+        } else {
+            self.structure_block_range(region.default_op, self.func.ops.len())
+        };
+
+        vec![Statement::Switch {
+            arg: switch_arg,
+            default: default_body,
+            cases,
+            enum_type: None,
+        }]
     }
 
     /// Structure a loop
@@ -803,75 +1103,238 @@ impl<'a> Structurer<'a> {
         }
     }
 
-    /// Structure a conditional
+    /// Check if a block is a simple conditional suitable for chain flattening.
+    /// A block is only a chain candidate if:
+    /// - It has exactly 2 successors (conditional)
+    /// - It's not a loop header
+    /// - It hasn't been processed yet
+    /// - It has no preamble statements (only the conditional jump)
+    fn is_chain_candidate(&self, block: NodeIndex) -> bool {
+        let succs = self.cfg.successors(block);
+        if succs.len() != 2 {
+            return false;
+        }
+        // Avoid loop headers - they need special handling
+        if self.analysis.loops.iter().any(|l| l.header == block) {
+            return false;
+        }
+        if self.processed.contains(&block) {
+            return false;
+        }
+        // Check that the block has no preamble statements
+        // A pure chain block should only contain the conditional jump
+        let block_data = &self.cfg.graph[block];
+        block_data.start == block_data.end
+    }
+
+    /// Structure a branch target, returning statements
+    fn structure_branch(&mut self, target: Option<NodeIndex>, stop_at: Option<NodeIndex>) -> Vec<Statement> {
+        if let Some(t) = target {
+            if Some(t) != stop_at && !self.processed.contains(&t) {
+                self.structure_from(t, stop_at)
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        }
+    }
+
+    /// Structure a conditional - collects if-else-if chains iteratively
     fn structure_conditional(
         &mut self,
         block: NodeIndex,
         _succs: &[NodeIndex],
         stop_at: Option<NodeIndex>,
     ) -> Vec<Statement> {
-        let block_data = &self.cfg.graph[block];
-        let last_op = &self.func.ops[block_data.end];
+        // Collect the if-else-if chain iteratively
+        let mut chain: Vec<(Expr, Vec<Statement>)> = vec![];
+        let mut current_block = Some(block);
+        let mut final_merge: Option<NodeIndex> = None;
+        let mut is_first = true;
 
-        // Set SSA context for the conditional jump opcode
-        self.current_op = block_data.end;
-        if let Some((ssa_dst, ssa_uses)) = self.ssa.get_instr_for_op(block_data.end) {
-            self.current_ssa_dst = ssa_dst;
-            self.current_ssa_uses = ssa_uses.clone();
-        } else {
-            self.current_ssa_dst = None;
-            self.current_ssa_uses.clear();
+        self.scope_depth += 1;
+
+        while let Some(blk) = current_block {
+            // Skip processed check for first block - structure_from already marked it
+            if !is_first && self.processed.contains(&blk) {
+                break;
+            }
+            is_first = false;
+
+            let block_data = &self.cfg.graph[blk];
+            let last_op = &self.func.ops[block_data.end];
+
+            // Set SSA context for the conditional jump opcode
+            self.current_op = block_data.end;
+            if let Some((ssa_dst, ssa_uses)) = self.ssa.get_instr_for_op(block_data.end) {
+                self.current_ssa_dst = ssa_dst;
+                self.current_ssa_uses = ssa_uses.clone();
+            } else {
+                self.current_ssa_dst = None;
+                self.current_ssa_uses.clear();
+            }
+
+            let (condition, then_target, else_target) = self.extract_condition(block_data.end, last_op);
+
+            // Find merge point for this conditional
+            let merge = self.find_merge_point(then_target, else_target);
+            if final_merge.is_none() {
+                final_merge = merge;
+            }
+
+            // Mark this block as processed
+            self.processed.insert(blk);
+
+            // Check if this is a NotEq pattern (used in if-else-if chains compiled from Haxe)
+            // For JNotEq: then_target = next case (jump), else_target = case body (fallthrough)
+            // We need to invert: case body is else, continue chain with then
+            let is_not_eq = matches!(&condition, Expr::Op(Operation::NotEq(_, _)));
+
+            if is_not_eq {
+                // NotEq pattern: case body is in else branch, next case is in then branch
+                // Convert NotEq(x, c) to Eq(x, c) for switch analysis
+                let eq_condition = if let Expr::Op(Operation::NotEq(a, b)) = &condition {
+                    Expr::Op(Operation::Eq(a.clone(), b.clone()))
+                } else {
+                    condition.clone()
+                };
+
+                // For NotEq chains, find the real merge point by looking at where
+                // the case body jumps to (via JAlways). This is where all cases converge.
+                let chain_merge = if let Some(e) = else_target {
+                    // Case body block's single successor (via JAlways) is the merge
+                    let case_succs = self.cfg.successors(e);
+                    if case_succs.len() == 1 {
+                        Some(case_succs[0])
+                    } else {
+                        merge
+                    }
+                } else {
+                    merge
+                };
+
+                // Update final_merge if we found a better one
+                if final_merge.is_none() && chain_merge.is_some() {
+                    final_merge = chain_merge;
+                }
+
+                // Structure the case body (else branch for NotEq), stopping at merge
+                let case_stmts = self.structure_branch(else_target, chain_merge);
+                chain.push((eq_condition, case_stmts));
+
+                // Check if the then branch (next conditional) can continue the chain
+                if let Some(t) = then_target {
+                    if Some(t) != chain_merge && self.is_chain_candidate(t) {
+                        current_block = Some(t);
+                        continue;
+                    }
+                }
+
+                // Then branch is not a chain candidate - it becomes the else/default
+                // Use chain_merge (not original merge) to stop at the correct point
+                let else_stmts = self.structure_branch(then_target, chain_merge);
+
+                self.scope_depth -= 1;
+
+                // Build result
+                let result = if let Some((switch_arg, cases)) = self.analyze_for_switch(&chain) {
+                    vec![Statement::Switch {
+                        arg: switch_arg,
+                        default: else_stmts,
+                        cases,
+                        enum_type: None,
+                    }]
+                } else if chain.len() > 1 {
+                    vec![Statement::IfElseChain {
+                        branches: chain,
+                        else_: else_stmts,
+                    }]
+                } else {
+                    let (cond, then_stmts) = chain.pop().unwrap();
+                    vec![Statement::IfElse {
+                        cond,
+                        if_: then_stmts,
+                        else_: else_stmts,
+                    }]
+                };
+
+                let mut full_result = result;
+                if let Some(m) = final_merge {
+                    if Some(m) != stop_at && !self.processed.contains(&m) {
+                        full_result.extend(self.structure_from(m, stop_at));
+                    }
+                }
+                return full_result;
+            }
+
+            // Standard pattern: case body is in then branch
+            let then_stmts = self.structure_branch(then_target, merge);
+
+            chain.push((condition, then_stmts));
+
+            // Check if the else branch is another simple conditional we can chain
+            if let Some(e) = else_target {
+                if Some(e) != merge && self.is_chain_candidate(e) {
+                    // Continue the chain with this block
+                    current_block = Some(e);
+                    continue;
+                }
+            }
+
+            // Else branch is not a simple conditional - structure it and end chain
+            let else_stmts = self.structure_branch(else_target, merge);
+
+            self.scope_depth -= 1;
+
+            // Build the result based on chain analysis
+            let result = if let Some((switch_arg, cases)) = self.analyze_for_switch(&chain) {
+                // Chain matches switch pattern - emit switch statement
+                vec![Statement::Switch {
+                    arg: switch_arg,
+                    default: else_stmts,
+                    cases,
+                    enum_type: None,
+                }]
+            } else if chain.len() > 1 {
+                // Use flat IfElseChain for multiple conditions
+                vec![Statement::IfElseChain {
+                    branches: chain,
+                    else_: else_stmts,
+                }]
+            } else {
+                // Single conditional - use regular IfElse
+                let (cond, then_stmts) = chain.pop().unwrap();
+                vec![Statement::IfElse {
+                    cond,
+                    if_: then_stmts,
+                    else_: else_stmts,
+                }]
+            };
+
+            // Continue after merge
+            let mut full_result = result;
+            if let Some(m) = final_merge {
+                if Some(m) != stop_at && !self.processed.contains(&m) {
+                    full_result.extend(self.structure_from(m, stop_at));
+                }
+            }
+
+            return full_result;
         }
 
-        let (condition, then_target, else_target) = self.extract_condition(block_data.end, last_op);
-
-        // Find merge point
-        let merge = self.find_merge_point(then_target, else_target);
-
-        // Structure branches (increment scope depth for block scoping)
-        self.scope_depth += 1;
-        let mut then_stmts = if let Some(t) = then_target {
-            if Some(t) != merge && !self.processed.contains(&t) {
-                self.structure_from(t, merge)
-            } else {
-                vec![]
-            }
-        } else {
-            vec![]
-        };
-
-        let mut else_stmts = if let Some(e) = else_target {
-            if Some(e) != merge && !self.processed.contains(&e) {
-                self.structure_from(e, merge)
-            } else {
-                vec![]
-            }
-        } else {
-            vec![]
-        };
         self.scope_depth -= 1;
 
-        // φ-elimination: insert assignments at branch ends for merge point φ-functions
-        if let Some(merge_node) = merge {
-            let phi_assignments = self.get_phi_assignments_for_merge(merge_node, then_target, else_target);
-            then_stmts.extend(phi_assignments.0);
-            else_stmts.extend(phi_assignments.1);
+        // Edge case: loop ended without producing result (shouldn't happen normally)
+        if chain.is_empty() {
+            return vec![];
         }
 
-        let mut result = vec![Statement::IfElse {
-            cond: condition,
-            if_: then_stmts,
-            else_: else_stmts,
-        }];
-
-        // Continue after merge
-        if let Some(m) = merge {
-            if Some(m) != stop_at && !self.processed.contains(&m) {
-                result.extend(self.structure_from(m, stop_at));
-            }
-        }
-
-        result
+        // Build result from accumulated chain
+        vec![Statement::IfElseChain {
+            branches: chain,
+            else_: vec![],
+        }]
     }
 
     /// Extract condition from a conditional jump
@@ -978,6 +1441,209 @@ impl<'a> Structurer<'a> {
         if a_succs.contains(&b) { Some(b) }
         else if b_succs.contains(&a) { Some(a) }
         else { None }
+    }
+
+    /// Analyze an if-else-if chain to see if it can be converted to a switch statement.
+    /// Returns Some((switch_arg, cases)) if the chain matches the switch pattern.
+    ///
+    /// Switch pattern criteria:
+    /// - All conditions are equality tests: Eq(X, C) or Eq(C, X)
+    /// - X is the same expression in all conditions (the switch argument)
+    /// - C is a constant (Int, String, Bool, or enum constructor)
+    fn analyze_for_switch(
+        &self,
+        chain: &[(Expr, Vec<Statement>)],
+    ) -> Option<(Expr, Vec<(Vec<Expr>, Vec<Statement>)>)> {
+        // Need at least 3 conditions to make a switch worthwhile
+        if chain.len() < 3 {
+            return None;
+        }
+
+        let mut switch_arg: Option<Expr> = None;
+        let mut cases = Vec::new();
+
+        for (cond, body) in chain {
+            let (arg, case_val) = self.extract_equality_pattern(cond)?;
+
+            if let Some(ref existing) = switch_arg {
+                // Check if the argument matches the existing switch argument
+                if !self.exprs_structurally_equal(existing, &arg) {
+                    return None;
+                }
+            } else {
+                switch_arg = Some(arg);
+            }
+
+            cases.push((vec![case_val], body.clone()));
+        }
+
+        Some((switch_arg?, cases))
+    }
+
+    /// Extract an equality pattern from a condition expression.
+    /// Returns Some((arg, case_value)) where case_value is a constant.
+    /// Note: NotEq patterns are converted to Eq during chain collection.
+    fn extract_equality_pattern(&self, cond: &Expr) -> Option<(Expr, Expr)> {
+        match cond {
+            Expr::Op(Operation::Eq(a, b)) => {
+                // First, check if one side is a simple constant (integer, string literal, etc.)
+                if self.is_switch_case_constant(b) {
+                    return Some((*a.clone(), *b.clone()));
+                } else if self.is_switch_case_constant(a) {
+                    return Some((*b.clone(), *a.clone()));
+                }
+
+                // If not a simple constant, try string comparison pattern:
+                // Eq(Variable(result), Variable(zero))
+                // where result = string_compare(bytes, string_literal, len) and zero = 0
+                if let (Expr::Variable(reg_a, _), Expr::Variable(reg_b, _)) = (a.as_ref(), b.as_ref()) {
+                    if let Some(result) = self.try_extract_string_compare_pattern(*reg_a, *reg_b) {
+                        return Some(result);
+                    }
+                    if let Some(result) = self.try_extract_string_compare_pattern(*reg_b, *reg_a) {
+                        return Some(result);
+                    }
+                }
+
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Try to extract a string comparison pattern from two register references.
+    /// Returns Some((switch_arg, string_constant)) if reg_result was defined by
+    /// string_compare(bytes, string_literal, len) and reg_zero was defined as 0.
+    fn try_extract_string_compare_pattern(&self, reg_result: Reg, reg_zero: Reg) -> Option<(Expr, Expr)> {
+        // Find SSA variables for these registers
+        let result_var = self.find_ssa_use(reg_result)?;
+        let zero_var = self.find_ssa_use(reg_zero)?;
+
+        // Find defining opcodes
+        let result_def_idx = self.ssa.find_def(result_var)?;
+        let zero_def_idx = self.ssa.find_def(zero_var)?;
+
+        // Check if zero_def is Int with value 0
+        let zero_op = &self.func.ops[zero_def_idx];
+        let is_zero = if let Opcode::Int { ptr, .. } = zero_op {
+            // Look up the actual integer value
+            self.code.ints[ptr.0] == 0
+        } else {
+            false
+        };
+        if !is_zero {
+            return None;
+        }
+
+        // Check if result_def is Call3 to string_compare
+        let result_op = &self.func.ops[result_def_idx];
+        if let Opcode::Call3 { fun, arg1, .. } = result_op {
+            // Check if this is a call to string_compare
+            if self.is_string_compare_function(*fun) {
+                // arg1 is the string literal bytes - look up what it was assigned from
+                // The pattern is: String reg = "literal"; then reg.bytes is passed
+                // We need to find the String opcode that defined the value in arg1
+                if let Some(string_val) = self.find_string_literal_for_bytes(*arg1, result_def_idx) {
+                    // The switch argument is the original string being compared
+                    // (typically from a field access like obj.id)
+                    // For now, just return a placeholder - the actual switch arg detection
+                    // would need to trace back further
+                    return Some((
+                        Expr::Variable(reg_result, Some("stringArg".into())),
+                        Expr::Constant(Constant::String(string_val)),
+                    ));
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Check if a function reference is for string_compare
+    fn is_string_compare_function(&self, fun: RefFun) -> bool {
+        use hlbc::types::FunPtr;
+        if let FunPtr::Native(native) = self.code.get(fun) {
+            // Check for std.string_compare native
+            let lib = self.code.get(native.lib);
+            let name = self.code.get(native.name);
+            lib == "std" && name == "string_compare"
+        } else {
+            false
+        }
+    }
+
+    /// Find the string literal that was passed to string_compare.
+    /// Searches backwards from call_idx to find the String opcode that defined bytes_reg.
+    fn find_string_literal_for_bytes(&self, bytes_reg: Reg, call_idx: usize) -> Option<RefString> {
+        // Search backwards from the call to find where bytes_reg was defined
+        for i in (0..call_idx).rev() {
+            let op = &self.func.ops[i];
+            if let Opcode::String { dst, ptr } = op {
+                if *dst == bytes_reg {
+                    return Some(*ptr);
+                }
+            }
+            // If we see bytes_reg being written to by something else, stop
+            if get_opcode_dst(op).map_or(false, |d| d == bytes_reg) {
+                break;
+            }
+        }
+        None
+    }
+
+    /// Check if an expression is a valid switch case constant
+    fn is_switch_case_constant(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Constant(c) => matches!(
+                c,
+                Constant::Int(_)
+                | Constant::InlineInt(_)
+                | Constant::String(_)
+                | Constant::Bool(_)
+            ),
+            _ => false,
+        }
+    }
+
+    /// Check if two expressions are structurally equal (for switch arg comparison)
+    fn exprs_structurally_equal(&self, a: &Expr, b: &Expr) -> bool {
+        match (a, b) {
+            (Expr::Variable(ra, _), Expr::Variable(rb, _)) => ra == rb,
+            (Expr::Constant(ca), Expr::Constant(cb)) => self.constants_equal(ca, cb),
+            (Expr::Field(obj_a, field_a), Expr::Field(obj_b, field_b)) => {
+                field_a == field_b && self.exprs_structurally_equal(obj_a, obj_b)
+            }
+            (Expr::Call(call_a), Expr::Call(call_b)) => {
+                // For calls, compare function and arguments
+                if !self.exprs_structurally_equal(&call_a.fun, &call_b.fun)
+                    || call_a.args.len() != call_b.args.len()
+                {
+                    return false;
+                }
+                call_a.args.iter().zip(call_b.args.iter())
+                    .all(|(a, b)| self.exprs_structurally_equal(a, b))
+            }
+            (Expr::Op(op_a), Expr::Op(op_b)) => {
+                // Simple operation comparison - just check if they're the same variant
+                // This is a conservative check
+                std::mem::discriminant(op_a) == std::mem::discriminant(op_b)
+            }
+            _ => false,
+        }
+    }
+
+    /// Check if two constants are equal
+    fn constants_equal(&self, a: &Constant, b: &Constant) -> bool {
+        match (a, b) {
+            (Constant::Int(ia), Constant::Int(ib)) => ia == ib,
+            (Constant::InlineInt(ia), Constant::InlineInt(ib)) => ia == ib,
+            (Constant::Float(fa), Constant::Float(fb)) => fa == fb,
+            (Constant::String(sa), Constant::String(sb)) => sa == sb,
+            (Constant::Bool(ba), Constant::Bool(bb)) => ba == bb,
+            (Constant::Null, Constant::Null) => true,
+            (Constant::This, Constant::This) => true,
+            _ => false,
+        }
     }
 
     /// Get φ-elimination assignments for a merge point
@@ -1093,7 +1759,7 @@ impl<'a> Structurer<'a> {
         };
 
         // Structure each case target
-        let mut cases: Vec<(Vec<usize>, Vec<Statement>)> = Vec::new();
+        let mut cases: Vec<(Vec<Expr>, Vec<Statement>)> = Vec::new();
         let mut processed_targets: HashSet<usize> = HashSet::new();
 
         // Sort case values for deterministic output
@@ -1105,6 +1771,12 @@ impl<'a> Structurer<'a> {
                 continue;
             }
             processed_targets.insert(target_op);
+
+            // Convert integer case values to expressions
+            let case_exprs: Vec<Expr> = case_vals
+                .iter()
+                .map(|&v| Expr::Constant(Constant::InlineInt(v)))
+                .collect();
 
             // Skip default case target if it's also a case target
             if target_op == default_op {
@@ -1118,7 +1790,7 @@ impl<'a> Structurer<'a> {
                 } else {
                     vec![]
                 };
-                cases.push((case_vals, stmts));
+                cases.push((case_exprs, stmts));
                 continue;
             }
 
@@ -1132,7 +1804,7 @@ impl<'a> Structurer<'a> {
                 vec![]
             };
 
-            cases.push((case_vals, stmts));
+            cases.push((case_exprs, stmts));
         }
         self.scope_depth -= 1;
 
@@ -1185,7 +1857,7 @@ impl<'a> Structurer<'a> {
         // Process all case statements (process default FIRST since it has the declarations)
         let default_stmts = process_case_stmts(default_stmts, &mut hoisted_names, &mut hoisted_decls);
 
-        let cases: Vec<(Vec<usize>, Vec<Statement>)> = cases
+        let cases: Vec<(Vec<Expr>, Vec<Statement>)> = cases
             .into_iter()
             .map(|(vals, stmts)| (vals, process_case_stmts(stmts, &mut hoisted_names, &mut hoisted_decls)))
             .collect();
@@ -3288,6 +3960,11 @@ fn is_var_used_in_stmt(reg: &Reg, stmt: &Statement) -> bool {
             is_var_used_in_expr(reg, arg)
                 || default.iter().any(|s| is_var_used_in_stmt(reg, s))
                 || cases.iter().any(|(_, body)| body.iter().any(|s| is_var_used_in_stmt(reg, s)))
+        }
+        Statement::IfElseChain { branches, else_ } => {
+            branches.iter().any(|(cond, body)| {
+                is_var_used_in_expr(reg, cond) || body.iter().any(|s| is_var_used_in_stmt(reg, s))
+            }) || else_.iter().any(|s| is_var_used_in_stmt(reg, s))
         }
         Statement::Comment(_) | Statement::Break | Statement::Continue | Statement::VarDecl { .. } => false,
     }

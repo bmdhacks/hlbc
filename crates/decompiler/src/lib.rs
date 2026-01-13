@@ -187,17 +187,38 @@ pub fn decompile_code_with_closures(
     // Pass 6: Post-processing transformations
     post::reconstruct_array_literals(code, &mut stmts);
 
-    // Pass 7: Inline single-use variables to reduce verbosity
+    // Pass 7: Iterative optimization loop
+    // Multiple passes can enable each other (e.g., inverting empty ifs can expose early return patterns)
+    const MAX_OPT_ITERATIONS: usize = 10;
+    for _ in 0..MAX_OPT_ITERATIONS {
+        let mut changed = false;
+
+        // Invert empty if bodies: if (c) {} else { body } → if (!c) { body }
+        if post::invert_empty_ifs(&mut stmts) {
+            changed = true;
+        }
+
+        // Flatten early returns: if (x) { return; } else { body } → if (x) { return; } body
+        if post::flatten_early_returns(&mut stmts) {
+            changed = true;
+        }
+
+        // Condense if/else returns to ternary expressions
+        post::condense_ternary_returns(&mut stmts);
+
+        if !changed {
+            break;
+        }
+    }
+
+    // Pass 8: Inline single-use variables to reduce verbosity
     post::inline_single_use_vars(&mut stmts);
 
-    // Pass 8: Merge forward declarations with first assignments
+    // Pass 9: Merge forward declarations with first assignments
     post::merge_declarations(&mut stmts);
 
-    // Pass 9: Inline constants that are immediately returned
+    // Pass 10: Inline constants that are immediately returned
     post::inline_constant_returns(&mut stmts);
-
-    // Pass 10: Condense if/else returns to ternary expressions
-    post::condense_ternary_returns(&mut stmts);
 
     // Pass 11: Remove unused forward declarations
     post::remove_unused_var_decls(&mut stmts);

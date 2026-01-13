@@ -574,6 +574,7 @@ dependencies = [
  "fmtools",
  "hlbc",
  "petgraph",
+ "rayon",
  "serde",
  "serde_json",
 ]

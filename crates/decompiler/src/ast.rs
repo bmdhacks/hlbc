@@ -350,11 +350,18 @@ pub enum Statement {
         /// Else clause if the vec isn't empty
         else_: Vec<Statement>,
     },
+    /// Flat if-else-if chain (avoids deep recursion for long chains)
+    IfElseChain {
+        /// Conditions and their bodies: [(cond1, body1), (cond2, body2), ...]
+        branches: Vec<(Expr, Vec<Statement>)>,
+        /// Final else body (may be empty)
+        else_: Vec<Statement>,
+    },
     Switch {
         arg: Expr,
         default: Vec<Statement>,
-        /// Cases with potentially combined patterns (e.g., case 0, 1, 2:)
-        cases: Vec<(Vec<usize>, Vec<Statement>)>,
+        /// Cases with expression patterns (e.g., case 0, 1, 2: or case "foo", "bar":)
+        cases: Vec<(Vec<Expr>, Vec<Statement>)>,
         /// If this switch is on an enum constructor index, the enum type for lookup
         enum_type: Option<RefType>,
     },

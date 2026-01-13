@@ -1,6 +1,6 @@
 use hlbc::{Bytecode, Str};
 
-use crate::ast::{add, Constant, ConstructorCall, Expr, Operation, Statement};
+use crate::ast::{add, not, Constant, ConstructorCall, Expr, Operation, Statement};
 use crate::call_fun;
 
 pub(crate) trait AstVisitor {
@@ -47,6 +47,13 @@ pub(crate) fn visit(
             Statement::IfElse { cond, if_, else_ } => {
                 v!(cond);
                 rec!(if_);
+                rec!(else_);
+            }
+            Statement::IfElseChain { branches, else_ } => {
+                for (cond, body) in branches {
+                    v!(cond);
+                    rec!(body);
+                }
                 rec!(else_);
             }
             Statement::Switch {
@@ -2221,4 +2228,145 @@ fn collect_var_names_in_expr(expr: &Expr, used: &mut std::collections::HashSet<S
         Expr::Cast(inner, _) => collect_var_names_in_expr(inner, used),
         _ => {}
     }
+}
+
+/// Check if a statement is a terminating statement (return, throw, break, continue)
+fn is_terminating(stmt: &Statement) -> bool {
+    matches!(stmt, Statement::Return(_) | Statement::Throw(_) | Statement::Break | Statement::Continue)
+}
+
+/// Check if a block of statements ends with a terminating statement
+fn ends_with_terminator(stmts: &[Statement]) -> bool {
+    stmts.last().map(is_terminating).unwrap_or(false)
+}
+
+/// Flatten early returns: `if (x) { return; } else { body }` → `if (x) { return; } body`
+/// This removes unnecessary else blocks after terminating statements.
+/// Returns true if any changes were made.
+pub fn flatten_early_returns(stmts: &mut Vec<Statement>) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+
+    while i < stmts.len() {
+        // First, recursively process nested statements
+        match &mut stmts[i] {
+            Statement::IfElse { if_, else_, .. } => {
+                if flatten_early_returns(if_) {
+                    changed = true;
+                }
+                if flatten_early_returns(else_) {
+                    changed = true;
+                }
+            }
+            Statement::While { stmts: inner, .. } => {
+                if flatten_early_returns(inner) {
+                    changed = true;
+                }
+            }
+            Statement::Switch { default, cases, .. } => {
+                if flatten_early_returns(default) {
+                    changed = true;
+                }
+                for (_, case_stmts) in cases.iter_mut() {
+                    if flatten_early_returns(case_stmts) {
+                        changed = true;
+                    }
+                }
+            }
+            Statement::TryCatch { try_stmts, catch_stmts, .. } => {
+                if flatten_early_returns(try_stmts) {
+                    changed = true;
+                }
+                if flatten_early_returns(catch_stmts) {
+                    changed = true;
+                }
+            }
+            Statement::Block { stmts: inner } | Statement::Sequence { stmts: inner } => {
+                if flatten_early_returns(inner) {
+                    changed = true;
+                }
+            }
+            _ => {}
+        }
+
+        // Now check if this is an if-else where if ends with terminator
+        if let Statement::IfElse { if_, else_, .. } = &mut stmts[i] {
+            if ends_with_terminator(if_) && !else_.is_empty() {
+                // Extract else statements and insert them after the if
+                let else_stmts = std::mem::take(else_);
+                let insert_pos = i + 1;
+                for (j, stmt) in else_stmts.into_iter().enumerate() {
+                    stmts.insert(insert_pos + j, stmt);
+                }
+                changed = true;
+                // Don't increment i, re-process the newly inserted statements
+                continue;
+            }
+        }
+
+        i += 1;
+    }
+
+    changed
+}
+
+/// Invert empty if bodies: `if (c) {} else { body }` → `if (!c) { body }`
+/// This produces cleaner output for guard-style conditionals.
+/// Returns true if any changes were made.
+pub fn invert_empty_ifs(stmts: &mut Vec<Statement>) -> bool {
+    let mut changed = false;
+
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            Statement::IfElse { cond, if_, else_ } => {
+                // Recursively process nested statements first
+                if invert_empty_ifs(if_) {
+                    changed = true;
+                }
+                if invert_empty_ifs(else_) {
+                    changed = true;
+                }
+
+                // If the if-body is empty and else-body is not, invert
+                if if_.is_empty() && !else_.is_empty() {
+                    // Replace cond with its negation
+                    let old_cond = std::mem::replace(cond, Expr::Constant(Constant::Null));
+                    *cond = not(old_cond);
+                    std::mem::swap(if_, else_);
+                    changed = true;
+                }
+            }
+            Statement::While { stmts, .. } => {
+                if invert_empty_ifs(stmts) {
+                    changed = true;
+                }
+            }
+            Statement::Switch { default, cases, .. } => {
+                if invert_empty_ifs(default) {
+                    changed = true;
+                }
+                for (_, case_stmts) in cases.iter_mut() {
+                    if invert_empty_ifs(case_stmts) {
+                        changed = true;
+                    }
+                }
+            }
+            Statement::TryCatch { try_stmts, catch_stmts, .. } => {
+                if invert_empty_ifs(try_stmts) {
+                    changed = true;
+                }
+                if invert_empty_ifs(catch_stmts) {
+                    changed = true;
+                }
+            }
+            Statement::Block { stmts } | Statement::Sequence { stmts } => {
+                if invert_empty_ifs(stmts) {
+                    changed = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    changed
 }
