@@ -72,6 +72,28 @@ pub struct Structurer<'a> {
     /// Enum global -> (enum type, constructor index) mapping
     /// Built by analyzing the entry point function's enum initialization pattern
     enum_global_map: HashMap<hlbc::types::RefGlobal, (RefType, usize)>,
+    /// String conversion sources: maps length output reg -> original value expression
+    /// Used to track ftos/itos/dtos(value, ref_out) where ref_out points to length_reg
+    /// When __alloc__(bytes, length_reg) is seen, we can use the original value expression
+    /// We store Expr (not Reg) to capture the correct SSA-versioned name at conversion time
+    string_conversion_source: HashMap<Reg, Expr>,
+    /// Ref targets: maps ref reg -> target reg (for Ref dst = &src)
+    ref_targets: HashMap<Reg, Reg>,
+    /// Renamed registers: maps (reg, opcode index) -> new name
+    /// Used when we need to give a register a different name to avoid type conflicts
+    renamed_regs: HashMap<Reg, Str>,
+    /// Registers that should use raw names (rN) instead of debug names
+    /// to avoid type conflicts (e.g., iterator vs iteration value)
+    use_raw_name_regs: HashSet<Reg>,
+    /// Registers that hold iterators (from .keys() or .iterator() calls)
+    /// Used to detect when these are later reassigned to non-iterator values
+    iterator_regs: HashSet<Reg>,
+    /// Current SSA destination variable (set when processing each opcode)
+    /// Used for SSA-versioned naming
+    current_ssa_dst: Option<SsaVar>,
+    /// Current SSA source variables (set when processing each opcode)
+    /// Used for SSA-versioned naming of source operands
+    current_ssa_uses: Vec<SsaVar>,
 }
 
 impl<'a> Structurer<'a> {
@@ -138,6 +160,13 @@ impl<'a> Structurer<'a> {
             array_bytes_source: HashMap::new(),
             shifted_indices: HashMap::new(),
             enum_global_map: Self::build_enum_global_map(code),
+            string_conversion_source: HashMap::new(),
+            ref_targets: HashMap::new(),
+            renamed_regs: HashMap::new(),
+            use_raw_name_regs: HashSet::new(),
+            iterator_regs: HashSet::new(),
+            current_ssa_dst: None,
+            current_ssa_uses: Vec::new(),
         }
     }
 
@@ -248,6 +277,20 @@ impl<'a> Structurer<'a> {
     /// IMPORTANT: Variables are only declared (with `var`) at scope depth 0 to avoid
     /// scoping issues where a variable declared inside a loop is not visible outside.
     fn make_assign(&mut self, variable: Expr, assign: Expr) -> Statement {
+        // Check for self-assignment (x = x) where different registers map to the same name
+        // This can happen when SSA/variable naming gives multiple registers the same name
+        let is_self_assign = match (&variable, &assign) {
+            (Expr::Variable(_, Some(lhs)), Expr::Variable(_, Some(rhs))) => lhs == rhs,
+            (Expr::Ident(lhs), Expr::Ident(rhs)) => lhs == rhs,
+            (Expr::Variable(_, Some(lhs)), Expr::Ident(rhs)) => lhs == rhs,
+            (Expr::Ident(lhs), Expr::Variable(_, Some(rhs))) => lhs == rhs,
+            _ => false,
+        };
+        if is_self_assign {
+            // Return a no-op comment statement instead of self-assignment
+            return Statement::Comment("// self-assign elided".into());
+        }
+
         // Extract variable name to check if it's been declared
         // ONLY simple variables can have declarations (var x = ...)
         // Field access, array index, etc. are NEVER declarations
@@ -751,6 +794,11 @@ impl<'a> Structurer<'a> {
         // For nested regions, catch body is inside outer region's try body
         let catch_end = outer_end;
 
+        // Mark the exception register to use raw names in the catch body
+        // This ensures uses of the caught exception match the catch parameter name
+        // (prevents SSA versioning from creating mismatched names like `catch (r0)` vs `r0_1`)
+        self.use_raw_name_regs.insert(region.exc_reg);
+
         self.scope_depth += 1;
         let catch_stmts = self.structure_opcode_range(
             region.handler_op,
@@ -948,6 +996,16 @@ impl<'a> Structurer<'a> {
         let block_data = &self.cfg.graph[block];
         let last_op = &self.func.ops[block_data.end];
 
+        // Set SSA context for the conditional jump opcode
+        self.current_op = block_data.end;
+        if let Some((ssa_dst, ssa_uses)) = self.ssa.get_instr_for_op(block_data.end) {
+            self.current_ssa_dst = ssa_dst;
+            self.current_ssa_uses = ssa_uses.clone();
+        } else {
+            self.current_ssa_dst = None;
+            self.current_ssa_uses.clear();
+        }
+
         let (condition, then_target, else_target) = self.extract_condition(block_data.end, last_op);
 
         // Find merge point
@@ -1119,7 +1177,9 @@ impl<'a> Structurer<'a> {
         if let Some(ssa_block) = self.ssa.blocks.get(&merge) {
             for phi in &ssa_block.phis {
                 if let SsaInstr::Phi { dst, sources } = phi {
-                    // Use register name for phi destination (consistent with how we name vars)
+                    // Use register name for phi destination (non-SSA-versioned)
+                    // For same-register phis, we use the debug name if available
+                    // This allows the value to "flow through" without explicit assignments
                     let dst_name = self.reg_name(dst.reg);
                     let dst_expr = Expr::Variable(dst.reg, Some(dst_name.clone()));
 
@@ -1127,7 +1187,7 @@ impl<'a> Structurer<'a> {
                     if let Some(then_node) = then_pred {
                         if let Some((_, src_var)) = sources.iter().find(|(pred, _)| *pred == then_node) {
                             // Skip if source is same register as destination (self-assignment)
-                            // This happens because phi merges different versions of same register
+                            // This is the common case for same-register phis - the value flows through
                             if src_var.reg != dst.reg {
                                 let src_name = self.reg_name(src_var.reg);
                                 let src_expr = Expr::Variable(src_var.reg, Some(src_name));
@@ -1174,6 +1234,15 @@ impl<'a> Structurer<'a> {
         };
 
         let switch_op_idx = block_data.end;
+        // Set SSA context for the switch opcode so reg_to_expr uses SSA-versioned names
+        self.current_op = switch_op_idx;
+        if let Some((ssa_dst, ssa_uses)) = self.ssa.get_instr_for_op(switch_op_idx) {
+            self.current_ssa_dst = ssa_dst;
+            self.current_ssa_uses = ssa_uses.clone();
+        } else {
+            self.current_ssa_dst = None;
+            self.current_ssa_uses.clear();
+        }
         let switch_arg = self.reg_to_expr(switch_reg);
 
         // Group cases by their target opcode
@@ -1535,6 +1604,15 @@ impl<'a> Structurer<'a> {
     fn opcode_to_statement(&mut self, op_idx: usize) -> Option<Statement> {
         let op = &self.func.ops[op_idx];
 
+        // Set SSA context for this opcode - enables SSA-versioned naming
+        if let Some((ssa_dst, ssa_uses)) = self.ssa.get_instr_for_op(op_idx) {
+            self.current_ssa_dst = ssa_dst;
+            self.current_ssa_uses = ssa_uses.clone();
+        } else {
+            self.current_ssa_dst = None;
+            self.current_ssa_uses.clear();
+        }
+
         match op {
             Opcode::Label | Opcode::Nop => None,
             // Control flow opcodes - handled by structuring, not statement generation
@@ -1555,12 +1633,49 @@ impl<'a> Structurer<'a> {
                 if dst == src {
                     return None;
                 }
+                // If the destination held an iterator and we're assigning from a non-iterator,
+                // switch to raw register names to avoid type conflicts
+                let dst_was_iterator = self.iterator_regs.contains(dst);
+                let src_is_iterator = self.iterator_regs.contains(src);
+                if dst_was_iterator && !src_is_iterator {
+                    // Use raw register name for this and future uses
+                    self.iterator_regs.remove(dst);
+                    self.use_raw_name_regs.insert(*dst);
+                    let raw_name: Str = format!("r{}", dst.0).into();
+                    let var = Expr::Variable(*dst, Some(raw_name.clone()));
+                    let expr = self.reg_to_expr(*src);
+                    // Hoist to function level so it's available outside the loop
+                    self.hoisted_vars.insert(raw_name.clone());
+                    self.declared_vars.insert(raw_name);
+                    return Some(Statement::Assign {
+                        declaration: false, // Declaration is hoisted to function level
+                        variable: var,
+                        assign: expr,
+                    });
+                }
                 let var = self.reg_to_expr_dst(*dst);
                 let expr = self.reg_to_expr(*src);
                 Some(self.make_assign(var, expr))
             }
 
             Opcode::Int { dst, ptr } => {
+                // If the destination held an iterator and we're assigning a constant,
+                // switch to raw register names to avoid type conflicts
+                if self.iterator_regs.contains(dst) {
+                    self.iterator_regs.remove(dst);
+                    self.use_raw_name_regs.insert(*dst);
+                    let raw_name: Str = format!("r{}", dst.0).into();
+                    let var = Expr::Variable(*dst, Some(raw_name.clone()));
+                    let val = Expr::Constant(Constant::Int(*ptr));
+                    // Hoist to function level so it's available outside the loop
+                    self.hoisted_vars.insert(raw_name.clone());
+                    self.declared_vars.insert(raw_name);
+                    return Some(Statement::Assign {
+                        declaration: false, // Declaration is hoisted to function level
+                        variable: var,
+                        assign: val,
+                    });
+                }
                 let var = self.reg_to_expr_dst(*dst);
                 let val = Expr::Constant(Constant::Int(*ptr));
                 Some(self.make_assign(var, val))
@@ -1618,13 +1733,27 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::Incr { dst } => {
-                let var = self.reg_to_expr_dst(*dst);
-                Some(Statement::ExprStatement(Expr::Op(Operation::Incr(Box::new(var)))))
+                // Incr reads from dst (source SSA version) and writes to dst (destination SSA version)
+                // In SSA form: r1_2 = r1_1 + 1  (not r1_2++)
+                let dst_var = self.reg_to_expr_dst(*dst);
+                let src_expr = self.reg_to_expr(*dst);
+                let expr = Expr::Op(Operation::Add(
+                    Box::new(src_expr),
+                    Box::new(Expr::Constant(Constant::InlineInt(1))),
+                ));
+                Some(self.make_assign(dst_var, expr))
             }
 
             Opcode::Decr { dst } => {
-                let var = self.reg_to_expr_dst(*dst);
-                Some(Statement::ExprStatement(Expr::Op(Operation::Decr(Box::new(var)))))
+                // Decr reads from dst (source SSA version) and writes to dst (destination SSA version)
+                // In SSA form: r1_2 = r1_1 - 1  (not r1_2--)
+                let dst_var = self.reg_to_expr_dst(*dst);
+                let src_expr = self.reg_to_expr(*dst);
+                let expr = Expr::Op(Operation::Sub(
+                    Box::new(src_expr),
+                    Box::new(Expr::Constant(Constant::InlineInt(1))),
+                ));
+                Some(self.make_assign(dst_var, expr))
             }
 
             Opcode::Field { dst, obj, field } => {
@@ -1681,6 +1810,12 @@ impl<'a> Structurer<'a> {
                     }
                 }
 
+                // Track iterator-returning methods
+                let fun_name = fun.name(self.code);
+                if matches!(fun_name.as_ref(), "keys" | "iterator" | "keyValueIterator") {
+                    self.iterator_regs.insert(*dst);
+                }
+
                 let args = [*arg0];
                 let call = self.try_make_method_call(*fun, &args)
                     .unwrap_or_else(|| Call::new_fun(*fun, vec![self.reg_to_expr(*arg0)]));
@@ -1688,6 +1823,36 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::Call2 { dst, fun, arg0, arg1 } => {
+                // Skip itos/ftos/dtos - these are internal string conversion functions
+                // The actual string is created by __alloc__ which follows
+                let name = fun.name(self.code);
+                if matches!(name.as_ref(), "itos" | "ftos" | "dtos") {
+                    // Track the conversion source:
+                    // ftos(original_value, ref_out) where ref_out points to length_reg
+                    // We want to record: length_reg -> original_value expression
+                    // Store the Expr (not Reg) to capture the SSA-versioned name now
+                    if let Some(&target_reg) = self.ref_targets.get(arg1) {
+                        let original_expr = self.reg_to_expr(*arg0);
+                        self.string_conversion_source.insert(target_reg, original_expr);
+                    }
+                    return None;
+                }
+
+                // Handle __alloc__ - create Std.string(original_value) if we tracked the source
+                if name.as_ref() == "__alloc__" {
+                    // __alloc__(bytes, length_reg) where length_reg came from ftos/itos/dtos
+                    if let Some(original_expr) = self.string_conversion_source.get(arg1).cloned() {
+                        // Create Std.string(original_value)
+                        let std_string = Expr::Field(
+                            Box::new(Expr::Ident("Std".into())),
+                            "string".into()
+                        );
+                        let call = Call::new(std_string, vec![original_expr]);
+                        let var = self.reg_to_expr_dst(*dst);
+                        return Some(self.make_assign(var, Expr::Call(Box::new(call))));
+                    }
+                }
+
                 let args = [*arg0, *arg1];
                 let call = self.try_make_method_call(*fun, &args)
                     .unwrap_or_else(|| Call::new_fun(*fun, vec![self.reg_to_expr(*arg0), self.reg_to_expr(*arg1)]));
@@ -1743,10 +1908,35 @@ impl<'a> Structurer<'a> {
                 let obj = self.reg_to_expr(args[0]);
                 // For CallMethod, 'field' is a proto array index (NOT a pindex or field index)
                 let method_name = self.get_proto_name(args[0], *field);
+
+                // When calling .next() on an iterator, the result might get the same debug name
+                // as the iterator itself (e.g., `key = key.next()`). This causes type errors
+                // because `key` would need to be both Iterator<T> and T.
+                // Detect this pattern and give the result a unique name.
+                let use_unique_name = method_name.as_ref() == "next"
+                    && self.reg_name(args[0]) == self.reg_name(*dst);
+
                 let method = Expr::Field(Box::new(obj), method_name);
                 let arg_exprs: Vec<_> = args[1..].iter().map(|r| self.reg_to_expr(*r)).collect();
                 let call = Call { fun: method, args: arg_exprs };
-                Some(self.make_call_stmt(*dst, call))
+
+                if use_unique_name {
+                    // Use raw register name to avoid conflict with iterator variable
+                    let raw_name: Str = format!("r{}", dst.0).into();
+                    let var = Expr::Variable(*dst, Some(raw_name.clone()));
+                    // Track this register to use raw name for all subsequent reads
+                    self.use_raw_name_regs.insert(*dst);
+                    // Hoist to function level so it's available outside the loop
+                    self.hoisted_vars.insert(raw_name.clone());
+                    self.declared_vars.insert(raw_name);
+                    Some(Statement::Assign {
+                        declaration: false, // Declaration is hoisted to function level
+                        variable: var,
+                        assign: Expr::Call(Box::new(call)),
+                    })
+                } else {
+                    Some(self.make_call_stmt(*dst, call))
+                }
             }
 
             Opcode::CallThis { dst, field, args } => {
@@ -2041,26 +2231,28 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::SetMem { bytes, index, src } => {
-                // Determine the target (array or bytes)
-                let target_expr = if let Some(array_reg) = self.array_bytes_source.get(bytes).copied() {
-                    // Bytes came from an array - use the array itself
-                    self.reg_to_expr(array_reg)
-                } else {
-                    // Raw bytes access
-                    self.reg_to_expr(*bytes)
-                };
-
                 // Always unshift the index if it was tracked
-                // Use the stored Expr directly to preserve the correct SSA version
                 let index_expr = if let Some((orig_expr, _shift)) = self.shifted_indices.get(index).cloned() {
                     orig_expr
                 } else {
                     self.reg_to_expr(*index)
                 };
 
-                let target = Expr::Array(Box::new(target_expr), Box::new(index_expr));
-                let expr = self.reg_to_expr(*src);
-                Some(self.make_assign(target, expr))
+                let value_expr = self.reg_to_expr(*src);
+
+                // Determine the target (array or raw bytes)
+                if let Some(array_reg) = self.array_bytes_source.get(bytes).copied() {
+                    // Bytes came from an array - use array[index] = value syntax
+                    let array_expr = self.reg_to_expr(array_reg);
+                    let target = Expr::Array(Box::new(array_expr), Box::new(index_expr));
+                    Some(self.make_assign(target, value_expr))
+                } else {
+                    // Raw bytes - use bytes.set(index, value) syntax
+                    let bytes_expr = self.reg_to_expr(*bytes);
+                    let method = Expr::Field(Box::new(bytes_expr), "set".into());
+                    let call = Call::new(method, vec![index_expr, value_expr]);
+                    Some(Statement::ExprStatement(Expr::Call(Box::new(call))))
+                }
             }
 
             Opcode::Ref { dst, src } => {
@@ -2071,6 +2263,9 @@ impl<'a> Structurer<'a> {
                 // 2. INPUT ref: Ref reg4 = &reg9; Call(reg4) - passes nullable value
                 //    We need to emit dst = src so the value flows through.
                 //
+                // Track ref target for string conversion pattern detection
+                self.ref_targets.insert(*dst, *src);
+
                 // Detect OUTPUT pattern by looking at next opcode for ftos/itos/dtos calls
                 let is_output_ref = if let Some(next_op) = self.func.ops.get(op_idx + 1) {
                     match next_op {
@@ -2499,6 +2694,11 @@ impl<'a> Structurer<'a> {
     }
 
     fn reg_name(&self, reg: Reg) -> Str {
+        // If this register was marked to use raw name (to avoid type conflicts),
+        // always use the raw rN format
+        if self.use_raw_name_regs.contains(&reg) {
+            return format!("r{}", reg.0).into();
+        }
         self.get_debug_name(reg, false)
             .unwrap_or_else(|| format!("r{}", reg.0))
             .into()
@@ -2507,6 +2707,11 @@ impl<'a> Structurer<'a> {
     /// Get register name for source context (reading from register).
     /// Only uses debug names assigned BEFORE current_op.
     fn reg_name_for_source(&self, reg: Reg) -> Str {
+        // If this register was marked to use raw name (to avoid type conflicts),
+        // always use the raw rN format
+        if self.use_raw_name_regs.contains(&reg) {
+            return format!("r{}", reg.0).into();
+        }
         self.get_debug_name_at(reg, self.current_op, true)
             .unwrap_or_else(|| format!("r{}", reg.0))
             .into()
@@ -2517,6 +2722,88 @@ impl<'a> Structurer<'a> {
         self.get_debug_name_at(reg, at_op, true)
             .unwrap_or_else(|| format!("r{}", reg.0))
             .into()
+    }
+
+    /// Get SSA-versioned variable name for a destination register.
+    /// If a debug name exists, use it (preserves user variable names).
+    /// For same-register phi destinations/sources, use non-SSA name (allows value flow-through).
+    /// Otherwise, use SSA-versioned name like "r3_1" to enable inlining.
+    fn ssa_var_name_dst(&self, var: SsaVar) -> Str {
+        // Check for raw name override first (set by CallMethod for .next() results)
+        // Use non-versioned name for consistency
+        if self.use_raw_name_regs.contains(&var.reg) {
+            return format!("r{}", var.reg.0).into();
+        }
+        // If debug name exists, use it (preserve user variable names)
+        if let Some(debug_name) = self.get_debug_name(var.reg, false) {
+            return debug_name.into();
+        }
+        // For same-register phi destinations or sources, use non-SSA name
+        // This allows the value to flow through if/else branches without explicit phi assignments
+        if self.ssa.is_same_register_phi(var) || self.ssa.is_same_register_phi_source(var) {
+            return format!("r{}", var.reg.0).into();
+        }
+        // No debug name → use SSA-versioned name
+        format!("r{}_{}", var.reg.0, var.version).into()
+    }
+
+    /// Get SSA-versioned variable name for a source register.
+    /// Uses source context (only debug names assigned BEFORE current_op).
+    fn ssa_var_name_src(&self, var: SsaVar) -> Str {
+        self.ssa_var_name_src_at(var, self.current_op)
+    }
+
+    /// Get SSA-versioned variable name for a source register at a specific opcode position.
+    /// Uses source context (only debug names assigned BEFORE at_op).
+    fn ssa_var_name_src_at(&self, var: SsaVar, at_op: usize) -> Str {
+        // Check for raw name override first (set by CallMethod for .next() results)
+        // Use non-versioned name to match the destination
+        if self.use_raw_name_regs.contains(&var.reg) {
+            return format!("r{}", var.reg.0).into();
+        }
+        // If debug name exists, use it (preserve user variable names)
+        if let Some(debug_name) = self.get_debug_name_at(var.reg, at_op, true) {
+            return debug_name.into();
+        }
+        // For same-register phi results or sources, use non-SSA name
+        // This ensures consistency with phi destinations (allows value flow-through)
+        if self.ssa.is_same_register_phi(var) || self.ssa.is_same_register_phi_source(var) {
+            return format!("r{}", var.reg.0).into();
+        }
+        // No debug name → use SSA-versioned name
+        format!("r{}_{}", var.reg.0, var.version).into()
+    }
+
+    /// Get SSA-versioned variable name WITHOUT phi name collapsing.
+    /// Used for array indices and other contexts where we need the exact SSA version.
+    fn ssa_var_name_strict(&self, var: SsaVar, at_op: usize) -> Str {
+        // Check for raw name override first
+        if self.use_raw_name_regs.contains(&var.reg) {
+            return format!("r{}_{}", var.reg.0, var.version).into();
+        }
+        // If debug name exists, use it (preserve user variable names)
+        if let Some(debug_name) = self.get_debug_name_at(var.reg, at_op, true) {
+            return debug_name.into();
+        }
+        // Always use SSA-versioned name - no phi collapsing
+        format!("r{}_{}", var.reg.0, var.version).into()
+    }
+
+    /// Create expression for destination register using SSA-versioned name.
+    fn reg_to_expr_ssa_dst(&self, reg: Reg, ssa_var: SsaVar) -> Expr {
+        let name = self.ssa_var_name_dst(ssa_var);
+        Expr::Variable(reg, Some(name))
+    }
+
+    /// Create expression for source register using SSA-versioned name.
+    fn reg_to_expr_ssa_src(&self, reg: Reg, ssa_var: SsaVar) -> Expr {
+        let name = self.ssa_var_name_src(ssa_var);
+        Expr::Variable(reg, Some(name))
+    }
+
+    /// Find the SSA variable for a source register in the current instruction's uses.
+    fn find_ssa_use(&self, reg: Reg) -> Option<SsaVar> {
+        self.current_ssa_uses.iter().find(|v| v.reg == reg).copied()
     }
 
     /// Get debug name for a register, optionally for source context.
@@ -2935,17 +3222,29 @@ impl<'a> Structurer<'a> {
     }
 
     /// Get expression for reading from a register (source context).
-    /// Uses debug names assigned BEFORE current_op to prevent using a name
-    /// before it's assigned (e.g., `var dx = dx - r3` when dx is defined here).
+    /// Uses SSA-versioned names when available to enable inlining.
+    /// Falls back to debug names assigned BEFORE current_op.
     fn reg_to_expr(&self, reg: Reg) -> Expr {
+        // Use SSA-versioned name if we have SSA context for this register
+        if let Some(ssa_var) = self.find_ssa_use(reg) {
+            return self.reg_to_expr_ssa_src(reg, ssa_var);
+        }
+        // Fallback to non-SSA naming
         let name = self.reg_name_for_source(reg);
         Expr::Variable(reg, Some(name))
     }
 
     /// Get expression for writing to a register (destination context).
-    /// Uses debug names assigned at or before current_op, so the new name
-    /// is used for the variable being defined.
+    /// Uses SSA-versioned names when available to enable inlining.
+    /// Falls back to debug names assigned at or before current_op.
     fn reg_to_expr_dst(&self, reg: Reg) -> Expr {
+        // Use SSA-versioned name if we have SSA context and the register matches
+        if let Some(ssa_var) = self.current_ssa_dst {
+            if ssa_var.reg == reg {
+                return self.reg_to_expr_ssa_dst(reg, ssa_var);
+            }
+        }
+        // Fallback to non-SSA naming
         let name = self.reg_name(reg);
         Expr::Variable(reg, Some(name))
     }
@@ -2980,18 +3279,22 @@ impl<'a> Structurer<'a> {
                                 return Expr::Constant(Constant::Null);
                             }
                             _ => {
-                                // Not a constant - return as variable with proper name
-                                let name = self.reg_name_at(reg, blk.end);
+                                // Not a constant - return as variable with SSA-versioned name
+                                // Use block.end as the position for debug name lookup
+                                let name = self.ssa_var_name_src_at(*ssa_var, blk.end);
                                 return Expr::Variable(reg, Some(name));
                             }
                         }
                     }
-                    break;
+                    // No def found (phi function) - use SSA-versioned name
+                    // Use block.end as the position for debug name lookup
+                    let name = self.ssa_var_name_src_at(*ssa_var, blk.end);
+                    return Expr::Variable(reg, Some(name));
                 }
             }
         }
 
-        // Fallback: return as variable
+        // Fallback: return as variable using non-SSA naming
         let name = self.reg_name_at(reg, blk.end);
         Expr::Variable(reg, Some(name))
     }
@@ -3027,7 +3330,10 @@ impl<'a> Structurer<'a> {
 
     /// Get an expression for a register using SSA information to find the correct definition.
     /// This is used when debug names might be unreliable due to control flow (e.g., bounds check branches).
-    /// Returns an expression based on where the SSA variable is actually defined.
+    ///
+    /// For phi-involved variables (loop counters), use the debug name since it's consistent across the loop.
+    /// For non-phi variables, use raw SSA-versioned names to avoid picking up debug names from
+    /// different control flow paths (e.g., bounds check failure path).
     fn get_ssa_based_expr(&self, reg: Reg, at_op: usize) -> Expr {
         // Get the SSA instruction for this opcode
         if let Some((_dst, uses)) = self.ssa.get_instr_for_op(at_op) {
@@ -3035,15 +3341,23 @@ impl<'a> Structurer<'a> {
             for ssa_var in uses {
                 if ssa_var.reg == reg {
                     // Found the SSA variable for this register
-                    // Now find its defining instruction
-                    if let Some(def_op_idx) = self.ssa.find_def(*ssa_var) {
-                        // Get the name at the definition point, which is in the correct control flow path
-                        let name = self.reg_name_at(reg, def_op_idx);
-                        return Expr::Variable(reg, Some(name));
-                    }
-                    // No def found - probably a phi-function (loop variable)
-                    // Fall through to use normal naming which should work for loop indices
-                    break;
+                    let is_phi_involved = self.ssa.is_same_register_phi(*ssa_var) || self.ssa.is_same_register_phi_source(*ssa_var);
+
+                    let name: Str = if is_phi_involved {
+                        // For phi-involved variables (loop counters), use debug name if available
+                        // since it's consistent across the loop
+                        if let Some(debug_name) = self.get_debug_name_at(reg, at_op, true) {
+                            debug_name.into()
+                        } else {
+                            format!("r{}", reg.0).into()
+                        }
+                    } else {
+                        // For non-phi variables, use raw SSA-versioned name
+                        // This avoids picking up debug names from different branches
+                        // (e.g., bounds check failure path assigns "last" to default value)
+                        format!("r{}_{}", reg.0, ssa_var.version).into()
+                    };
+                    return Expr::Variable(reg, Some(name));
                 }
             }
         }

@@ -596,14 +596,23 @@ impl Expr {
                     let handling = if let Expr::FunRef(fun_ref) = &call.fun {
                         let name = fun_ref.name(code);
                         match name.as_ref() {
-                            // itos/ftos/dtos convert numbers to strings - use Std.string(first_arg)
-                            "itos" | "ftos" | "dtos" => {
-                                call.args.first().map(|arg| {
-                                    CallHandling::SpecialFormat(format!("Std.string({})", arg.display(indent, code, f)))
-                                }).unwrap_or(CallHandling::Normal)
+                            // itos/ftos/dtos are internal - they return intermediate bytes
+                            // The actual string is created by __alloc__, so skip these
+                            "itos" | "ftos" | "dtos" => CallHandling::Skip,
+                            // __alloc__ creates a String from bytes
+                            // If the first arg looks like intermediate bytes from itos/ftos/dtos, emit Std.string()
+                            // Otherwise just elide to the first arg
+                            "__alloc__" => {
+                                // Check if first arg is a variable that might be from itos/ftos/dtos
+                                // For now, emit Std.string() wrapping the second arg (the original value)
+                                // since __alloc__(bytes, length) where length often comes from the original value
+                                if call.args.len() >= 2 {
+                                    // Second arg is typically the value that was converted
+                                    CallHandling::SpecialFormat(format!("Std.string({})", call.args[1].display(indent, code, f)))
+                                } else {
+                                    call.args.first().map(CallHandling::Elide).unwrap_or(CallHandling::Normal)
+                                }
                             }
-                            // __alloc__ creates a String from bytes - use the first arg
-                            "__alloc__" => call.args.first().map(CallHandling::Elide).unwrap_or(CallHandling::Normal),
                             // thrown wraps an exception - use the argument
                             "thrown" => call.args.first().map(CallHandling::Elide).unwrap_or(CallHandling::Normal),
                             // caught wraps a raw exception in haxe.Exception
@@ -614,6 +623,22 @@ impl Expr {
                                 call.args.first().map(|arg| {
                                     CallHandling::SpecialFormat(format!("Std.string({})", arg.display(indent, code, f)))
                                 }).unwrap_or(CallHandling::Normal)
+                            }
+                            // Internal array allocation functions need fully qualified names
+                            "allocI32" | "allocI64" | "allocF64" | "allocObj" | "allocDyn" => {
+                                // These are hl.types.ArrayBase.allocXXX functions
+                                CallHandling::SpecialFormat(format!(
+                                    "hl.types.ArrayBase.{}({})",
+                                    name,
+                                    call.args.iter().map(|a| format!("{}", a.display(indent, code, f))).collect::<Vec<_>>().join(", ")
+                                ))
+                            }
+                            // alloc_bytes is also internal - use haxe.io.Bytes.alloc
+                            "alloc_bytes" => {
+                                CallHandling::SpecialFormat(format!(
+                                    "haxe.io.Bytes.alloc({})",
+                                    call.args.iter().map(|a| format!("{}", a.display(indent, code, f))).collect::<Vec<_>>().join(", ")
+                                ))
                             }
                             // Internal array methods that shouldn't be visible
                             "__expand" | "__construct" => CallHandling::Skip,
@@ -693,34 +718,43 @@ impl Expr {
                     "new "{ty.display::<HaxeFmt>(code)}"("{fmtools::join(", ", args.iter().map(|e| disp!(e)))}")"
                 }
                 Expr::Closure(f, stmts) => {
-                    let fun = f.as_fn(code).unwrap();
-                    let args = &fun.ty(code).args;
+                    if let Some(fun) = f.as_fn(code) {
+                        let args = &fun.ty(code).args;
 
-                    // Check if first param is closure context (enum type)
-                    let has_capture = args.first().map(|t| matches!(&code[*t], Type::Enum { .. })).unwrap_or(false);
-                    let skip_first = if has_capture { 1 } else { 0 };
+                        // Check if first param is closure context (enum type)
+                        let has_capture = args.first().map(|t| matches!(&code[*t], Type::Enum { .. })).unwrap_or(false);
+                        let skip_first = if has_capture { 1 } else { 0 };
 
-                    // Build parameter names using same logic as DecompilerState::new()
-                    // Uses a counter for synthetic names to match body variable references
-                    let mut param_counter = 0u32;
-                    let param_names = args.iter().enumerate().map(|(i, _)| {
-                        fun.arg_name(code, i).unwrap_or_else(|| {
-                            let name = Str::from(format!("arg{}", param_counter));
-                            param_counter += 1;
-                            name
-                        })
-                    }).collect::<Vec<_>>();
+                        // Build parameter names using same logic as DecompilerState::new()
+                        // Uses a counter for synthetic names to match body variable references
+                        let mut param_counter = 0u32;
+                        let param_names = args.iter().enumerate().map(|(i, _)| {
+                            fun.arg_name(code, i).unwrap_or_else(|| {
+                                let name = Str::from(format!("arg{}", param_counter));
+                                param_counter += 1;
+                                name
+                            })
+                        }).collect::<Vec<_>>();
 
-                    // Format visible parameters (skip closure context if present)
-                    let params_display = args.iter().enumerate().skip(skip_first).map(|(i, arg)| {
-                        format!("{}: {}", param_names[i], to_haxe_type(&code[*arg], code))
-                    }).collect::<Vec<_>>().join(", ");
-                    "("{params_display}") -> {\n"
-                    let indent2 = indent.inc_nesting();
-                    for stmt in stmts {
-                        {indent2}{stmt.display(&indent2, code, fun)}"\n"
+                        // Format visible parameters (skip closure context if present)
+                        let params_display = args.iter().enumerate().skip(skip_first).map(|(i, arg)| {
+                            format!("{}: {}", param_names[i], to_haxe_type(&code[*arg], code))
+                        }).collect::<Vec<_>>().join(", ");
+                        "("{params_display}") -> {\n"
+                        let indent2 = indent.inc_nesting();
+                        for stmt in stmts {
+                            {indent2}{stmt.display(&indent2, code, fun)}"\n"
+                        }
+                        {indent}"}"
+                    } else {
+                        // Native function reference - emit placeholder
+                        "/* native closure fun@"{f.0}" */ () -> {\n"
+                        let indent2 = indent.inc_nesting();
+                        for stmt in stmts {
+                            {indent2}{stmt.display(&indent2, code, &code.functions[0])}"\n"
+                        }
+                        {indent}"}"
                     }
-                    {indent}"}"
                 }
                 Expr::EnumConstr(ty, constr, args) => {
                     // Emit EnumName.ConstructorName(args) syntax

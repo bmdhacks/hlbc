@@ -507,6 +507,44 @@ impl SsaCfg {
         None
     }
 
+    /// Check if an SSA variable is defined by a same-register phi function.
+    /// Same-register phis merge different SSA versions of the SAME register.
+    /// For these, we should use non-SSA naming to allow value flow-through.
+    pub fn is_same_register_phi(&self, var: SsaVar) -> bool {
+        for block in self.blocks.values() {
+            for phi in &block.phis {
+                if let SsaInstr::Phi { dst, sources } = phi {
+                    if *dst == var {
+                        // Check if all sources are the same register as destination
+                        return sources.iter().all(|(_, src)| src.reg == var.reg);
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Check if an SSA variable is a SOURCE of a same-register phi function.
+    /// For phi sources that feed into same-register phis, we should also use
+    /// non-SSA naming to ensure the value flows through properly.
+    pub fn is_same_register_phi_source(&self, var: SsaVar) -> bool {
+        for block in self.blocks.values() {
+            for phi in &block.phis {
+                if let SsaInstr::Phi { dst, sources } = phi {
+                    // Check if all sources are the same register as destination (same-register phi)
+                    let is_same_reg_phi = sources.iter().all(|(_, src)| src.reg == dst.reg);
+                    if is_same_reg_phi {
+                        // Check if var is one of the sources
+                        if sources.iter().any(|(_, src)| *src == var) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Debug: print SSA form
     #[allow(dead_code)]
     pub fn dump(&self, f: &Function, cfg: &Cfg) {

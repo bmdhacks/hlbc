@@ -137,12 +137,23 @@ run_test() {
     fi
 }
 
+# Build hlbc
+build_hlbc() {
+    echo "Building hlbc..."
+    if ! (cd "$HLBC_ROOT" && cargo build -p hlbc-cli 2>&1 | tail -3); then
+        echo -e "${RED}ERROR: Failed to build hlbc${NC}"
+        exit 1
+    fi
+    echo ""
+}
+
 # Main
 main() {
     echo "Round-Trip Test Suite"
     echo "====================="
     echo ""
 
+    build_hlbc
     check_deps
 
     mkdir -p "$BIN_DIR" "$TMP_DIR"

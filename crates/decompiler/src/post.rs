@@ -1,4 +1,4 @@
-use hlbc::Bytecode;
+use hlbc::{Bytecode, Str};
 
 use crate::ast::{add, Constant, ConstructorCall, Expr, Operation, Statement};
 use crate::call_fun;
@@ -705,17 +705,48 @@ pub(crate) fn reconstruct_array_literals(code: &Bytecode, stmts: &mut Vec<Statem
         let mut values: Vec<Expr> = Vec::new();
         let mut j = i + 1;
         let mut stmts_to_remove: Vec<usize> = vec![i]; // Start with alloc_bytes stmt
+        // Track the most recent constant assignment to each variable
+        let mut last_constant: std::collections::HashMap<hlbc::types::Reg, Expr> = std::collections::HashMap::new();
 
         while j < stmts.len() {
             let stmt = &stmts[j];
 
+            // Track constant assignments for value inlining
+            if let Statement::Assign { variable: Expr::Variable(reg, _), assign, .. } = stmt {
+                if is_constant_expr(assign) {
+                    last_constant.insert(*reg, assign.clone());
+                    stmts_to_remove.push(j); // Remove value setup statements
+                    j += 1;
+                    continue;
+                }
+            }
+
             // Check for array assignment: bytes[offset] = value
             if let Statement::Assign { variable: Expr::Array(arr, _), assign, .. } = stmt {
                 if is_var_reg(arr, bytes_reg) {
-                    values.push(assign.clone());
+                    // Try to inline constant if this is a variable reference
+                    let value = inline_constant(assign, &last_constant);
+                    values.push(value);
                     stmts_to_remove.push(j);
                     j += 1;
                     continue;
+                }
+            }
+
+            // Check for method call: bytes.set(index, value)
+            if let Statement::ExprStatement(Expr::Call(call)) = stmt {
+                if let Expr::Field(receiver, method) = &call.fun {
+                    if method.as_ref() == "set" && is_var_reg(receiver, bytes_reg) {
+                        // The value is the second argument (index is first, value is second)
+                        if call.args.len() >= 2 {
+                            // Try to inline constant if this is a variable reference
+                            let value = inline_constant(&call.args[1], &last_constant);
+                            values.push(value);
+                            stmts_to_remove.push(j);
+                            j += 1;
+                            continue;
+                        }
+                    }
                 }
             }
 
@@ -804,6 +835,19 @@ fn is_var_reg(expr: &Expr, reg: hlbc::types::Reg) -> bool {
     matches!(expr, Expr::Variable(r, _) if *r == reg)
 }
 
+fn is_constant_expr(expr: &Expr) -> bool {
+    matches!(expr, Expr::Constant(_))
+}
+
+fn inline_constant(expr: &Expr, constants: &std::collections::HashMap<hlbc::types::Reg, Expr>) -> Expr {
+    if let Expr::Variable(reg, _) = expr {
+        if let Some(constant) = constants.get(reg) {
+            return constant.clone();
+        }
+    }
+    expr.clone()
+}
+
 fn recurse_array_literals(code: &Bytecode, stmt: &mut Statement) {
     match stmt {
         Statement::IfElse { if_, else_, .. } => {
@@ -854,6 +898,792 @@ impl AstVisitor for Trace {
         };
         if let Some(call) = call {
             *expr = call;
+        }
+    }
+}
+
+// =============================================================================
+// SingleUseInline: Inline single-use variables into their use sites
+// =============================================================================
+
+use std::collections::HashMap as StdHashMap;
+use crate::ast::Call;
+
+/// Information about a variable definition
+#[derive(Debug, Clone)]
+struct VarDefInfo {
+    /// Index of the defining statement
+    def_idx: usize,
+    /// The expression assigned to this variable
+    expr: Expr,
+    /// Is the expression pure (safe to inline)?
+    is_pure: bool,
+}
+
+/// Check if an expression is pure (no side effects, safe to inline)
+fn is_pure_expr(expr: &Expr) -> bool {
+    match expr {
+        // Constants are always pure
+        Expr::Constant(_) => true,
+        // Variable references are pure
+        Expr::Variable(_, _) => true,
+        Expr::Ident(_) => true,
+        // Field access is NOT pure - can change type inference on Dynamic objects
+        // e.g., `var r2 = p2.x; var dx = r2 - r3;` works differently than `var dx = p2.x - r3;`
+        Expr::Field(_, _) => false,
+        // Pure operations
+        Expr::Op(op) => match op {
+            Operation::Add(a, b) | Operation::Sub(a, b) | Operation::Mul(a, b) |
+            Operation::Div(a, b) | Operation::Mod(a, b) | Operation::Shl(a, b) |
+            Operation::Shr(a, b) | Operation::And(a, b) | Operation::Or(a, b) |
+            Operation::Xor(a, b) | Operation::Eq(a, b) | Operation::NotEq(a, b) |
+            Operation::Gt(a, b) | Operation::Gte(a, b) | Operation::Lt(a, b) |
+            Operation::Lte(a, b) => is_pure_expr(a) && is_pure_expr(b),
+            Operation::Neg(a) | Operation::Not(a) => is_pure_expr(a),
+            // Incr/Decr have side effects
+            Operation::Incr(_) | Operation::Decr(_) => false,
+        },
+        // Function calls are NOT pure (might have side effects)
+        Expr::Call(_) => false,
+        // Constructors are NOT pure
+        Expr::Constructor(_) => false,
+        // Array access might trigger bounds check
+        Expr::Array(_, _) => false,
+        // Other expressions - be conservative
+        _ => false,
+    }
+}
+
+/// Count uses of a variable name in an expression
+fn count_uses_in_expr(expr: &Expr, var_name: &str) -> usize {
+    match expr {
+        Expr::Variable(_, Some(name)) if name.as_ref() == var_name => 1,
+        Expr::Ident(name) if name.as_ref() == var_name => 1,
+        Expr::Field(obj, _) => count_uses_in_expr(obj, var_name),
+        Expr::Array(arr, idx) => count_uses_in_expr(arr, var_name) + count_uses_in_expr(idx, var_name),
+        Expr::Call(call) => {
+            let mut count = count_uses_in_expr(&call.fun, var_name);
+            for arg in &call.args {
+                count += count_uses_in_expr(arg, var_name);
+            }
+            count
+        }
+        Expr::Constructor(ctor) => {
+            ctor.args.iter().map(|a| count_uses_in_expr(a, var_name)).sum()
+        }
+        Expr::Op(op) => match op {
+            Operation::Add(a, b) | Operation::Sub(a, b) | Operation::Mul(a, b) |
+            Operation::Div(a, b) | Operation::Mod(a, b) | Operation::Shl(a, b) |
+            Operation::Shr(a, b) | Operation::And(a, b) | Operation::Or(a, b) |
+            Operation::Xor(a, b) | Operation::Eq(a, b) | Operation::NotEq(a, b) |
+            Operation::Gt(a, b) | Operation::Gte(a, b) | Operation::Lt(a, b) |
+            Operation::Lte(a, b) => count_uses_in_expr(a, var_name) + count_uses_in_expr(b, var_name),
+            Operation::Neg(a) | Operation::Not(a) | Operation::Incr(a) | Operation::Decr(a) => {
+                count_uses_in_expr(a, var_name)
+            }
+        },
+        Expr::Cast(inner, _) => count_uses_in_expr(inner, var_name),
+        Expr::IfElse { cond, if_, else_ } => {
+            count_uses_in_expr(cond, var_name) +
+            count_uses_in_stmts(if_, var_name) +
+            count_uses_in_stmts(else_, var_name)
+        }
+        Expr::EnumConstr(_, _, args) => {
+            args.iter().map(|a| count_uses_in_expr(a, var_name)).sum()
+        }
+        Expr::ArrayLiteral(elems) => {
+            elems.iter().map(|e| count_uses_in_expr(e, var_name)).sum()
+        }
+        Expr::Anonymous(_, fields) => {
+            fields.values().map(|e| count_uses_in_expr(e, var_name)).sum()
+        }
+        _ => 0,
+    }
+}
+
+/// Count uses of a variable name in statements
+fn count_uses_in_stmts(stmts: &[Statement], var_name: &str) -> usize {
+    let mut count = 0;
+    for stmt in stmts {
+        count += count_uses_in_stmt(stmt, var_name);
+    }
+    count
+}
+
+/// Count uses of a variable name in a statement
+fn count_uses_in_stmt(stmt: &Statement, var_name: &str) -> usize {
+    match stmt {
+        Statement::Assign { variable, assign, .. } => {
+            // Don't count the LHS variable as a use
+            let lhs_uses = match variable {
+                Expr::Field(obj, _) => count_uses_in_expr(obj, var_name),
+                Expr::Array(arr, idx) => count_uses_in_expr(arr, var_name) + count_uses_in_expr(idx, var_name),
+                _ => 0,
+            };
+            lhs_uses + count_uses_in_expr(assign, var_name)
+        }
+        Statement::ExprStatement(e) => count_uses_in_expr(e, var_name),
+        Statement::Return(Some(e)) => count_uses_in_expr(e, var_name),
+        Statement::Return(None) => 0,
+        Statement::IfElse { cond, if_, else_ } => {
+            count_uses_in_expr(cond, var_name) +
+            count_uses_in_stmts(if_, var_name) +
+            count_uses_in_stmts(else_, var_name)
+        }
+        Statement::While { cond, stmts } => {
+            count_uses_in_expr(cond, var_name) + count_uses_in_stmts(stmts, var_name)
+        }
+        Statement::Switch { arg, default, cases, .. } => {
+            let mut count = count_uses_in_expr(arg, var_name);
+            count += count_uses_in_stmts(default, var_name);
+            for (_, case_stmts) in cases {
+                count += count_uses_in_stmts(case_stmts, var_name);
+            }
+            count
+        }
+        Statement::Throw(e) => count_uses_in_expr(e, var_name),
+        Statement::TryCatch { try_stmts, catch_stmts, .. } => {
+            count_uses_in_stmts(try_stmts, var_name) + count_uses_in_stmts(catch_stmts, var_name)
+        }
+        Statement::Block { stmts } | Statement::Sequence { stmts } => {
+            count_uses_in_stmts(stmts, var_name)
+        }
+        _ => 0,
+    }
+}
+
+/// Replace a variable with an expression in an expression (returns new expr)
+fn replace_var_in_expr(expr: &Expr, var_name: &str, replacement: &Expr) -> Expr {
+    match expr {
+        Expr::Variable(_, Some(name)) if name.as_ref() == var_name => replacement.clone(),
+        Expr::Ident(name) if name.as_ref() == var_name => replacement.clone(),
+        Expr::Field(obj, field) => {
+            Expr::Field(Box::new(replace_var_in_expr(obj, var_name, replacement)), field.clone())
+        }
+        Expr::Array(arr, idx) => {
+            Expr::Array(
+                Box::new(replace_var_in_expr(arr, var_name, replacement)),
+                Box::new(replace_var_in_expr(idx, var_name, replacement)),
+            )
+        }
+        Expr::Call(call) => {
+            let new_fun = replace_var_in_expr(&call.fun, var_name, replacement);
+            let new_args: Vec<_> = call.args.iter()
+                .map(|a| replace_var_in_expr(a, var_name, replacement))
+                .collect();
+            Expr::Call(Box::new(Call { fun: new_fun, args: new_args }))
+        }
+        Expr::Constructor(ctor) => {
+            let new_args: Vec<_> = ctor.args.iter()
+                .map(|a| replace_var_in_expr(a, var_name, replacement))
+                .collect();
+            Expr::Constructor(ConstructorCall { ty: ctor.ty, args: new_args })
+        }
+        Expr::Op(op) => {
+            let new_op = match op {
+                Operation::Add(a, b) => Operation::Add(
+                    Box::new(replace_var_in_expr(a, var_name, replacement)),
+                    Box::new(replace_var_in_expr(b, var_name, replacement)),
+                ),
+                Operation::Sub(a, b) => Operation::Sub(
+                    Box::new(replace_var_in_expr(a, var_name, replacement)),
+                    Box::new(replace_var_in_expr(b, var_name, replacement)),
+                ),
+                Operation::Mul(a, b) => Operation::Mul(
+                    Box::new(replace_var_in_expr(a, var_name, replacement)),
+                    Box::new(replace_var_in_expr(b, var_name, replacement)),
+                ),
+                Operation::Div(a, b) => Operation::Div(
+                    Box::new(replace_var_in_expr(a, var_name, replacement)),
+                    Box::new(replace_var_in_expr(b, var_name, replacement)),
+                ),
+                Operation::Mod(a, b) => Operation::Mod(
+                    Box::new(replace_var_in_expr(a, var_name, replacement)),
+                    Box::new(replace_var_in_expr(b, var_name, replacement)),
+                ),
+                Operation::Shl(a, b) => Operation::Shl(
+                    Box::new(replace_var_in_expr(a, var_name, replacement)),
+                    Box::new(replace_var_in_expr(b, var_name, replacement)),
+                ),
+                Operation::Shr(a, b) => Operation::Shr(
+                    Box::new(replace_var_in_expr(a, var_name, replacement)),
+                    Box::new(replace_var_in_expr(b, var_name, replacement)),
+                ),
+                Operation::And(a, b) => Operation::And(
+                    Box::new(replace_var_in_expr(a, var_name, replacement)),
+                    Box::new(replace_var_in_expr(b, var_name, replacement)),
+                ),
+                Operation::Or(a, b) => Operation::Or(
+                    Box::new(replace_var_in_expr(a, var_name, replacement)),
+                    Box::new(replace_var_in_expr(b, var_name, replacement)),
+                ),
+                Operation::Xor(a, b) => Operation::Xor(
+                    Box::new(replace_var_in_expr(a, var_name, replacement)),
+                    Box::new(replace_var_in_expr(b, var_name, replacement)),
+                ),
+                Operation::Eq(a, b) => Operation::Eq(
+                    Box::new(replace_var_in_expr(a, var_name, replacement)),
+                    Box::new(replace_var_in_expr(b, var_name, replacement)),
+                ),
+                Operation::NotEq(a, b) => Operation::NotEq(
+                    Box::new(replace_var_in_expr(a, var_name, replacement)),
+                    Box::new(replace_var_in_expr(b, var_name, replacement)),
+                ),
+                Operation::Gt(a, b) => Operation::Gt(
+                    Box::new(replace_var_in_expr(a, var_name, replacement)),
+                    Box::new(replace_var_in_expr(b, var_name, replacement)),
+                ),
+                Operation::Gte(a, b) => Operation::Gte(
+                    Box::new(replace_var_in_expr(a, var_name, replacement)),
+                    Box::new(replace_var_in_expr(b, var_name, replacement)),
+                ),
+                Operation::Lt(a, b) => Operation::Lt(
+                    Box::new(replace_var_in_expr(a, var_name, replacement)),
+                    Box::new(replace_var_in_expr(b, var_name, replacement)),
+                ),
+                Operation::Lte(a, b) => Operation::Lte(
+                    Box::new(replace_var_in_expr(a, var_name, replacement)),
+                    Box::new(replace_var_in_expr(b, var_name, replacement)),
+                ),
+                Operation::Neg(a) => Operation::Neg(
+                    Box::new(replace_var_in_expr(a, var_name, replacement)),
+                ),
+                Operation::Not(a) => Operation::Not(
+                    Box::new(replace_var_in_expr(a, var_name, replacement)),
+                ),
+                Operation::Incr(a) => Operation::Incr(
+                    Box::new(replace_var_in_expr(a, var_name, replacement)),
+                ),
+                Operation::Decr(a) => Operation::Decr(
+                    Box::new(replace_var_in_expr(a, var_name, replacement)),
+                ),
+            };
+            Expr::Op(new_op)
+        }
+        Expr::Cast(inner, ty) => {
+            Expr::Cast(Box::new(replace_var_in_expr(inner, var_name, replacement)), ty.clone())
+        }
+        Expr::EnumConstr(ty, idx, args) => {
+            let new_args: Vec<_> = args.iter()
+                .map(|a| replace_var_in_expr(a, var_name, replacement))
+                .collect();
+            Expr::EnumConstr(*ty, *idx, new_args)
+        }
+        Expr::ArrayLiteral(elems) => {
+            let new_elems: Vec<_> = elems.iter()
+                .map(|e| replace_var_in_expr(e, var_name, replacement))
+                .collect();
+            Expr::ArrayLiteral(new_elems)
+        }
+        Expr::Anonymous(ty, fields) => {
+            let new_fields = fields.iter()
+                .map(|(k, v)| (k.clone(), replace_var_in_expr(v, var_name, replacement)))
+                .collect();
+            Expr::Anonymous(*ty, new_fields)
+        }
+        Expr::IfElse { cond, if_, else_ } => {
+            let new_if: Vec<_> = if_.iter()
+                .map(|s| {
+                    let mut s = s.clone();
+                    replace_var_in_stmt(&mut s, var_name, replacement);
+                    s
+                })
+                .collect();
+            let new_else: Vec<_> = else_.iter()
+                .map(|s| {
+                    let mut s = s.clone();
+                    replace_var_in_stmt(&mut s, var_name, replacement);
+                    s
+                })
+                .collect();
+            Expr::IfElse {
+                cond: Box::new(replace_var_in_expr(cond, var_name, replacement)),
+                if_: new_if,
+                else_: new_else,
+            }
+        }
+        // For other expressions, return as-is
+        _ => expr.clone(),
+    }
+}
+
+/// Replace a variable with an expression in a statement (modifies in place)
+fn replace_var_in_stmt(stmt: &mut Statement, var_name: &str, replacement: &Expr) {
+    match stmt {
+        Statement::Assign { variable, assign, .. } => {
+            // Replace in LHS if it's a field/array access
+            match variable {
+                Expr::Field(obj, field) => {
+                    *variable = Expr::Field(
+                        Box::new(replace_var_in_expr(obj, var_name, replacement)),
+                        field.clone(),
+                    );
+                }
+                Expr::Array(arr, idx) => {
+                    *variable = Expr::Array(
+                        Box::new(replace_var_in_expr(arr, var_name, replacement)),
+                        Box::new(replace_var_in_expr(idx, var_name, replacement)),
+                    );
+                }
+                _ => {}
+            }
+            *assign = replace_var_in_expr(assign, var_name, replacement);
+        }
+        Statement::ExprStatement(e) => {
+            *e = replace_var_in_expr(e, var_name, replacement);
+        }
+        Statement::Return(Some(e)) => {
+            *e = replace_var_in_expr(e, var_name, replacement);
+        }
+        Statement::IfElse { cond, if_, else_ } => {
+            *cond = replace_var_in_expr(cond, var_name, replacement);
+            replace_var_in_stmts(if_, var_name, replacement);
+            replace_var_in_stmts(else_, var_name, replacement);
+        }
+        Statement::While { cond, stmts } => {
+            *cond = replace_var_in_expr(cond, var_name, replacement);
+            replace_var_in_stmts(stmts, var_name, replacement);
+        }
+        Statement::Switch { arg, default, cases, .. } => {
+            *arg = replace_var_in_expr(arg, var_name, replacement);
+            replace_var_in_stmts(default, var_name, replacement);
+            for (_, case_stmts) in cases {
+                replace_var_in_stmts(case_stmts, var_name, replacement);
+            }
+        }
+        Statement::Throw(e) => {
+            *e = replace_var_in_expr(e, var_name, replacement);
+        }
+        Statement::TryCatch { try_stmts, catch_stmts, .. } => {
+            replace_var_in_stmts(try_stmts, var_name, replacement);
+            replace_var_in_stmts(catch_stmts, var_name, replacement);
+        }
+        Statement::Block { stmts } | Statement::Sequence { stmts } => {
+            replace_var_in_stmts(stmts, var_name, replacement);
+        }
+        _ => {}
+    }
+}
+
+/// Replace a variable in a slice of statements
+fn replace_var_in_stmts(stmts: &mut [Statement], var_name: &str, replacement: &Expr) {
+    for stmt in stmts {
+        replace_var_in_stmt(stmt, var_name, replacement);
+    }
+}
+
+/// Get the variable name from a variable expression
+fn get_var_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Variable(_, Some(name)) => Some(name.to_string()),
+        Expr::Ident(name) => Some(name.to_string()),
+        _ => None,
+    }
+}
+
+/// Check if a variable is assigned to (excluding the initial declaration) anywhere in statements
+fn is_reassigned_in_stmts(stmts: &[Statement], var_name: &str, skip_idx: usize) -> bool {
+    for (idx, stmt) in stmts.iter().enumerate() {
+        if idx == skip_idx {
+            continue;
+        }
+        if is_reassigned_in_stmt(stmt, var_name) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if a variable is assigned to in a range of statements (from start_idx+1 to end)
+fn is_reassigned_in_range(stmts: &[Statement], var_name: &str, start_idx: usize) -> bool {
+    for stmt in stmts.iter().skip(start_idx + 1) {
+        if is_reassigned_in_stmt(stmt, var_name) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Get all variable names referenced in an expression
+fn get_var_refs_in_expr(expr: &Expr, vars: &mut Vec<String>) {
+    match expr {
+        Expr::Variable(_, Some(name)) => vars.push(name.to_string()),
+        Expr::Ident(name) => vars.push(name.to_string()),
+        Expr::Field(obj, _) => get_var_refs_in_expr(obj, vars),
+        Expr::Array(arr, idx) => {
+            get_var_refs_in_expr(arr, vars);
+            get_var_refs_in_expr(idx, vars);
+        }
+        Expr::Call(call) => {
+            get_var_refs_in_expr(&call.fun, vars);
+            for arg in &call.args {
+                get_var_refs_in_expr(arg, vars);
+            }
+        }
+        Expr::Constructor(ctor) => {
+            for arg in &ctor.args {
+                get_var_refs_in_expr(arg, vars);
+            }
+        }
+        Expr::Op(op) => match op {
+            Operation::Add(a, b) | Operation::Sub(a, b) | Operation::Mul(a, b) |
+            Operation::Div(a, b) | Operation::Mod(a, b) | Operation::Shl(a, b) |
+            Operation::Shr(a, b) | Operation::And(a, b) | Operation::Or(a, b) |
+            Operation::Xor(a, b) | Operation::Eq(a, b) | Operation::NotEq(a, b) |
+            Operation::Gt(a, b) | Operation::Gte(a, b) | Operation::Lt(a, b) |
+            Operation::Lte(a, b) => {
+                get_var_refs_in_expr(a, vars);
+                get_var_refs_in_expr(b, vars);
+            }
+            Operation::Neg(a) | Operation::Not(a) | Operation::Incr(a) | Operation::Decr(a) => {
+                get_var_refs_in_expr(a, vars);
+            }
+        },
+        Expr::Cast(inner, _) => get_var_refs_in_expr(inner, vars),
+        Expr::EnumConstr(_, _, args) => {
+            for arg in args {
+                get_var_refs_in_expr(arg, vars);
+            }
+        }
+        Expr::ArrayLiteral(elems) => {
+            for elem in elems {
+                get_var_refs_in_expr(elem, vars);
+            }
+        }
+        Expr::Anonymous(_, fields) => {
+            for expr in fields.values() {
+                get_var_refs_in_expr(expr, vars);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Check if any variable in an expression is reassigned in the range of statements after def_idx
+fn expr_vars_reassigned_after(stmts: &[Statement], expr: &Expr, def_idx: usize) -> bool {
+    let mut vars = Vec::new();
+    get_var_refs_in_expr(expr, &mut vars);
+
+    for var_name in vars {
+        if is_reassigned_in_range(stmts, &var_name, def_idx) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if a variable is assigned to in a statement
+fn is_reassigned_in_stmt(stmt: &Statement, var_name: &str) -> bool {
+    match stmt {
+        // Check for assignment to this variable (any assignment, including declarations)
+        Statement::Assign { variable, .. } => {
+            if let Some(name) = get_var_name(variable) {
+                if name == var_name {
+                    return true;
+                }
+            }
+            // Also check nested structures in the assign expression
+            false
+        }
+        Statement::IfElse { if_, else_, .. } => {
+            is_reassigned_in_stmts(if_, var_name, usize::MAX) ||
+            is_reassigned_in_stmts(else_, var_name, usize::MAX)
+        }
+        Statement::While { stmts, .. } => {
+            is_reassigned_in_stmts(stmts, var_name, usize::MAX)
+        }
+        Statement::Switch { default, cases, .. } => {
+            if is_reassigned_in_stmts(default, var_name, usize::MAX) {
+                return true;
+            }
+            for (_, case_stmts) in cases {
+                if is_reassigned_in_stmts(case_stmts, var_name, usize::MAX) {
+                    return true;
+                }
+            }
+            false
+        }
+        Statement::TryCatch { try_stmts, catch_stmts, .. } => {
+            is_reassigned_in_stmts(try_stmts, var_name, usize::MAX) ||
+            is_reassigned_in_stmts(catch_stmts, var_name, usize::MAX)
+        }
+        Statement::Block { stmts } | Statement::Sequence { stmts } => {
+            is_reassigned_in_stmts(stmts, var_name, usize::MAX)
+        }
+        _ => false,
+    }
+}
+
+/// Inline single-use variables into their use sites.
+///
+/// This pass finds patterns like:
+/// ```haxe
+/// var r4 = someExpr;
+/// var r3 = r4.field;
+/// ```
+/// and transforms them to:
+/// ```haxe
+/// var r3 = someExpr.field;
+/// ```
+pub fn inline_single_use_vars(stmts: &mut Vec<Statement>) {
+    // We need to iterate until no more changes, since inlining can enable more inlining
+    let mut changed = true;
+    while changed {
+        changed = inline_single_use_vars_pass(stmts);
+    }
+}
+
+/// Single pass of variable inlining. Returns true if any changes were made.
+fn inline_single_use_vars_pass(stmts: &mut Vec<Statement>) -> bool {
+    // Build map of variable definitions at the top level
+    let mut var_defs: StdHashMap<String, VarDefInfo> = StdHashMap::new();
+
+    // First pass: collect definitions
+    for (idx, stmt) in stmts.iter().enumerate() {
+        if let Statement::Assign { declaration: true, variable, assign, .. } = stmt {
+            if let Some(name) = get_var_name(variable) {
+                let is_pure = is_pure_expr(assign);
+                var_defs.insert(name, VarDefInfo {
+                    def_idx: idx,
+                    expr: assign.clone(),
+                    is_pure,
+                });
+            }
+        }
+    }
+
+    // Second pass: find single uses and check if safe to inline
+    let mut to_inline: Vec<(String, usize, Expr)> = Vec::new(); // (var_name, def_idx, expr)
+
+    for (var_name, def_info) in &var_defs {
+        if !def_info.is_pure {
+            continue;
+        }
+
+        // Count total uses of this variable in the rest of the function
+        let mut use_count = 0;
+        let mut use_idx = None;
+        for (idx, stmt) in stmts.iter().enumerate().skip(def_info.def_idx + 1) {
+            let uses_in_stmt = count_uses_in_stmt(stmt, var_name);
+            if uses_in_stmt > 0 {
+                use_count += uses_in_stmt;
+                if use_idx.is_none() {
+                    use_idx = Some(idx);
+                }
+            }
+        }
+
+        // Only inline if exactly one use
+        if use_count != 1 {
+            continue;
+        }
+
+        // Don't inline if the variable is reassigned anywhere
+        // (removing the declaration would leave later reassignments without a var declaration)
+        if is_reassigned_in_stmts(stmts, var_name, def_info.def_idx) {
+            continue;
+        }
+
+        let use_idx = match use_idx {
+            Some(idx) => idx,
+            None => continue,
+        };
+
+        // Check if any variable in the expression is reassigned between def and use
+        // (if so, inlining would change semantics)
+        let mut expr_vars_modified = false;
+        let mut expr_vars = Vec::new();
+        get_var_refs_in_expr(&def_info.expr, &mut expr_vars);
+        for expr_var in &expr_vars {
+            for (idx, stmt) in stmts.iter().enumerate().skip(def_info.def_idx + 1) {
+                if idx >= use_idx {
+                    break;
+                }
+                if is_reassigned_in_stmt(stmt, expr_var) {
+                    expr_vars_modified = true;
+                    break;
+                }
+            }
+            if expr_vars_modified {
+                break;
+            }
+        }
+        if expr_vars_modified {
+            continue;
+        }
+
+        to_inline.push((var_name.clone(), def_info.def_idx, def_info.expr.clone()));
+    }
+
+    if to_inline.is_empty() {
+        return false;
+    }
+
+    // Sort by def_idx descending so we can remove from back to front
+    to_inline.sort_by(|a, b| b.1.cmp(&a.1));
+
+    // Third pass: perform inlining and remove definitions
+    for (var_name, def_idx, replacement) in to_inline {
+        // Replace uses in subsequent statements
+        for stmt in stmts.iter_mut().skip(def_idx + 1) {
+            replace_var_in_stmt(stmt, &var_name, &replacement);
+        }
+
+        // Remove the definition statement
+        // (we already checked the variable isn't reassigned, so safe to remove)
+        stmts.remove(def_idx);
+    }
+
+    // Recurse into nested structures
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            Statement::IfElse { if_, else_, .. } => {
+                inline_single_use_vars(if_);
+                inline_single_use_vars(else_);
+            }
+            Statement::While { stmts, .. } => {
+                inline_single_use_vars(stmts);
+            }
+            Statement::Switch { default, cases, .. } => {
+                inline_single_use_vars(default);
+                for (_, case_stmts) in cases {
+                    inline_single_use_vars(case_stmts);
+                }
+            }
+            Statement::TryCatch { try_stmts, catch_stmts, .. } => {
+                inline_single_use_vars(try_stmts);
+                inline_single_use_vars(catch_stmts);
+            }
+            Statement::Block { stmts } | Statement::Sequence { stmts } => {
+                inline_single_use_vars(stmts);
+            }
+            _ => {}
+        }
+    }
+
+    true
+}
+
+/// Merge forward declarations with their first assignment.
+///
+/// This pass finds patterns like:
+/// ```haxe
+/// var r5;
+/// var r6;
+/// // ... code that doesn't use r5 or r6 ...
+/// r5 = someValue;
+/// ```
+/// and transforms them to:
+/// ```haxe
+/// var r6;
+/// // ... code ...
+/// var r5 = someValue;
+/// ```
+///
+/// IMPORTANT: Only merges if the first assignment is at the TOP LEVEL (same scope as the VarDecl).
+/// Variables declared at function level but first assigned inside a nested scope (if/while/switch)
+/// must keep their forward declaration - that's exactly why they were hoisted.
+pub fn merge_declarations(stmts: &mut Vec<Statement>) {
+    // Collect all VarDecl names and their indices
+    let mut var_decls: Vec<(usize, String, Option<Str>)> = Vec::new(); // (idx, name, type_hint)
+
+    for (idx, stmt) in stmts.iter().enumerate() {
+        if let Statement::VarDecl { name, type_hint } = stmt {
+            var_decls.push((idx, name.to_string(), type_hint.clone()));
+        }
+    }
+
+    // For each VarDecl, try to find first assignment at top level
+    let mut to_merge: Vec<(usize, usize)> = Vec::new(); // (var_decl_idx, assign_idx)
+
+    for (decl_idx, var_name, _type_hint) in &var_decls {
+        // Look for first assignment to this variable AFTER the declaration
+        // Only consider top-level statements (not inside nested scopes)
+        let mut found_use_before_assign = false;
+
+        for (stmt_idx, stmt) in stmts.iter().enumerate().skip(*decl_idx + 1) {
+            match stmt {
+                // Found an assignment to this variable at top level
+                Statement::Assign { declaration: false, variable, .. } => {
+                    if let Some(name) = get_var_name(variable) {
+                        if &name == var_name {
+                            // Check if there were any uses before this assignment
+                            if !found_use_before_assign {
+                                to_merge.push((*decl_idx, stmt_idx));
+                            }
+                            break;
+                        }
+                    }
+                    // Check if this statement uses the variable
+                    if count_uses_in_stmt(stmt, var_name) > 0 {
+                        found_use_before_assign = true;
+                    }
+                }
+                // Any other statement - check for uses
+                _ => {
+                    if count_uses_in_stmt(stmt, var_name) > 0 {
+                        found_use_before_assign = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort by decl_idx descending so we can remove from back to front
+    to_merge.sort_by(|a, b| b.0.cmp(&a.0));
+
+    // Perform the merges
+    for (decl_idx, assign_idx) in to_merge {
+        // Get the type hint from the VarDecl (if any)
+        let type_hint = if let Statement::VarDecl { type_hint, .. } = &stmts[decl_idx] {
+            type_hint.clone()
+        } else {
+            None
+        };
+
+        // Convert the assignment to a declaration
+        if let Statement::Assign { variable, assign, .. } = &mut stmts[assign_idx] {
+            // Create new statement with declaration: true
+            let new_stmt = Statement::Assign {
+                declaration: true,
+                variable: variable.clone(),
+                assign: assign.clone(),
+            };
+            stmts[assign_idx] = new_stmt;
+
+            // If there was a type hint, we might need to add it to the variable
+            // For now, we'll just drop it since Haxe can often infer the type
+            let _ = type_hint;
+        }
+
+        // Remove the VarDecl
+        stmts.remove(decl_idx);
+    }
+
+    // Recurse into nested structures
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            Statement::IfElse { if_, else_, .. } => {
+                merge_declarations(if_);
+                merge_declarations(else_);
+            }
+            Statement::While { stmts, .. } => {
+                merge_declarations(stmts);
+            }
+            Statement::Switch { default, cases, .. } => {
+                merge_declarations(default);
+                for (_, case_stmts) in cases {
+                    merge_declarations(case_stmts);
+                }
+            }
+            Statement::TryCatch { try_stmts, catch_stmts, .. } => {
+                merge_declarations(try_stmts);
+                merge_declarations(catch_stmts);
+            }
+            Statement::Block { stmts } | Statement::Sequence { stmts } => {
+                merge_declarations(stmts);
+            }
+            _ => {}
         }
     }
 }

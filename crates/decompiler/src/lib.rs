@@ -182,7 +182,18 @@ pub fn decompile_code_with_closures(
     let mut structurer = Structurer::new_with_closures(
         code, f, &cfg, &analysis, &ssa, &type_info, closure_analysis
     );
-    structurer.structure()
+    let mut stmts = structurer.structure();
+
+    // Pass 6: Post-processing transformations
+    post::reconstruct_array_literals(code, &mut stmts);
+
+    // Pass 7: Inline single-use variables to reduce verbosity
+    post::inline_single_use_vars(&mut stmts);
+
+    // Pass 8: Merge forward declarations with first assignments
+    post::merge_declarations(&mut stmts);
+
+    stmts
 }
 
 /// Decompile a function out of context, returning a Method.
