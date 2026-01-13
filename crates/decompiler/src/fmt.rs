@@ -182,7 +182,17 @@ fn to_haxe_type<'a>(ty: &Type, ctx: &'a Bytecode) -> Str {
                 Str::from(format!("({}) -> {}", args.join(", "), ret))
             }
         }
-        Obj(obj) | Struct(obj) => ctx.get(obj.name),
+        Obj(obj) | Struct(obj) => {
+            let name_str = ctx.get(obj.name);
+            // Map internal HL types to their Haxe equivalents
+            match name_str.as_ref() {
+                "hl.types.ArrayBytes_Int" | "hl.types.ArrayBytes_hl_UI16" => Str::from_static("Array<Int>"),
+                "hl.types.ArrayBytes_Float" | "hl.types.ArrayBytes_Single" | "hl.types.ArrayBytes_hl_F64" | "hl.types.ArrayBytes_hl_F32" => Str::from_static("Array<Float>"),
+                "hl.types.ArrayObj" => Str::from_static("Array<Dynamic>"),
+                "hl.types.ArrayDyn" => Str::from_static("Array<Dynamic>"),
+                _ => name_str,
+            }
+        }
         Array => Str::from_static("Array<Dynamic>"),
         Type => Str::from_static("Class<Dynamic>"),
         Abstract { name } => {
@@ -230,10 +240,16 @@ impl Class {
         } else {
             (None, self.name.as_str())
         };
-        // Also extract simple parent name
-        let simple_parent = self.parent.as_ref().map(|p| {
-            if let Some(pos) = p.rfind('.') {
-                &p[pos + 1..]
+        // Extract parent name - use simple name only if in same package
+        let parent_display = self.parent.as_ref().map(|p| {
+            let (parent_pkg, parent_simple) = if let Some(pos) = p.rfind('.') {
+                (Some(&p[..pos]), &p[pos + 1..])
+            } else {
+                (None, p.as_str())
+            };
+            // Use simple name if same package, otherwise use full qualified name
+            if parent_pkg == package {
+                parent_simple
             } else {
                 p.as_str()
             }
@@ -250,7 +266,7 @@ impl Class {
                 }
             }
             {opts}"class "{simple_name}
-            if let Some(parent) = simple_parent {
+            if let Some(parent) = parent_display {
                 " extends "{parent}
             }
             " {\n"

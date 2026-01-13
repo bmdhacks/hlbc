@@ -795,6 +795,25 @@ pub(crate) fn reconstruct_array_literals(code: &Bytecode, stmts: &mut Vec<Statem
                 j += 1;
                 continue;
             }
+            // Also detect increment-as-assignment: var r2_3 = r2_2 + 1
+            // The structurer converts Incr opcodes to Assign(var, Add(var, 1))
+            if let Statement::Assign { variable: Expr::Variable(dst_reg, _), assign: Expr::Op(Operation::Add(left, right)), .. } = stmt {
+                // Check if it's adding 1 to a variable (increment pattern)
+                let is_increment = match (left.as_ref(), right.as_ref()) {
+                    (Expr::Variable(src_reg, _), Expr::Constant(Constant::InlineInt(1))) => {
+                        dst_reg.0 == src_reg.0  // Same base register
+                    }
+                    (Expr::Constant(Constant::InlineInt(1)), Expr::Variable(src_reg, _)) => {
+                        dst_reg.0 == src_reg.0  // Same base register
+                    }
+                    _ => false,
+                };
+                if is_increment {
+                    stmts_to_remove.push(j);
+                    j += 1;
+                    continue;
+                }
+            }
 
             // Not part of the pattern
             j += 1;

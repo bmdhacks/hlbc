@@ -1555,6 +1555,14 @@ impl<'a> Structurer<'a> {
                     return None;
                 }
 
+                // Check if this is a .array access on ArrayObj/ArrayDyn
+                // This is internal structure access - just pass through the array itself
+                if field_name == "array" && self.is_array_type(*obj) {
+                    // Track: dst register is same as obj (the array itself)
+                    self.array_bytes_source.insert(*dst, *obj);
+                    return None;
+                }
+
                 let var = self.reg_to_expr_dst(*dst);
                 let obj_expr = self.reg_to_expr(*obj);
                 let expr = Expr::Field(Box::new(obj_expr), field_name);
@@ -1593,6 +1601,31 @@ impl<'a> Structurer<'a> {
                     self.iterator_regs.insert(*dst);
                 }
 
+                // Check for array wrapper functions: TypeName(array) -> ArrayObj
+                // These are generated functions that wrap native arrays into typed ArrayObj
+                // The function name matches a type (String, Int, etc.) and takes array, returns ArrayObj
+                // We can just pass through the array since it's already been assigned
+                if let Some(func) = fun.as_fn(self.code) {
+                    // Check if return type is ArrayObj or ArrayDyn
+                    if let Some(ret_type) = self.code.types.get(func.ty(self.code).ret.0) {
+                        if let Type::Obj(obj) = ret_type {
+                            if let Some(ret_name) = self.code.strings.get(obj.name.0) {
+                                if ret_name == "hl.types.ArrayObj" || ret_name == "hl.types.ArrayDyn" {
+                                    // Check if first arg is array type
+                                    if !func.ty(self.code).args.is_empty() {
+                                        if let Some(Type::Array) = self.code.types.get(func.ty(self.code).args[0].0) {
+                                            // This is an array wrapper - just pass through the array
+                                            let var = self.reg_to_expr_dst(*dst);
+                                            let arr = self.reg_to_expr(*arg0);
+                                            return Some(self.make_assign(var, arr));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let args = [*arg0];
                 let call = self.try_make_method_call(*fun, &args)
                     .unwrap_or_else(|| Call::new_fun(*fun, vec![self.reg_to_expr(*arg0)]));
@@ -1600,9 +1633,17 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::Call2 { dst, fun, arg0, arg1 } => {
+                let name = fun.name(self.code);
+
+                // Handle alloc_array(type, size) -> output as empty array literal []
+                // This native allocates a raw array that gets filled by SetArray ops
+                if name.as_ref() == "alloc_array" {
+                    let var = self.reg_to_expr_dst(*dst);
+                    return Some(self.make_assign(var, Expr::ArrayLiteral(vec![])));
+                }
+
                 // Skip itos/ftos/dtos - these are internal string conversion functions
                 // The actual string is created by __alloc__ which follows
-                let name = fun.name(self.code);
                 if matches!(name.as_ref(), "itos" | "ftos" | "dtos") {
                     // Track the conversion source:
                     // ftos(original_value, ref_out) where ref_out points to length_reg
@@ -1939,14 +1980,24 @@ impl<'a> Structurer<'a> {
 
             Opcode::GetArray { dst, array, index } => {
                 let var = self.reg_to_expr_dst(*dst);
-                let arr = self.reg_to_expr(*array);
+                // Check if array register came from .array field access (ArrayObj internal structure)
+                let arr = if let Some(source_reg) = self.array_bytes_source.get(array).copied() {
+                    self.reg_to_expr(source_reg)
+                } else {
+                    self.reg_to_expr(*array)
+                };
                 let idx = self.reg_to_expr(*index);
                 let expr = Expr::Array(Box::new(arr), Box::new(idx));
                 Some(self.make_assign(var, expr))
             }
 
             Opcode::SetArray { array, index, src } => {
-                let arr = self.reg_to_expr(*array);
+                // Check if array register came from .array field access (ArrayObj internal structure)
+                let arr = if let Some(source_reg) = self.array_bytes_source.get(array).copied() {
+                    self.reg_to_expr(source_reg)
+                } else {
+                    self.reg_to_expr(*array)
+                };
                 let idx = self.reg_to_expr(*index);
                 let target = Expr::Array(Box::new(arr), Box::new(idx));
                 let expr = self.reg_to_expr(*src);
@@ -2375,9 +2426,10 @@ impl<'a> Structurer<'a> {
             return None;
         }
 
-        // Check if the first argument's type matches the owner type
+        // Check if the first argument's type is compatible with the owner type
+        // (either the same type or a subtype that inherits from it)
         let first_arg_type = self.get_type_ref(args[0]);
-        if first_arg_type != *owner_type {
+        if !self.is_subtype_of(first_arg_type, *owner_type) {
             return None;
         }
 
@@ -2387,6 +2439,34 @@ impl<'a> Structurer<'a> {
         let arg_exprs: Vec<_> = args[1..].iter().map(|r| self.reg_to_expr(*r)).collect();
 
         Some(Call { fun: method, args: arg_exprs })
+    }
+
+    /// Check if `derived` type is the same as or inherits from `base` type.
+    /// Walks the inheritance chain via TypeObj.super_.
+    fn is_subtype_of(&self, derived: RefType, base: RefType) -> bool {
+        if derived == base {
+            return true;
+        }
+
+        // Walk up the inheritance chain
+        let mut current = derived;
+        loop {
+            if let Some(Type::Obj(obj)) = self.code.types.get(current.0) {
+                if let Some(parent) = obj.super_ {
+                    if parent == base {
+                        return true;
+                    }
+                    current = parent;
+                } else {
+                    // No more parents
+                    break;
+                }
+            } else {
+                // Not an object type
+                break;
+            }
+        }
+        false
     }
 
     /// Check if a register has void type (used to skip assignments of void-returning calls)
