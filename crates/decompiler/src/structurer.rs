@@ -111,6 +111,8 @@ pub struct Structurer<'a> {
     current_ssa_uses: Vec<SsaVar>,
     /// Detected string switch regions (from bytecode pattern analysis)
     string_switches: Vec<StringSwitchRegion>,
+    /// Recursion depth counter to prevent stack overflow
+    recursion_depth: u32,
 }
 
 impl<'a> Structurer<'a> {
@@ -181,6 +183,7 @@ impl<'a> Structurer<'a> {
             current_ssa_dst: None,
             current_ssa_uses: Vec::new(),
             string_switches: Self::detect_string_switches(code, func),
+            recursion_depth: 0,
         }
     }
 
@@ -660,6 +663,25 @@ impl<'a> Structurer<'a> {
             return vec![];
         }
 
+        // Prevent stack overflow from deep recursion
+        const MAX_RECURSION_DEPTH: u32 = 500;
+        if self.recursion_depth >= MAX_RECURSION_DEPTH {
+            return vec![Statement::Comment(format!(
+                "// [deep nesting truncated at depth {} - remaining {} blocks]",
+                MAX_RECURSION_DEPTH,
+                self.cfg.graph.node_count() - self.processed.len()
+            ))];
+        }
+        self.recursion_depth += 1;
+
+        let result = self.structure_from_inner(start, stop_at);
+
+        self.recursion_depth -= 1;
+        result
+    }
+
+    /// Inner implementation of structure_from (separated for recursion depth tracking)
+    fn structure_from_inner(&mut self, start: NodeIndex, stop_at: Option<NodeIndex>) -> Vec<Statement> {
         let block_start_op = self.cfg.graph[start].start;
 
         // Check if this block starts a string switch
@@ -1103,12 +1125,8 @@ impl<'a> Structurer<'a> {
         }
     }
 
-    /// Check if a block is a simple conditional suitable for chain flattening.
-    /// A block is only a chain candidate if:
-    /// - It has exactly 2 successors (conditional)
-    /// - It's not a loop header
-    /// - It hasn't been processed yet
-    /// - It has no preamble statements (only the conditional jump)
+    /// Check if a block is a conditional that can be collected into a chain.
+    /// We allow blocks with preambles - they'll be handled when building the result.
     fn is_chain_candidate(&self, block: NodeIndex) -> bool {
         let succs = self.cfg.successors(block);
         if succs.len() != 2 {
@@ -1118,13 +1136,7 @@ impl<'a> Structurer<'a> {
         if self.analysis.loops.iter().any(|l| l.header == block) {
             return false;
         }
-        if self.processed.contains(&block) {
-            return false;
-        }
-        // Check that the block has no preamble statements
-        // A pure chain block should only contain the conditional jump
-        let block_data = &self.cfg.graph[block];
-        block_data.start == block_data.end
+        !self.processed.contains(&block)
     }
 
     /// Structure a branch target, returning statements
@@ -1141,6 +1153,7 @@ impl<'a> Structurer<'a> {
     }
 
     /// Structure a conditional - collects if-else-if chains iteratively
+    /// Chain entry: (preamble_statements, condition, then_body)
     fn structure_conditional(
         &mut self,
         block: NodeIndex,
@@ -1148,10 +1161,12 @@ impl<'a> Structurer<'a> {
         stop_at: Option<NodeIndex>,
     ) -> Vec<Statement> {
         // Collect the if-else-if chain iteratively
-        let mut chain: Vec<(Expr, Vec<Statement>)> = vec![];
+        // Each entry: (preamble, condition, then_body)
+        let mut chain: Vec<(Vec<Statement>, Expr, Vec<Statement>)> = vec![];
         let mut current_block = Some(block);
         let mut final_merge: Option<NodeIndex> = None;
         let mut is_first = true;
+        let mut has_preambles = false;
 
         self.scope_depth += 1;
 
@@ -1160,7 +1175,19 @@ impl<'a> Structurer<'a> {
             if !is_first && self.processed.contains(&blk) {
                 break;
             }
-            is_first = false;
+
+            // Structure preamble for non-first blocks (first block's preamble is in structure_from)
+            let preamble = if is_first {
+                is_first = false;
+                vec![]  // First block's preamble already handled by structure_from
+            } else {
+                self.processed.insert(blk);
+                let p = self.structure_block(blk);
+                if !p.is_empty() {
+                    has_preambles = true;
+                }
+                p
+            };
 
             let block_data = &self.cfg.graph[blk];
             let last_op = &self.func.ops[block_data.end];
@@ -1183,47 +1210,35 @@ impl<'a> Structurer<'a> {
                 final_merge = merge;
             }
 
-            // Mark this block as processed
+            // Mark this block as processed (if not already)
             self.processed.insert(blk);
 
             // Check if this is a NotEq pattern (used in if-else-if chains compiled from Haxe)
-            // For JNotEq: then_target = next case (jump), else_target = case body (fallthrough)
-            // We need to invert: case body is else, continue chain with then
             let is_not_eq = matches!(&condition, Expr::Op(Operation::NotEq(_, _)));
 
             if is_not_eq {
                 // NotEq pattern: case body is in else branch, next case is in then branch
-                // Convert NotEq(x, c) to Eq(x, c) for switch analysis
                 let eq_condition = if let Expr::Op(Operation::NotEq(a, b)) = &condition {
                     Expr::Op(Operation::Eq(a.clone(), b.clone()))
                 } else {
                     condition.clone()
                 };
 
-                // For NotEq chains, find the real merge point by looking at where
-                // the case body jumps to (via JAlways). This is where all cases converge.
                 let chain_merge = if let Some(e) = else_target {
-                    // Case body block's single successor (via JAlways) is the merge
                     let case_succs = self.cfg.successors(e);
-                    if case_succs.len() == 1 {
-                        Some(case_succs[0])
-                    } else {
-                        merge
-                    }
+                    if case_succs.len() == 1 { Some(case_succs[0]) } else { merge }
                 } else {
                     merge
                 };
 
-                // Update final_merge if we found a better one
                 if final_merge.is_none() && chain_merge.is_some() {
                     final_merge = chain_merge;
                 }
 
-                // Structure the case body (else branch for NotEq), stopping at merge
                 let case_stmts = self.structure_branch(else_target, chain_merge);
-                chain.push((eq_condition, case_stmts));
+                chain.push((preamble, eq_condition, case_stmts));
 
-                // Check if the then branch (next conditional) can continue the chain
+                // Check if the then branch can continue the chain
                 if let Some(t) = then_target {
                     if Some(t) != chain_merge && self.is_chain_candidate(t) {
                         current_block = Some(t);
@@ -1231,110 +1246,122 @@ impl<'a> Structurer<'a> {
                     }
                 }
 
-                // Then branch is not a chain candidate - it becomes the else/default
-                // Use chain_merge (not original merge) to stop at the correct point
+                // End of chain
                 let else_stmts = self.structure_branch(then_target, chain_merge);
-
-                self.scope_depth -= 1;
-
-                // Build result
-                let result = if let Some((switch_arg, cases)) = self.analyze_for_switch(&chain) {
-                    vec![Statement::Switch {
-                        arg: switch_arg,
-                        default: else_stmts,
-                        cases,
-                        enum_type: None,
-                    }]
-                } else if chain.len() > 1 {
-                    vec![Statement::IfElseChain {
-                        branches: chain,
-                        else_: else_stmts,
-                    }]
-                } else {
-                    let (cond, then_stmts) = chain.pop().unwrap();
-                    vec![Statement::IfElse {
-                        cond,
-                        if_: then_stmts,
-                        else_: else_stmts,
-                    }]
-                };
-
-                let mut full_result = result;
-                if let Some(m) = final_merge {
-                    if Some(m) != stop_at && !self.processed.contains(&m) {
-                        full_result.extend(self.structure_from(m, stop_at));
-                    }
-                }
-                return full_result;
+                return self.build_conditional_result(chain, else_stmts, has_preambles, final_merge, stop_at);
             }
 
             // Standard pattern: case body is in then branch
             let then_stmts = self.structure_branch(then_target, merge);
+            chain.push((preamble, condition, then_stmts));
 
-            chain.push((condition, then_stmts));
-
-            // Check if the else branch is another simple conditional we can chain
+            // Check if the else branch can continue the chain
             if let Some(e) = else_target {
                 if Some(e) != merge && self.is_chain_candidate(e) {
-                    // Continue the chain with this block
                     current_block = Some(e);
                     continue;
                 }
             }
 
-            // Else branch is not a simple conditional - structure it and end chain
+            // End of chain
             let else_stmts = self.structure_branch(else_target, merge);
+            return self.build_conditional_result(chain, else_stmts, has_preambles, final_merge, stop_at);
+        }
 
-            self.scope_depth -= 1;
+        self.scope_depth -= 1;
 
-            // Build the result based on chain analysis
-            let result = if let Some((switch_arg, cases)) = self.analyze_for_switch(&chain) {
-                // Chain matches switch pattern - emit switch statement
+        // Edge case: loop ended without producing result
+        if chain.is_empty() {
+            return vec![];
+        }
+
+        // Build result from accumulated chain (no else)
+        self.build_conditional_result(chain, vec![], has_preambles, final_merge, stop_at)
+    }
+
+    /// Build the final result from a collected conditional chain
+    fn build_conditional_result(
+        &mut self,
+        chain: Vec<(Vec<Statement>, Expr, Vec<Statement>)>,
+        else_stmts: Vec<Statement>,
+        has_preambles: bool,
+        final_merge: Option<NodeIndex>,
+        stop_at: Option<NodeIndex>,
+    ) -> Vec<Statement> {
+        self.scope_depth -= 1;
+
+        let result = if has_preambles {
+            // Build nested IfElse iteratively (from last to first) to include preambles
+            self.build_nested_if_else(chain, else_stmts)
+        } else {
+            // No preambles - can use flat representation
+            // Convert chain to (condition, body) format for analysis
+            let flat_chain: Vec<(Expr, Vec<Statement>)> = chain.into_iter()
+                .map(|(_, cond, body)| (cond, body))
+                .collect();
+
+            if let Some((switch_arg, cases)) = self.analyze_for_switch(&flat_chain) {
                 vec![Statement::Switch {
                     arg: switch_arg,
                     default: else_stmts,
                     cases,
                     enum_type: None,
                 }]
-            } else if chain.len() > 1 {
-                // Use flat IfElseChain for multiple conditions
+            } else if flat_chain.len() > 1 {
                 vec![Statement::IfElseChain {
-                    branches: chain,
+                    branches: flat_chain,
                     else_: else_stmts,
                 }]
-            } else {
-                // Single conditional - use regular IfElse
-                let (cond, then_stmts) = chain.pop().unwrap();
-                vec![Statement::IfElse {
-                    cond,
-                    if_: then_stmts,
-                    else_: else_stmts,
-                }]
-            };
-
-            // Continue after merge
-            let mut full_result = result;
-            if let Some(m) = final_merge {
-                if Some(m) != stop_at && !self.processed.contains(&m) {
-                    full_result.extend(self.structure_from(m, stop_at));
+            } else if flat_chain.len() == 1 {
+                let (cond, then_stmts) = flat_chain.into_iter().next().unwrap();
+                if let Some(ternary) = self.try_condense_ternary_return(&cond, &then_stmts, &else_stmts) {
+                    vec![ternary]
+                } else {
+                    vec![Statement::IfElse {
+                        cond,
+                        if_: then_stmts,
+                        else_: else_stmts,
+                    }]
                 }
+            } else {
+                else_stmts
             }
+        };
 
-            return full_result;
+        // Continue after merge
+        let mut full_result = result;
+        if let Some(m) = final_merge {
+            if Some(m) != stop_at && !self.processed.contains(&m) {
+                full_result.extend(self.structure_from(m, stop_at));
+            }
         }
 
-        self.scope_depth -= 1;
+        full_result
+    }
 
-        // Edge case: loop ended without producing result (shouldn't happen normally)
-        if chain.is_empty() {
-            return vec![];
+    /// Build nested IfElse structure iteratively from a chain with preambles
+    /// This avoids recursion by building from last to first
+    fn build_nested_if_else(
+        &self,
+        chain: Vec<(Vec<Statement>, Expr, Vec<Statement>)>,
+        final_else: Vec<Statement>,
+    ) -> Vec<Statement> {
+        // Build from last to first: each iteration wraps the previous result as the else branch
+        let mut current_else = final_else;
+
+        for (preamble, cond, then_body) in chain.into_iter().rev() {
+            let if_else = Statement::IfElse {
+                cond,
+                if_: then_body,
+                else_: current_else,
+            };
+            // Preamble goes before the if-else
+            let mut block = preamble;
+            block.push(if_else);
+            current_else = block;
         }
 
-        // Build result from accumulated chain
-        vec![Statement::IfElseChain {
-            branches: chain,
-            else_: vec![],
-        }]
+        current_else
     }
 
     /// Extract condition from a conditional jump
@@ -1646,47 +1673,64 @@ impl<'a> Structurer<'a> {
         }
     }
 
-    /// Get φ-elimination assignments for a merge point
-    /// Returns (assignments for then branch, assignments for else branch)
-    fn get_phi_assignments_for_merge(
-        &mut self,
-        merge: NodeIndex,
-        then_pred: Option<NodeIndex>,
-        else_pred: Option<NodeIndex>,
-    ) -> (Vec<Statement>, Vec<Statement>) {
-        let mut then_assigns = Vec::new();
-        let mut else_assigns = Vec::new();
+    /// Try to condense an if/else with returns into a ternary return.
+    /// Returns Some(statement) if the pattern matches, None otherwise.
+    ///
+    /// Supported patterns:
+    /// - Pattern 1: if (cond) { return a; } else { return b; } → return cond ? a : b
+    /// - Pattern 2: if (cond) { r = a; return r; } else { r = b; return r; } → return cond ? a : b
+    /// - Pattern 3: if (cond) { r = a; return r; } else { return b; } → return cond ? a : b
+    /// - Pattern 4: if (cond) { return a; } else { r = b; return r; } → return cond ? a : b
+    fn try_condense_ternary_return(
+        &self,
+        cond: &Expr,
+        then_stmts: &[Statement],
+        else_stmts: &[Statement],
+    ) -> Option<Statement> {
+        // Pattern 1: Simple returns in both branches
+        // if (cond) { return a; } else { return b; }
+        if then_stmts.len() == 1 && else_stmts.len() == 1 {
+            if let (Statement::Return(Some(if_expr)), Statement::Return(Some(else_expr))) =
+                (&then_stmts[0], &else_stmts[0])
+            {
+                return Some(Statement::Return(Some(Expr::IfElse {
+                    cond: Box::new(cond.clone()),
+                    if_: vec![Statement::ExprStatement(if_expr.clone())],
+                    else_: vec![Statement::ExprStatement(else_expr.clone())],
+                })));
+            }
+        }
 
-        if let Some(ssa_block) = self.ssa.blocks.get(&merge) {
-            for phi in &ssa_block.phis {
-                if let SsaInstr::Phi { dst, sources } = phi {
-                    // Use register name for phi destination (non-SSA-versioned)
-                    // For same-register phis, we use the debug name if available
-                    // This allows the value to "flow through" without explicit assignments
-                    let dst_name = self.reg_name(dst.reg);
-                    let dst_expr = Expr::Variable(dst.reg, Some(dst_name.clone()));
-
-                    // Find source for then branch
-                    if let Some(then_node) = then_pred {
-                        if let Some((_, src_var)) = sources.iter().find(|(pred, _)| *pred == then_node) {
-                            // Skip if source is same register as destination (self-assignment)
-                            // This is the common case for same-register phis - the value flows through
-                            if src_var.reg != dst.reg {
-                                let src_name = self.reg_name(src_var.reg);
-                                let src_expr = Expr::Variable(src_var.reg, Some(src_name));
-                                then_assigns.push(self.make_assign(dst_expr.clone(), src_expr));
-                            }
-                        }
-                    }
-
-                    // Find source for else branch
-                    if let Some(else_node) = else_pred {
-                        if let Some((_, src_var)) = sources.iter().find(|(pred, _)| *pred == else_node) {
-                            // Skip if source is same register as destination
-                            if src_var.reg != dst.reg {
-                                let src_name = self.reg_name(src_var.reg);
-                                let src_expr = Expr::Variable(src_var.reg, Some(src_name));
-                                else_assigns.push(self.make_assign(dst_expr, src_expr));
+        // Pattern 2: Assignment + return in both branches
+        // if (cond) { r = a; return r; } else { r = b; return r; }
+        if then_stmts.len() == 2 && else_stmts.len() == 2 {
+            if let (
+                Statement::Assign { variable: if_var, assign: if_assign, .. },
+                Statement::Return(Some(if_ret)),
+            ) = (&then_stmts[0], &then_stmts[1])
+            {
+                if let (
+                    Statement::Assign { variable: else_var, assign: else_assign, .. },
+                    Statement::Return(Some(else_ret)),
+                ) = (&else_stmts[0], &else_stmts[1])
+                {
+                    // Check that both assign to the same register and return that register
+                    if let (Expr::Variable(if_reg, _), Expr::Variable(else_reg, _)) =
+                        (if_var, else_var)
+                    {
+                        if if_reg == else_reg {
+                            if let (
+                                Expr::Variable(if_ret_reg, _),
+                                Expr::Variable(else_ret_reg, _),
+                            ) = (if_ret, else_ret)
+                            {
+                                if if_ret_reg == if_reg && else_ret_reg == else_reg {
+                                    return Some(Statement::Return(Some(Expr::IfElse {
+                                        cond: Box::new(cond.clone()),
+                                        if_: vec![Statement::ExprStatement(if_assign.clone())],
+                                        else_: vec![Statement::ExprStatement(else_assign.clone())],
+                                    })));
+                                }
                             }
                         }
                     }
@@ -1694,7 +1738,55 @@ impl<'a> Structurer<'a> {
             }
         }
 
-        (then_assigns, else_assigns)
+        // Pattern 3: Asymmetric - if has assign+return, else has direct return
+        // if (cond) { r = a; return r; } else { return b; }
+        if then_stmts.len() == 2 && else_stmts.len() == 1 {
+            if let (
+                Statement::Assign { variable: if_var, assign: if_assign, .. },
+                Statement::Return(Some(if_ret)),
+            ) = (&then_stmts[0], &then_stmts[1])
+            {
+                if let Statement::Return(Some(else_expr)) = &else_stmts[0] {
+                    if let (Expr::Variable(if_reg, _), Expr::Variable(if_ret_reg, _)) =
+                        (if_var, if_ret)
+                    {
+                        if if_reg == if_ret_reg {
+                            return Some(Statement::Return(Some(Expr::IfElse {
+                                cond: Box::new(cond.clone()),
+                                if_: vec![Statement::ExprStatement(if_assign.clone())],
+                                else_: vec![Statement::ExprStatement(else_expr.clone())],
+                            })));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pattern 4: Asymmetric (reversed) - if has direct return, else has assign+return
+        // if (cond) { return a; } else { r = b; return r; }
+        if then_stmts.len() == 1 && else_stmts.len() == 2 {
+            if let Statement::Return(Some(if_expr)) = &then_stmts[0] {
+                if let (
+                    Statement::Assign { variable: else_var, assign: else_assign, .. },
+                    Statement::Return(Some(else_ret)),
+                ) = (&else_stmts[0], &else_stmts[1])
+                {
+                    if let (Expr::Variable(else_reg, _), Expr::Variable(else_ret_reg, _)) =
+                        (else_var, else_ret)
+                    {
+                        if else_reg == else_ret_reg {
+                            return Some(Statement::Return(Some(Expr::IfElse {
+                                cond: Box::new(cond.clone()),
+                                if_: vec![Statement::ExprStatement(if_expr.clone())],
+                                else_: vec![Statement::ExprStatement(else_assign.clone())],
+                            })));
+                        }
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     /// Structure a switch statement

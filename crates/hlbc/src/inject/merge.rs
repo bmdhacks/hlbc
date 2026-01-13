@@ -109,6 +109,7 @@ pub fn format_type(code: &Bytecode, t: RefType) -> String {
             let field_names: Vec<_> = fields.iter().map(|f| code.get(f.name).to_string()).collect();
             format!("virtual({})", field_names.join(","))
         }
+        Type::Guid => "guid".to_string(),
     }
 }
 

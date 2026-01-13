@@ -222,6 +222,7 @@ impl Type {
                 w.write_u8(22)?;
                 inner.write(w)?;
             }
+            Type::Guid => w.write_u8(23)?,
         }
         Ok(())
     }

@@ -72,6 +72,7 @@ impl BytecodeFmt for HaxeFmt {
             Type::Dyn | Type::DynObj => write!(f, "Dynamic"),
             Type::Array => write!(f, "Array<Dynamic>"),
             Type::Type => write!(f, "Class<Dynamic>"),
+            Type::Guid => write!(f, "hl.Guid"),
         }
     }
 
@@ -217,6 +218,7 @@ fn to_haxe_type<'a>(ty: &Type, ctx: &'a Bytecode) -> Str {
             Str::from(format!("Null<{}>", inner_name))
         }
         Packed(_) => Str::from_static("Dynamic"),
+        Guid => Str::from_static("hl.Guid"),
     }
 }
 

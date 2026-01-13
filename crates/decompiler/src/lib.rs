@@ -189,6 +189,7 @@ pub fn decompile_code_with_closures(
 
     // Pass 7: Iterative optimization loop
     // Multiple passes can enable each other (e.g., inverting empty ifs can expose early return patterns)
+    // Note: condense_ternary_returns has been migrated to structurer.rs (try_condense_ternary_return)
     const MAX_OPT_ITERATIONS: usize = 10;
     for _ in 0..MAX_OPT_ITERATIONS {
         let mut changed = false;
@@ -202,9 +203,6 @@ pub fn decompile_code_with_closures(
         if post::flatten_early_returns(&mut stmts) {
             changed = true;
         }
-
-        // Condense if/else returns to ternary expressions
-        post::condense_ternary_returns(&mut stmts);
 
         if !changed {
             break;

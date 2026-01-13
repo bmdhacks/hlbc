@@ -686,7 +686,8 @@ pub fn get_dst_reg(op: &Opcode) -> Option<Reg> {
         | NullCheck { .. }
         | Assert
         | Prefetch { .. }
-        | Asm { .. } => None,
+        | Asm { .. }
+        | Catch { .. } => None,
     }
 }
 
@@ -818,7 +819,8 @@ fn get_use_regs(op: &Opcode) -> Vec<Reg> {
         | Nop
         | Trap { .. }
         | Assert
-        | Asm { .. } => vec![],
+        | Asm { .. }
+        | Catch { .. } => vec![],
     }
 }
 
@@ -880,7 +882,7 @@ fn classify_opcode_purity(op: &Opcode) -> (bool, bool) {
         | JNotLt { .. } | JNotGte { .. } | JEq { .. } | JNotEq { .. } | JAlways { .. }
         | Switch { .. } | Label | Nop | Ret { .. } | Throw { .. } | Rethrow { .. }
         | Trap { .. } | EndTrap { .. } | NullCheck { .. } | Assert | Prefetch { .. }
-        | Asm { .. } => (false, false),
+        | Asm { .. } | Catch { .. } => (false, false),
     }
 }
 

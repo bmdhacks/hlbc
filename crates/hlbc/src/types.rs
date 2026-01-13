@@ -185,6 +185,8 @@ pub enum Type {
     Struct(TypeObj),
     /// Packed wrapper
     Packed(RefType),
+    /// GUID type (128-bit unique identifier)
+    Guid,
 }
 
 impl Type {

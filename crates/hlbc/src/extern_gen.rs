@@ -122,6 +122,8 @@ fn hl_type_to_haxe_depth(ty: &Type, code: &Bytecode, depth: usize) -> String {
         Type::Abstract { name } => format_type_name(&code.get(*name)),
 
         Type::Enum { name, .. } => format_type_name(&code.get(*name)),
+
+        Type::Guid => "hl.Guid".to_string(),
     }
 }
 

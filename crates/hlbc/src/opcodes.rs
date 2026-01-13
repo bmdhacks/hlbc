@@ -748,6 +748,12 @@ pub enum Opcode {
         /// Warning ! Only non-zero values indicates valid reg. Register index is reg-1.
         reg: Reg,
     },
+    /// Catch block marker. Only used for typing by OTrap - doesn't execute.
+    ///
+    /// `dst = <caught exception>`
+    Catch {
+        dst: Reg,
+    },
 }
 
 #[cfg(test)]

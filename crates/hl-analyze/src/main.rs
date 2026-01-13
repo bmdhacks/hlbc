@@ -178,6 +178,7 @@ fn format_type(t: &hlbc::types::Type, code: &Bytecode) -> String {
             format!("struct<{}>", code.get(obj.name))
         }
         Type::Packed(inner) => format!("packed<{}>", format_type(code.get(*inner), code)),
+        Type::Guid => "guid".to_string(),
     }
 }
 
