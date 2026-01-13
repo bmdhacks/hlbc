@@ -202,9 +202,38 @@ fn main() -> anyhow::Result<()> {
             anyhow::anyhow!("--decompile-all requires --output <DIR> to specify output directory")
         })?;
 
+        // Build exclude list - add stdlib exclusions by default unless --include-stdlib
+        let mut exclude = args.exclude_filter.clone();
+        if !args.include_stdlib {
+            // Default exclusions for standard library types that can't be properly decompiled
+            // (they have intrinsic implementations and conflict with Haxe's stdlib)
+            let stdlib_patterns = [
+                "$*",           // All internal static type holders ($String, $Std, etc.)
+                "haxe.**",      // Haxe standard library
+                "sys.**",       // System library (with package prefix)
+                "hl.**",        // HashLink types (with package prefix)
+                "Std",          // Std class (top-level)
+                "String",       // String class (intrinsic)
+                "StringBuf",    // StringBuf class
+                "Type",         // Type class (intrinsic)
+                "Reflect",      // Reflect class (intrinsic)
+                "Sys",          // Sys class (top-level)
+                "Date",         // Date class
+                "Math",         // Math class (intrinsic)
+                "EReg",         // EReg class
+                "Xml",          // Xml class
+                "SysError",     // SysError exception type
+            ];
+            for pattern in stdlib_patterns {
+                if !exclude.iter().any(|e| e == pattern) {
+                    exclude.push(pattern.to_string());
+                }
+            }
+        }
+
         let batch_opts = BatchOptions {
             include: args.type_filter.clone(),
-            exclude: args.exclude_filter.clone(),
+            exclude,
             verbose: args.verbose,
         };
 

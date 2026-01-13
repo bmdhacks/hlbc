@@ -2013,7 +2013,7 @@ fn collect_used_vars_in_expr(expr: &Expr, used: &mut std::collections::HashSet<S
     }
 }
 
-/// Inline constants that are immediately returned.
+/// Inline constants that are immediately used in the next statement.
 ///
 /// Transforms:
 /// ```haxe
@@ -2025,53 +2025,96 @@ fn collect_used_vars_in_expr(expr: &Expr, used: &mut std::collections::HashSet<S
 /// return true;
 /// ```
 ///
+/// Also handles:
+/// ```haxe
+/// r2_2 = 0;
+/// return ((n >= r2_2) ? 0 : -1);
+/// ```
+/// into:
+/// ```haxe
+/// return ((n >= 0) ? 0 : -1);
+/// ```
+///
 /// This handles forward-declared variables that are assigned a constant
-/// and then immediately returned, which the main inlining pass misses
+/// and then immediately used, which the main inlining pass misses
 /// because it only handles declaration assignments.
 pub fn inline_constant_returns(stmts: &mut Vec<Statement>) {
+    // Run until no more changes (inlining can enable more inlining)
+    let mut changed = true;
+    while changed {
+        // Pass an empty set - at top level, no outer variables to protect
+        changed = inline_constant_returns_pass(stmts, &std::collections::HashSet::new());
+    }
+}
+
+fn inline_constant_returns_pass(
+    stmts: &mut Vec<Statement>,
+    outer_used_vars: &std::collections::HashSet<String>,
+) -> bool {
+    let mut changed = false;
     let mut i = 0;
     while i < stmts.len() {
-        // First recurse into nested structures
+        // First, recurse into nested structures, passing along info about
+        // variables used later in this scope (so nested scopes don't inline them)
+        let vars_used_after = collect_vars_used_in_remaining(stmts, i + 1);
+        let mut combined_outer: std::collections::HashSet<String> = outer_used_vars.clone();
+        combined_outer.extend(vars_used_after);
+
         match &mut stmts[i] {
             Statement::IfElse { if_, else_, .. } => {
-                inline_constant_returns(if_);
-                inline_constant_returns(else_);
+                if inline_constant_returns_pass(if_, &combined_outer) { changed = true; }
+                if inline_constant_returns_pass(else_, &combined_outer) { changed = true; }
             }
-            Statement::While { stmts, .. } => {
-                inline_constant_returns(stmts);
+            Statement::While { stmts: inner, .. } => {
+                if inline_constant_returns_pass(inner, &combined_outer) { changed = true; }
             }
             Statement::Switch { default, cases, .. } => {
-                inline_constant_returns(default);
+                if inline_constant_returns_pass(default, &combined_outer) { changed = true; }
                 for (_, case_stmts) in cases {
-                    inline_constant_returns(case_stmts);
+                    if inline_constant_returns_pass(case_stmts, &combined_outer) { changed = true; }
                 }
             }
             Statement::TryCatch { try_stmts, catch_stmts, .. } => {
-                inline_constant_returns(try_stmts);
-                inline_constant_returns(catch_stmts);
+                if inline_constant_returns_pass(try_stmts, &combined_outer) { changed = true; }
+                if inline_constant_returns_pass(catch_stmts, &combined_outer) { changed = true; }
             }
-            Statement::Block { stmts } | Statement::Sequence { stmts } => {
-                inline_constant_returns(stmts);
+            Statement::Block { stmts: inner } | Statement::Sequence { stmts: inner } => {
+                if inline_constant_returns_pass(inner, &combined_outer) { changed = true; }
             }
             _ => {}
         }
 
-        // Look for pattern: assign pure expr to var, then return that var
+        // Look for pattern: assign pure expr to var, then use that var in next stmt
         if i + 1 < stmts.len() {
-            if let Statement::Assign { variable, assign, .. } = &stmts[i] {
-                if is_pure_expr(assign) {
+            if let Statement::Assign { variable, assign, declaration, .. } = &stmts[i] {
+                // Only inline non-declaration assignments (forward-declared vars)
+                // Declaration assignments are handled by inline_single_use_vars
+                if !declaration && is_pure_expr(assign) {
                     if let Some(var_name) = get_var_name(variable) {
-                        if let Statement::Return(Some(ret_expr)) = &stmts[i + 1] {
-                            if let Expr::Variable(_, Some(ret_name)) = ret_expr {
-                                if ret_name.as_ref() == var_name {
-                                    // Found the pattern - inline the constant into the return
-                                    let new_return = Statement::Return(Some(assign.clone()));
-                                    stmts[i + 1] = new_return;
-                                    stmts.remove(i);
-                                    // Don't increment i - we removed current statement
-                                    continue;
-                                }
-                            }
+                        // Don't inline if variable is used in outer scope
+                        if outer_used_vars.contains(&var_name) {
+                            i += 1;
+                            continue;
+                        }
+
+                        // Count uses in the next statement (including nested structures)
+                        let uses_in_next = count_uses_in_stmt(&stmts[i + 1], &var_name);
+
+                        // Also count uses in ALL remaining statements (i+2 onwards)
+                        let mut uses_later = 0;
+                        for stmt in stmts.iter().skip(i + 2) {
+                            uses_later += count_uses_in_stmt(stmt, &var_name);
+                        }
+
+                        // Only inline if used exactly once in next stmt and never later
+                        if uses_in_next == 1 && uses_later == 0 {
+                            // Inline the constant into the next statement
+                            let replacement = assign.clone();
+                            replace_var_in_stmt(&mut stmts[i + 1], &var_name, &replacement);
+                            stmts.remove(i);
+                            changed = true;
+                            // Don't increment i - we removed current statement
+                            continue;
                         }
                     }
                 }
@@ -2079,5 +2122,103 @@ pub fn inline_constant_returns(stmts: &mut Vec<Statement>) {
         }
 
         i += 1;
+    }
+    changed
+}
+
+/// Collect all variable names used in statements from index `start` onwards
+fn collect_vars_used_in_remaining(stmts: &[Statement], start: usize) -> std::collections::HashSet<String> {
+    let mut used = std::collections::HashSet::new();
+    for stmt in stmts.iter().skip(start) {
+        collect_var_names_in_stmt(stmt, &mut used);
+    }
+    used
+}
+
+fn collect_var_names_in_stmt(stmt: &Statement, used: &mut std::collections::HashSet<String>) {
+    match stmt {
+        Statement::Assign { variable, assign, .. } => {
+            collect_var_names_in_expr(variable, used);
+            collect_var_names_in_expr(assign, used);
+        }
+        Statement::ExprStatement(e) => collect_var_names_in_expr(e, used),
+        Statement::Return(Some(e)) => collect_var_names_in_expr(e, used),
+        Statement::IfElse { cond, if_, else_ } => {
+            collect_var_names_in_expr(cond, used);
+            for s in if_ { collect_var_names_in_stmt(s, used); }
+            for s in else_ { collect_var_names_in_stmt(s, used); }
+        }
+        Statement::While { cond, stmts } => {
+            collect_var_names_in_expr(cond, used);
+            for s in stmts { collect_var_names_in_stmt(s, used); }
+        }
+        Statement::Switch { arg, default, cases, .. } => {
+            collect_var_names_in_expr(arg, used);
+            for s in default { collect_var_names_in_stmt(s, used); }
+            for (_, case_stmts) in cases {
+                for s in case_stmts { collect_var_names_in_stmt(s, used); }
+            }
+        }
+        Statement::TryCatch { try_stmts, catch_stmts, .. } => {
+            for s in try_stmts { collect_var_names_in_stmt(s, used); }
+            for s in catch_stmts { collect_var_names_in_stmt(s, used); }
+        }
+        Statement::Block { stmts } | Statement::Sequence { stmts } => {
+            for s in stmts { collect_var_names_in_stmt(s, used); }
+        }
+        _ => {}
+    }
+}
+
+fn collect_var_names_in_expr(expr: &Expr, used: &mut std::collections::HashSet<String>) {
+    match expr {
+        Expr::Variable(_, Some(name)) => { used.insert(name.to_string()); }
+        Expr::Field(inner, _) => collect_var_names_in_expr(inner, used),
+        Expr::Array(arr, idx) => {
+            collect_var_names_in_expr(arr, used);
+            collect_var_names_in_expr(idx, used);
+        }
+        Expr::Call(call) => {
+            collect_var_names_in_expr(&call.fun, used);
+            for arg in &call.args { collect_var_names_in_expr(arg, used); }
+        }
+        Expr::Op(op) => {
+            match op {
+                Operation::Add(l, r) | Operation::Sub(l, r) | Operation::Mul(l, r) |
+                Operation::Div(l, r) | Operation::Mod(l, r) | Operation::Shl(l, r) |
+                Operation::Shr(l, r) | Operation::And(l, r) | Operation::Or(l, r) |
+                Operation::Xor(l, r) | Operation::Eq(l, r) | Operation::NotEq(l, r) |
+                Operation::Gt(l, r) | Operation::Gte(l, r) | Operation::Lt(l, r) |
+                Operation::Lte(l, r) => {
+                    collect_var_names_in_expr(l, used);
+                    collect_var_names_in_expr(r, used);
+                }
+                Operation::Neg(e) | Operation::Not(e) | Operation::Incr(e) | Operation::Decr(e) => {
+                    collect_var_names_in_expr(e, used);
+                }
+            }
+        }
+        Expr::IfElse { cond, if_, else_ } => {
+            collect_var_names_in_expr(cond, used);
+            for s in if_ { collect_var_names_in_stmt(s, used); }
+            for s in else_ { collect_var_names_in_stmt(s, used); }
+        }
+        Expr::Constructor(ctor) => {
+            for arg in &ctor.args { collect_var_names_in_expr(arg, used); }
+        }
+        Expr::ArrayLiteral(elems) => {
+            for e in elems { collect_var_names_in_expr(e, used); }
+        }
+        Expr::Anonymous(_, fields) => {
+            for e in fields.values() { collect_var_names_in_expr(e, used); }
+        }
+        Expr::EnumConstr(_, _, args) => {
+            for arg in args { collect_var_names_in_expr(arg, used); }
+        }
+        Expr::Closure(_, stmts) => {
+            for s in stmts { collect_var_names_in_stmt(s, used); }
+        }
+        Expr::Cast(inner, _) => collect_var_names_in_expr(inner, used),
+        _ => {}
     }
 }

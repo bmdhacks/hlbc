@@ -87,6 +87,9 @@ fn matches_pattern(name: &str, pattern: &str) -> bool {
         // pattern "h2d.*" should match "h2d.Foo" but not "h2d.sub.Bar"
         let prefix = &pattern[..pattern.len() - 1]; // Keep the dot: "h2d."
         name.starts_with(prefix) && !name[prefix.len()..].contains('.')
+    } else if pattern == "$*" {
+        // Special pattern to match all $-prefixed types (internal static holders)
+        name.starts_with('$')
     } else {
         // Exact match
         name == pattern
