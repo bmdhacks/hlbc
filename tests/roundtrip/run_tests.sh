@@ -104,6 +104,18 @@ run_test() {
         fi
     done
 
+    # Copy user package directories (skip stdlib packages: haxe, hl, sys, std)
+    SKIP_DIRS="haxe hl sys std"
+    for d in "$decompiled_dir"/*/; do
+        if [ -d "$d" ]; then
+            dir_name=$(basename "$d")
+            if [[ ! " $SKIP_DIRS " =~ " $dir_name " ]]; then
+                # This is a user package - copy it recursively
+                cp -r "$d" "$single_dir/"
+            fi
+        fi
+    done
+
     # Step 4: Recompile
     if ! $HAXE -cp "$single_dir" --main "$name" -hl "$rt_file" 2>/dev/null; then
         echo -e "${RED}FAIL${NC} (recompile failed)"

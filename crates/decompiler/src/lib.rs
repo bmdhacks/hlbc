@@ -193,8 +193,14 @@ pub fn decompile_code_with_closures(
     // Pass 8: Merge forward declarations with first assignments
     post::merge_declarations(&mut stmts);
 
-    // Pass 9: Condense if/else returns to ternary expressions
+    // Pass 9: Inline constants that are immediately returned
+    post::inline_constant_returns(&mut stmts);
+
+    // Pass 10: Condense if/else returns to ternary expressions
     post::condense_ternary_returns(&mut stmts);
+
+    // Pass 11: Remove unused forward declarations
+    post::remove_unused_var_decls(&mut stmts);
 
     stmts
 }
