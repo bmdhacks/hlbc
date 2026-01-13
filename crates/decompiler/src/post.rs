@@ -9,6 +9,7 @@ pub(crate) trait AstVisitor {
 }
 
 /// Visit everything depth-first
+#[allow(dead_code)]
 pub(crate) fn visit(
     code: &Bytecode,
     stmts: &mut [Statement],
@@ -87,6 +88,7 @@ pub(crate) fn visit(
 }
 
 /// Visit expressions by depth-first recursion into [Expr].
+#[allow(dead_code)]
 pub(crate) fn visit_expr(code: &Bytecode, expr: &mut Expr, visitors: &mut [Box<dyn AstVisitor>]) {
     // Recurse
     macro_rules! rec {
@@ -1295,6 +1297,7 @@ fn is_reassigned_in_stmts(stmts: &[Statement], var_name: &str, skip_idx: usize) 
 }
 
 /// Check if a variable is assigned to in a range of statements (from start_idx+1 to end)
+#[allow(dead_code)]
 fn is_reassigned_in_range(stmts: &[Statement], var_name: &str, start_idx: usize) -> bool {
     for stmt in stmts.iter().skip(start_idx + 1) {
         if is_reassigned_in_stmt(stmt, var_name) {
@@ -1360,6 +1363,7 @@ fn get_var_refs_in_expr(expr: &Expr, vars: &mut Vec<String>) {
 }
 
 /// Check if any variable in an expression is reassigned in the range of statements after def_idx
+#[allow(dead_code)]
 fn expr_vars_reassigned_after(stmts: &[Statement], expr: &Expr, def_idx: usize) -> bool {
     let mut vars = Vec::new();
     get_var_refs_in_expr(expr, &mut vars);
@@ -1629,34 +1633,25 @@ pub fn merge_declarations(stmts: &mut Vec<Statement>) {
         }
     }
 
-    // Sort by decl_idx descending so we can remove from back to front
-    to_merge.sort_by(|a, b| b.0.cmp(&a.0));
-
-    // Perform the merges
-    for (decl_idx, assign_idx) in to_merge {
-        // Get the type hint from the VarDecl (if any)
-        let type_hint = if let Statement::VarDecl { type_hint, .. } = &stmts[decl_idx] {
-            type_hint.clone()
-        } else {
-            None
-        };
-
-        // Convert the assignment to a declaration
-        if let Statement::Assign { variable, assign, .. } = &mut stmts[assign_idx] {
+    // First pass: convert all assignments to declarations (doesn't change indices)
+    for (_decl_idx, assign_idx) in &to_merge {
+        if let Statement::Assign { variable, assign, .. } = &stmts[*assign_idx] {
             // Create new statement with declaration: true
             let new_stmt = Statement::Assign {
                 declaration: true,
                 variable: variable.clone(),
                 assign: assign.clone(),
             };
-            stmts[assign_idx] = new_stmt;
-
-            // If there was a type hint, we might need to add it to the variable
-            // For now, we'll just drop it since Haxe can often infer the type
-            let _ = type_hint;
+            stmts[*assign_idx] = new_stmt;
         }
+    }
 
-        // Remove the VarDecl
+    // Second pass: collect VarDecl indices to remove, sort descending, remove from back to front
+    let mut decl_indices: Vec<usize> = to_merge.iter().map(|(decl_idx, _)| *decl_idx).collect();
+    decl_indices.sort_by(|a, b| b.cmp(a));
+    decl_indices.dedup(); // In case same decl appears multiple times (shouldn't happen, but safe)
+
+    for decl_idx in decl_indices {
         stmts.remove(decl_idx);
     }
 

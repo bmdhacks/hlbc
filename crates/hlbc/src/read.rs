@@ -610,6 +610,7 @@ mod tests {
     }
 
     //#[test]
+    #[allow(dead_code)]
     fn list_strings() {
         let code = Bytecode::from_file("E:\\Games\\Northgard\\hlboot.dat").unwrap();
         let code2 = Bytecode::from_file("E:\\Games\\Wartales\\hlboot.dat").unwrap();

@@ -16,7 +16,7 @@ use hlbc::{Bytecode, Str};
 
 use crate::analyzer::{CfgAnalysis, NaturalLoop};
 use crate::ast::{Call, Constant, ConstructorCall, Expr, Operation, Statement};
-use crate::lifter::{Cfg, EdgeKind};
+use crate::lifter::Cfg;
 use hlbc::types::RefType;
 use crate::ssa::{SsaCfg, SsaInstr, SsaVar, get_dst_reg as get_opcode_dst};
 use crate::type_prop::TypeInfo;
@@ -39,14 +39,8 @@ pub struct Structurer<'a> {
 
     /// Processed blocks (to avoid re-processing)
     processed: HashSet<NodeIndex>,
-    /// Variable names for SSA variables
-    var_names: HashMap<SsaVar, Str>,
-    /// Counter for generating variable names
-    var_counter: u32,
     /// Use-def info for inlining decisions (ILSpy-style)
     use_info: HashMap<SsaVar, UseDefInfo>,
-    /// Expressions to inline (single-use variables)
-    inline_exprs: HashMap<SsaVar, Expr>,
     /// Variable names that have been declared (for declaration tracking)
     declared_vars: HashSet<Str>,
     /// Current opcode index being processed (for debug name lookup)
@@ -79,9 +73,6 @@ pub struct Structurer<'a> {
     string_conversion_source: HashMap<Reg, Expr>,
     /// Ref targets: maps ref reg -> target reg (for Ref dst = &src)
     ref_targets: HashMap<Reg, Reg>,
-    /// Renamed registers: maps (reg, opcode index) -> new name
-    /// Used when we need to give a register a different name to avoid type conflicts
-    renamed_regs: HashMap<Reg, Str>,
     /// Registers that should use raw names (rN) instead of debug names
     /// to avoid type conflicts (e.g., iterator vs iteration value)
     use_raw_name_regs: HashSet<Reg>,
@@ -146,10 +137,7 @@ impl<'a> Structurer<'a> {
             _type_info: type_info,
             closure_analysis,
             processed: HashSet::new(),
-            var_names: HashMap::new(),
-            var_counter: 0,
             use_info,
-            inline_exprs: HashMap::new(),
             exception_analysis,
             declared_vars,
             current_op: 0,
@@ -162,7 +150,6 @@ impl<'a> Structurer<'a> {
             enum_global_map: Self::build_enum_global_map(code),
             string_conversion_source: HashMap::new(),
             ref_targets: HashMap::new(),
-            renamed_regs: HashMap::new(),
             use_raw_name_regs: HashSet::new(),
             iterator_regs: HashSet::new(),
             current_ssa_dst: None,
@@ -178,6 +165,11 @@ impl<'a> Structurer<'a> {
     ///   global@X = value   // global X is constructor N
     fn build_enum_global_map(code: &Bytecode) -> HashMap<hlbc::types::RefGlobal, (RefType, usize)> {
         let mut map = HashMap::new();
+
+        // Skip if no functions are registered (e.g., in tests with mock bytecode)
+        if code.findex_max() == 0 {
+            return map;
+        }
 
         // Get the entry point function using the proper lookup
         let entry_func = code.entrypoint();
@@ -382,63 +374,9 @@ impl<'a> Structurer<'a> {
         simplify_statements(result)
     }
 
-    /// Check if an SSA variable can be inlined.
-    /// Implements ILSpy-style safety guards:
-    /// - Guard 1 (Side-Effect): Pure ops only (checked in UseDefInfo::can_inline)
-    /// - Guard 2 (Debug Name): Don't inline user-named variables
-    /// - Guard 3 (Phi): No cross-block inlining (checked in UseDefInfo::can_inline)
-    fn can_inline_var(&self, var: SsaVar) -> bool {
-        // Guard 2: Don't inline variables with user-defined debug names
-        // These are meaningful names the programmer chose, preserve them
-        if self.has_user_debug_name(var.reg) {
-            return false;
-        }
-
-        // Check SSA-based criteria (purity, use count, phi uses)
-        self.use_info.get(&var).map_or(false, |info| info.can_inline())
-    }
-
-    /// Check if a register has a user-defined debug name (not synthetic)
-    fn has_user_debug_name(&self, reg: Reg) -> bool {
-        // Check if the function has assigns (debug variable names)
-        // assigns is Vec<(RefString name, usize op_idx)>
-        // IMPORTANT: op_idx points to the opcode AFTER the definition.
-        // The actual definition is at op_idx - 1.
-        if let Some(assigns) = &self.func.assigns {
-            for (_, op_idx) in assigns {
-                let def_idx = op_idx.saturating_sub(1);
-                if def_idx < self.func.ops.len() {
-                    if let Some(dst_reg) = get_opcode_dst(&self.func.ops[def_idx]) {
-                        if dst_reg == reg {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-        false
-    }
-
     /// Check if an SSA variable is dead (defined but never used)
     fn is_dead_var(&self, var: SsaVar) -> bool {
         self.use_info.get(&var).map_or(false, |info| info.is_dead())
-    }
-
-    /// Store an expression for later inlining
-    fn store_for_inline(&mut self, var: SsaVar, expr: Expr) {
-        self.inline_exprs.insert(var, expr);
-    }
-
-    /// Try to get an inlined expression for a register
-    fn get_inlined_expr(&mut self, reg: Reg) -> Option<Expr> {
-        // Find the most recent SSA version for this register that can be inlined
-        // This is a simplification - in practice we'd need to track the current version
-        for (var, expr) in self.inline_exprs.iter() {
-            if var.reg == reg {
-                return Some(expr.clone());
-            }
-        }
-        None
     }
 
     /// Check if a register is a closure context (EnumAlloc result for a closure)
@@ -457,11 +395,6 @@ impl<'a> Structurer<'a> {
         } else {
             None
         }
-    }
-
-    /// Get the current function's reference
-    fn current_fun(&self) -> RefFun {
-        self.func.findex
     }
 
     /// Check if the current function is a closure (inner function with capture context)
@@ -536,122 +469,6 @@ impl<'a> Structurer<'a> {
                 stmts
             }
         }
-    }
-
-    /// Structure a try/catch block
-    fn structure_try_catch(&mut self, try_start: NodeIndex, catch_handler: NodeIndex, stop_at: Option<NodeIndex>) -> Vec<Statement> {
-        self.processed.insert(try_start);
-
-        // Find the exception register from the Trap opcode
-        let try_block = &self.cfg.graph[try_start];
-        let catch_var = if let Some(Opcode::Trap { exc, .. }) = self.func.ops.get(try_block.start) {
-            self.reg_name(*exc).to_string()
-        } else {
-            "e".to_string()
-        };
-
-        // Structure try body - follow normal flow, not the exception handler
-        // Find the non-exception successor
-        let normal_succs: Vec<NodeIndex> = self.cfg.successors_with_edges(try_start)
-            .into_iter()
-            .filter(|(_, kind)| !matches!(kind, crate::lifter::EdgeKind::ExceptionHandler))
-            .map(|(n, _)| n)
-            .collect();
-
-        // Structure the try block itself (excluding Trap opcode which is control flow)
-        self.scope_depth += 1;
-        let mut try_stmts = self.structure_block_range(try_block.start + 1, try_block.end + 1);
-
-        // Continue structuring try body following normal flow
-        // Stop at the catch handler (we'll handle that separately)
-        for succ in normal_succs {
-            if succ != catch_handler && !self.processed.contains(&succ) {
-                try_stmts.extend(self.structure_try_body(succ, catch_handler));
-            }
-        }
-        self.scope_depth -= 1;
-
-        // Structure catch body
-        self.scope_depth += 1;
-        let catch_stmts = self.structure_catch_body(catch_handler, stop_at);
-        self.scope_depth -= 1;
-
-        // Create TryCatch statement
-        let try_catch = Statement::TryCatch {
-            try_stmts,
-            catch_var,
-            catch_stmts,
-        };
-
-        // Find where control flow continues after try/catch
-        // This is typically where EndTrap jumps to
-        let mut result = vec![try_catch];
-
-        // Continue after the catch handler if there's more code
-        // The catch handler's successor (if not already processed) continues the function
-        let catch_succs = self.cfg.successors(catch_handler);
-        for succ in catch_succs {
-            if !self.processed.contains(&succ) && Some(succ) != stop_at {
-                result.extend(self.structure_from(succ, stop_at));
-            }
-        }
-
-        result
-    }
-
-    /// Structure the try body, stopping when we hit EndTrap or the catch handler
-    fn structure_try_body(&mut self, start: NodeIndex, catch_handler: NodeIndex) -> Vec<Statement> {
-        if start == catch_handler || self.processed.contains(&start) {
-            return vec![];
-        }
-
-        self.processed.insert(start);
-        let block = &self.cfg.graph[start];
-
-        // Check if this block ends with EndTrap (end of try body)
-        let ends_with_endtrap = matches!(
-            self.func.ops.get(block.end),
-            Some(Opcode::EndTrap { .. })
-        );
-
-        let mut stmts = if ends_with_endtrap {
-            // Structure up to but not including EndTrap
-            self.structure_block_range(block.start, block.end)
-        } else {
-            self.structure_block(start)
-        };
-
-        // If we haven't hit EndTrap, continue following normal flow
-        if !ends_with_endtrap {
-            let succs = self.cfg.successors(start);
-            for succ in succs {
-                if succ != catch_handler {
-                    stmts.extend(self.structure_try_body(succ, catch_handler));
-                }
-            }
-        }
-
-        stmts
-    }
-
-    /// Structure the catch body
-    fn structure_catch_body(&mut self, handler: NodeIndex, stop_at: Option<NodeIndex>) -> Vec<Statement> {
-        if self.processed.contains(&handler) {
-            return vec![];
-        }
-
-        self.processed.insert(handler);
-        let mut stmts = self.structure_block(handler);
-
-        // Continue structuring catch body
-        let succs = self.cfg.successors(handler);
-        if succs.len() == 1 && !self.processed.contains(&succs[0]) && Some(succs[0]) != stop_at {
-            // Check if the successor might be the merge point (shared with try body)
-            // For now, just continue until we hit something already processed
-            stmts.extend(self.structure_from(succs[0], stop_at));
-        }
-
-        stmts
     }
 
     /// Structure a loop
@@ -1524,46 +1341,6 @@ impl<'a> Structurer<'a> {
         stmts
     }
 
-    /// Convert an opcode to just the expression (for inlining)
-    fn opcode_to_expr(&self, op_idx: usize) -> Option<Expr> {
-        let op = &self.func.ops[op_idx];
-        match op {
-            Opcode::Int { ptr, .. } => Some(Expr::Constant(Constant::Int(*ptr))),
-            Opcode::Float { ptr, .. } => Some(Expr::Constant(Constant::Float(*ptr))),
-            Opcode::Bool { value, .. } => Some(Expr::Constant(Constant::Bool(*value))),
-            Opcode::String { ptr, .. } => Some(Expr::Constant(Constant::String(*ptr))),
-            Opcode::Null { .. } => Some(Expr::Constant(Constant::Null)),
-            Opcode::Mov { src, .. } => Some(self.reg_to_expr(*src)),
-            Opcode::Add { a, b, .. } => Some(Expr::Op(Operation::Add(
-                Box::new(self.reg_to_expr(*a)),
-                Box::new(self.reg_to_expr(*b)),
-            ))),
-            Opcode::Sub { a, b, .. } => Some(Expr::Op(Operation::Sub(
-                Box::new(self.reg_to_expr(*a)),
-                Box::new(self.reg_to_expr(*b)),
-            ))),
-            Opcode::Mul { a, b, .. } => Some(Expr::Op(Operation::Mul(
-                Box::new(self.reg_to_expr(*a)),
-                Box::new(self.reg_to_expr(*b)),
-            ))),
-            Opcode::Field { obj, field, .. } => {
-                let obj_expr = self.reg_to_expr(*obj);
-                let field_name = self.get_field_name(*obj, *field);
-                Some(Expr::Field(Box::new(obj_expr), field_name))
-            }
-            Opcode::GetGlobal { global, .. } => {
-                // Check if this is a string constant global
-                if let Some(string_ref) = self.get_global_string_value(*global) {
-                    Some(Expr::Constant(Constant::String(string_ref)))
-                } else {
-                    let name = self.get_global_name(*global);
-                    Some(Expr::Ident(name))
-                }
-            }
-            _ => None, // Complex expressions not handled for inlining
-        }
-    }
-
     fn is_control_flow_op(&self, op_idx: usize) -> bool {
         matches!(
             &self.func.ops[op_idx],
@@ -2001,7 +1778,7 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::NullCheck { reg } => {
-                let var = self.reg_to_expr(*reg);
+                let _var = self.reg_to_expr(*reg);
                 Some(Statement::Comment(format!("nullcheck {}", self.reg_name(*reg))))
             }
 
@@ -2576,31 +2353,6 @@ impl<'a> Structurer<'a> {
         }
     }
 
-    /// Get the name of an enum construct variant.
-    /// Uses the destination register's type to find the parent enum.
-    fn get_enum_construct_name(&self, dst: Reg, construct: hlbc::types::RefEnumConstruct) -> Str {
-        let reg_idx = dst.0 as usize;
-        if reg_idx < self.func.regs.len() {
-            let type_ref = self.func.regs[reg_idx];
-            if let Some(ty) = self.code.types.get(type_ref.0) {
-                if let hlbc::types::Type::Enum { name, constructs, .. } = ty {
-                    // Get the enum type name
-                    let enum_name = self.code.strings.get(name.0)
-                        .cloned()
-                        .unwrap_or_else(|| "Enum".into());
-                    // Get the specific construct name if valid
-                    if let Some(c) = constructs.get(construct.0) {
-                        if let Some(cname) = self.code.strings.get(c.name.0) {
-                            return format!("{}.{}", enum_name, cname).into();
-                        }
-                    }
-                    return enum_name;
-                }
-            }
-        }
-        format!("EnumConstruct_{}", construct.0).into()
-    }
-
     fn get_type_ref(&self, reg: Reg) -> RefType {
         let reg_idx = reg.0 as usize;
         if reg_idx < self.func.regs.len() {
@@ -2658,39 +2410,6 @@ impl<'a> Structurer<'a> {
             }
         }
         false
-    }
-
-    fn get_type_name(&self, reg: Reg) -> Str {
-        let reg_idx = reg.0 as usize;
-        if reg_idx < self.func.regs.len() {
-            let type_ref = self.func.regs[reg_idx];
-            match &self.code.types[type_ref.0] {
-                hlbc::types::Type::Obj(obj) => {
-                    return self.code.strings.get(obj.name.0)
-                        .cloned()
-                        .unwrap_or_else(|| format!("Type_{}", type_ref.0).into());
-                }
-                hlbc::types::Type::Struct(obj) => {
-                    return self.code.strings.get(obj.name.0)
-                        .cloned()
-                        .unwrap_or_else(|| format!("Type_{}", type_ref.0).into());
-                }
-                _ => {}
-            }
-        }
-        "Object".into()
-    }
-
-    fn get_var_name(&mut self, var: SsaVar) -> Str {
-        if let Some(name) = self.var_names.get(&var) {
-            return name.clone();
-        }
-        // For SSA variable names, use the destination context (not for_source)
-        let name: Str = self.get_debug_name(var.reg, false)
-            .unwrap_or_else(|| format!("v{}", { self.var_counter += 1; self.var_counter - 1 }))
-            .into();
-        self.var_names.insert(var, name.clone());
-        name
     }
 
     fn reg_name(&self, reg: Reg) -> Str {
@@ -2771,21 +2490,6 @@ impl<'a> Structurer<'a> {
             return format!("r{}", var.reg.0).into();
         }
         // No debug name → use SSA-versioned name
-        format!("r{}_{}", var.reg.0, var.version).into()
-    }
-
-    /// Get SSA-versioned variable name WITHOUT phi name collapsing.
-    /// Used for array indices and other contexts where we need the exact SSA version.
-    fn ssa_var_name_strict(&self, var: SsaVar, at_op: usize) -> Str {
-        // Check for raw name override first
-        if self.use_raw_name_regs.contains(&var.reg) {
-            return format!("r{}_{}", var.reg.0, var.version).into();
-        }
-        // If debug name exists, use it (preserve user variable names)
-        if let Some(debug_name) = self.get_debug_name_at(var.reg, at_op, true) {
-            return debug_name.into();
-        }
-        // Always use SSA-versioned name - no phi collapsing
         format!("r{}_{}", var.reg.0, var.version).into()
     }
 

@@ -217,7 +217,7 @@ pub struct InnerFunctionCaptures {
 
 impl InnerFunctionCaptures {
     /// Analyze an inner function to find captured variable accesses
-    pub fn analyze(code: &Bytecode, func: &Function, capture_info: &CaptureInfo) -> Self {
+    pub fn analyze(_code: &Bytecode, func: &Function, capture_info: &CaptureInfo) -> Self {
         let mut result = Self::default();
 
         // The capture context is always the first argument (reg0) for inner functions

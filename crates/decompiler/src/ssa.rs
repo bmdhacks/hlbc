@@ -545,41 +545,6 @@ impl SsaCfg {
         false
     }
 
-    /// Debug: print SSA form
-    #[allow(dead_code)]
-    pub fn dump(&self, f: &Function, cfg: &Cfg) {
-        for node in cfg.graph.node_indices() {
-            let block = &cfg.graph[node];
-            eprintln!("Block {:?} (ops {}..={})", node, block.start, block.end);
-
-            if let Some(ssa_block) = self.blocks.get(&node) {
-                for phi in &ssa_block.phis {
-                    if let SsaInstr::Phi { dst, sources } = phi {
-                        let sources_str: Vec<_> = sources
-                            .iter()
-                            .map(|(pred, var)| format!("[{:?}]: {}", pred, var.name()))
-                            .collect();
-                        eprintln!("  φ: {} = φ({})", dst.name(), sources_str.join(", "));
-                    }
-                }
-
-                for instr in &ssa_block.ops {
-                    if let SsaInstr::Op { op_idx, dst, uses } = instr {
-                        let dst_str = dst.map_or("_".to_string(), |v| v.name());
-                        let uses_str: Vec<_> = uses.iter().map(|v| v.name()).collect();
-                        eprintln!(
-                            "  {}: {} = {:?} (uses: {})",
-                            op_idx,
-                            dst_str,
-                            &f.ops[*op_idx],
-                            uses_str.join(", ")
-                        );
-                    }
-                }
-            }
-            eprintln!();
-        }
-    }
 }
 
 /// Build a map from each node to its dominated children

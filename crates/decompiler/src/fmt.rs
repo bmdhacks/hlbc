@@ -321,11 +321,6 @@ impl Method {
 }
 
 impl Constant {
-    #[allow(dead_code)]
-    fn fmt(&self, f: &mut Formatter, code: &Bytecode) -> fmt::Result {
-        self.fmt_with_opts(f, code, false)
-    }
-
     fn fmt_with_opts(&self, f: &mut Formatter, code: &Bytecode, show_indices: bool) -> fmt::Result {
         use Constant::*;
         match *self {

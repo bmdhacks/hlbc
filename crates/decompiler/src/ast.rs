@@ -238,6 +238,7 @@ pub const fn cst_type(ty: RefType) -> Expr {
 /// Create a shorthand function to create an expression from an operator
 macro_rules! make_op_shorthand {
     ($name:ident, $op:ident, $( $e:ident ),+) => {
+        #[allow(dead_code)]
         pub(crate) fn $name($( $e: Expr ),+) -> Expr {
             Expr::Op(Operation::$op($( Box::new($e) ),+))
         }

@@ -390,6 +390,7 @@ mod tests {
     use crate::Bytecode;
 
     //#[test]
+    #[allow(dead_code)]
     fn ser_eq_deser() {
         // FIXME this test fails because we are not generating the same bytecode after deserialization
         // This has to do with non deterministic hashing because we store some things in HashMap (fields ?)
@@ -406,6 +407,7 @@ mod tests {
     }
 
     //#[test]
+    #[allow(dead_code)]
     fn ser_eq_deser_all() {
         for entry in fs::read_dir("../../data").unwrap() {
             let path = entry.unwrap().path();

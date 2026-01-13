@@ -233,12 +233,6 @@ fn extract_called_functions(op: &Opcode) -> Vec<RefFun> {
     }
 }
 
-/// Check if a RefFun is a native function
-#[allow(dead_code)]
-fn is_native(code: &Bytecode, fref: RefFun) -> bool {
-    matches!(code.get(fref), FunPtr::Native(_))
-}
-
 fn main() -> Result<()> {
     let args = Args::parse();
 

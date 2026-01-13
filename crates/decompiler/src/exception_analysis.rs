@@ -6,7 +6,6 @@
 
 use hlbc::opcodes::Opcode;
 use hlbc::types::{Function, Reg};
-use std::collections::HashMap;
 
 /// A try/catch region identified by Trap/EndTrap pair.
 #[derive(Debug, Clone)]
@@ -55,8 +54,6 @@ impl TryRegion {
 pub struct ExceptionAnalysis {
     /// Top-level try regions (not nested inside another)
     pub regions: Vec<TryRegion>,
-    /// Maps opcode index to the innermost region containing it
-    op_to_region: HashMap<usize, usize>,
 }
 
 impl ExceptionAnalysis {
@@ -85,15 +82,8 @@ impl ExceptionAnalysis {
         // Build nesting structure
         let top_level = build_nesting(&mut regions);
 
-        // Build op_to_region mapping
-        let mut op_to_region = HashMap::new();
-        for (idx, region) in top_level.iter().enumerate() {
-            map_region_ops(&mut op_to_region, region, idx);
-        }
-
         Self {
             regions: top_level,
-            op_to_region,
         }
     }
 
@@ -211,16 +201,6 @@ fn insert_nested(parent: &mut TryRegion, child: TryRegion) -> bool {
         return true;
     }
     false
-}
-
-/// Recursively map opcode indices to region indices.
-fn map_region_ops(map: &mut HashMap<usize, usize>, region: &TryRegion, region_idx: usize) {
-    for op in region.trap_op..=region.end_trap_op {
-        map.insert(op, region_idx);
-    }
-    for (nested_idx, nested) in region.nested.iter().enumerate() {
-        map_region_ops(map, nested, nested_idx);
-    }
 }
 
 #[cfg(test)]
