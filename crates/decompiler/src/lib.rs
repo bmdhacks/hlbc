@@ -193,6 +193,9 @@ pub fn decompile_code_with_closures(
     // Pass 8: Merge forward declarations with first assignments
     post::merge_declarations(&mut stmts);
 
+    // Pass 9: Condense if/else returns to ternary expressions
+    post::condense_ternary_returns(&mut stmts);
+
     stmts
 }
 

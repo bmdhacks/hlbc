@@ -827,16 +827,35 @@ impl Expr {
                     }
                 },
                 Expr::IfElse { cond, if_, else_ } => {
-                    "if ("{disp!(cond)}") {\n"
-                    let indent2 = indent.inc_nesting();
-                    for stmt in if_ {
-                        {indent2}{stmt.display(&indent2, code, f)}"\n"
+                    // Use ternary syntax for simple single-expression branches
+                    let if_simple = if_.len() == 1 && matches!(&if_[0], Statement::ExprStatement(_));
+                    let else_simple = else_.len() == 1 && matches!(&else_[0], Statement::ExprStatement(_));
+
+                    if if_simple && else_simple {
+                        // Extract the expressions from ExprStatement
+                        let if_expr = match &if_[0] {
+                            Statement::ExprStatement(e) => e,
+                            _ => unreachable!(),
+                        };
+                        let else_expr = match &else_[0] {
+                            Statement::ExprStatement(e) => e,
+                            _ => unreachable!(),
+                        };
+                        // Ternary syntax: cond ? a : b
+                        "(("{disp!(cond)}") ? "{disp!(if_expr)}" : "{disp!(else_expr)}")"
+                    } else {
+                        // Block-style if-expression
+                        "if ("{disp!(cond)}") {\n"
+                        let indent2 = indent.inc_nesting();
+                        for stmt in if_ {
+                            {indent2}{stmt.display(&indent2, code, f)}"\n"
+                        }
+                        {indent}"} else {\n"
+                        for stmt in else_ {
+                            {indent2}{stmt.display(&indent2, code, f)}"\n"
+                        }
+                        {indent}"}"
                     }
-                    {indent}"} else {\n"
-                    for stmt in else_ {
-                        {indent2}{stmt.display(&indent2, code, f)}"\n"
-                    }
-                    {indent}"}"
                 }
                 Expr::Op(op) => {{disp!(op)}},
                 Expr::Unknown(msg) => {

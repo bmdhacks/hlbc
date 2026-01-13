@@ -1701,3 +1701,159 @@ pub fn merge_declarations(stmts: &mut Vec<Statement>) {
         }
     }
 }
+
+/// Condense if/else blocks that return values into ternary expressions.
+///
+/// Transforms:
+/// ```haxe
+/// if (cond) {
+///     return a;
+/// } else {
+///     return b;
+/// }
+/// ```
+/// into:
+/// ```haxe
+/// return cond ? a : b;
+/// ```
+///
+/// Also handles assignment patterns where both branches assign to the same variable
+/// and then return it.
+pub fn condense_ternary_returns(stmts: &mut Vec<Statement>) {
+    let mut i = 0;
+    while i < stmts.len() {
+        // First recurse into nested structures
+        match &mut stmts[i] {
+            Statement::IfElse { if_, else_, .. } => {
+                condense_ternary_returns(if_);
+                condense_ternary_returns(else_);
+            }
+            Statement::While { stmts, .. } => {
+                condense_ternary_returns(stmts);
+            }
+            Statement::Switch { default, cases, .. } => {
+                condense_ternary_returns(default);
+                for (_, case_stmts) in cases {
+                    condense_ternary_returns(case_stmts);
+                }
+            }
+            Statement::TryCatch { try_stmts, catch_stmts, .. } => {
+                condense_ternary_returns(try_stmts);
+                condense_ternary_returns(catch_stmts);
+            }
+            Statement::Block { stmts } | Statement::Sequence { stmts } => {
+                condense_ternary_returns(stmts);
+            }
+            _ => {}
+        }
+
+        // Try to condense if/else with returns to ternary
+        if let Some(new_stmt) = try_condense_if_else_returns(&stmts[i]) {
+            stmts[i] = new_stmt;
+        }
+
+        i += 1;
+    }
+}
+
+/// Try to condense an if/else statement into a ternary return.
+fn try_condense_if_else_returns(stmt: &Statement) -> Option<Statement> {
+    let Statement::IfElse { cond, if_, else_ } = stmt else {
+        return None;
+    };
+
+    // Pattern 1: Simple returns in both branches
+    // if (cond) { return a; } else { return b; }
+    // → return cond ? a : b;
+    if if_.len() == 1 && else_.len() == 1 {
+        if let (
+            Statement::Return(Some(if_expr)),
+            Statement::Return(Some(else_expr)),
+        ) = (&if_[0], &else_[0]) {
+            return Some(Statement::Return(Some(Expr::IfElse {
+                cond: Box::new(cond.clone()),
+                if_: vec![Statement::ExprStatement(if_expr.clone())],
+                else_: vec![Statement::ExprStatement(else_expr.clone())],
+            })));
+        }
+    }
+
+    // Pattern 2: Assignment + return in both branches
+    // if (cond) { r1 = a; return r1; } else { r1 = b; return r1; }
+    // → return cond ? a : b;
+    if if_.len() == 2 && else_.len() == 2 {
+        if let (
+            Statement::Assign { variable: if_var, assign: if_assign, .. },
+            Statement::Return(Some(if_ret)),
+        ) = (&if_[0], &if_[1]) {
+            if let (
+                Statement::Assign { variable: else_var, assign: else_assign, .. },
+                Statement::Return(Some(else_ret)),
+            ) = (&else_[0], &else_[1]) {
+                // Check that both assign to the same register and return that register
+                if let (Expr::Variable(if_reg, _), Expr::Variable(else_reg, _)) = (if_var, else_var) {
+                    if if_reg == else_reg {
+                        // Check that returns are of the assigned variables
+                        if let (Expr::Variable(if_ret_reg, _), Expr::Variable(else_ret_reg, _)) = (if_ret, else_ret) {
+                            if if_ret_reg == if_reg && else_ret_reg == else_reg {
+                                return Some(Statement::Return(Some(Expr::IfElse {
+                                    cond: Box::new(cond.clone()),
+                                    if_: vec![Statement::ExprStatement(if_assign.clone())],
+                                    else_: vec![Statement::ExprStatement(else_assign.clone())],
+                                })));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Pattern 3: Asymmetric - one branch has assign+return, other has direct return
+    // if (cond) { r1 = a; return r1; } else { return b; }
+    // → return cond ? a : b;
+    if if_.len() == 2 && else_.len() == 1 {
+        if let (
+            Statement::Assign { variable: if_var, assign: if_assign, .. },
+            Statement::Return(Some(if_ret)),
+        ) = (&if_[0], &if_[1]) {
+            if let Statement::Return(Some(else_expr)) = &else_[0] {
+                // Check that if-branch assigns and returns the same variable
+                if let (Expr::Variable(if_reg, _), Expr::Variable(if_ret_reg, _)) = (if_var, if_ret) {
+                    if if_reg == if_ret_reg {
+                        return Some(Statement::Return(Some(Expr::IfElse {
+                            cond: Box::new(cond.clone()),
+                            if_: vec![Statement::ExprStatement(if_assign.clone())],
+                            else_: vec![Statement::ExprStatement(else_expr.clone())],
+                        })));
+                    }
+                }
+            }
+        }
+    }
+
+    // Pattern 4: Asymmetric (reversed) - if has direct return, else has assign+return
+    // if (cond) { return a; } else { r1 = b; return r1; }
+    // → return cond ? a : b;
+    if if_.len() == 1 && else_.len() == 2 {
+        if let Statement::Return(Some(if_expr)) = &if_[0] {
+            if let (
+                Statement::Assign { variable: else_var, assign: else_assign, .. },
+                Statement::Return(Some(else_ret)),
+            ) = (&else_[0], &else_[1]) {
+                // Check that else-branch assigns and returns the same variable
+                if let (Expr::Variable(else_reg, _), Expr::Variable(else_ret_reg, _)) = (else_var, else_ret) {
+                    if else_reg == else_ret_reg {
+                        return Some(Statement::Return(Some(Expr::IfElse {
+                            cond: Box::new(cond.clone()),
+                            if_: vec![Statement::ExprStatement(if_expr.clone())],
+                            else_: vec![Statement::ExprStatement(else_assign.clone())],
+                        })));
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
