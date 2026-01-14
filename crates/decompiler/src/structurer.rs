@@ -15,8 +15,8 @@ use hlbc::types::{Function, Reg, RefFun, RefField, RefString, Type};
 use hlbc::{Bytecode, Resolve, Str};
 
 use crate::analyzer::{CfgAnalysis, NaturalLoop};
-use crate::ast::{Call, Constant, ConstructorCall, Expr, Operation, Statement};
-use crate::lifter::Cfg;
+use crate::ast::{not, Call, Constant, ConstructorCall, Expr, Operation, Statement};
+use crate::lifter::{BasicBlock, Cfg};
 use hlbc::types::RefType;
 use crate::ssa::{SsaCfg, SsaInstr, SsaVar, get_dst_reg as get_opcode_dst};
 use crate::type_prop::TypeInfo;
@@ -1323,6 +1323,11 @@ impl<'a> Structurer<'a> {
                 }]
             } else if flat_chain.len() == 1 {
                 let (cond, then_stmts) = flat_chain.into_iter().next().unwrap();
+                // Try phi-return optimization: both branches assign, merge returns the phi var
+                if let Some(optimized) = self.try_simplify_phi_return(&cond, &then_stmts, &else_stmts, final_merge) {
+                    return optimized;
+                }
+                // Try ternary condensation: both branches return directly
                 if let Some(ternary) = self.try_condense_ternary_return(&cond, &then_stmts, &else_stmts) {
                     vec![ternary]
                 } else {
@@ -1796,6 +1801,92 @@ impl<'a> Structurer<'a> {
         }
 
         None
+    }
+
+    /// Check if branches form a phi pattern where:
+    /// - Both branches assign to the same register
+    /// - The merge block immediately returns that register
+    /// Returns Some(optimized_statements) if pattern matched
+    fn try_simplify_phi_return(
+        &mut self,
+        cond: &Expr,
+        if_stmts: &[Statement],
+        else_stmts: &[Statement],
+        merge: Option<NodeIndex>,
+    ) -> Option<Vec<Statement>> {
+        let merge_node = merge?;
+        if self.processed.contains(&merge_node) {
+            return None;
+        }
+
+        // Get the return register from merge block
+        let merge_block = &self.cfg.graph[merge_node];
+        let ret_reg = self.get_merge_return_reg(merge_block)?;
+
+        // Check what each branch assigns to the return register
+        let if_assign = self.extract_assign_to_reg(if_stmts, ret_reg);
+        let else_assign = self.extract_assign_to_reg(else_stmts, ret_reg);
+
+        match (if_assign, else_assign) {
+            // Pattern 1: Both branches assign → ternary return
+            (Some(if_val), Some(else_val)) => {
+                self.processed.insert(merge_node);
+                Some(vec![self.make_ternary_return(cond, if_val, else_val)])
+            }
+            _ => None,
+        }
+    }
+
+    /// Check if merge block's first (and only) instruction is Ret, return the register
+    fn get_merge_return_reg(&self, block: &BasicBlock) -> Option<Reg> {
+        // Block must be a single instruction (just the Ret)
+        if block.start != block.end {
+            return None;
+        }
+        let op = self.func.ops.get(block.start)?;
+        if let &Opcode::Ret { ret } = op {
+            Some(ret)
+        } else {
+            None
+        }
+    }
+
+    /// Extract the assigned value if stmts is a single assignment to the given register
+    fn extract_assign_to_reg(&self, stmts: &[Statement], reg: Reg) -> Option<Expr> {
+        if stmts.len() != 1 {
+            return None;
+        }
+        if let Statement::Assign { variable, assign, .. } = &stmts[0] {
+            if let Expr::Variable(r, _) = variable {
+                if *r == reg {
+                    return Some(assign.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Create optimized ternary return, with boolean simplification
+    fn make_ternary_return(&self, cond: &Expr, if_val: Expr, else_val: Expr) -> Statement {
+        // Boolean simplification: if both values are boolean constants
+        if let (Expr::Constant(Constant::Bool(if_b)), Expr::Constant(Constant::Bool(else_b))) =
+            (&if_val, &else_val)
+        {
+            let result = match (if_b, else_b) {
+                (true, false) => cond.clone(),
+                (false, true) => not(cond.clone()),
+                // Both same value - just return one
+                _ => return Statement::Return(Some(if_val)),
+            };
+            return Statement::Return(Some(result));
+        }
+
+        // General case: return cond ? if_val : else_val
+        Statement::Return(Some(Expr::IfElse {
+            cond: Box::new(cond.clone()),
+            if_: vec![Statement::ExprStatement(if_val)],
+            else_: vec![Statement::ExprStatement(else_val)],
+        }))
     }
 
     /// Structure a switch statement
