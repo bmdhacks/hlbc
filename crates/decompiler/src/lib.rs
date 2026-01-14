@@ -3,7 +3,18 @@
 //!
 //! The decompiler takes bytecode elements as input and outputs [ast] structures that can be displayed.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+
+// Thread-local set of functions currently being decompiled (to detect recursive closures)
+thread_local! {
+    static DECOMPILING_FUNCTIONS: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+}
+
+/// Check if a function is currently being decompiled (for recursive closure detection)
+pub fn is_currently_decompiling(findex: usize) -> bool {
+    DECOMPILING_FUNCTIONS.with(|set| set.borrow().contains(&findex))
+}
 
 use ast::*;
 use hlbc::opcodes::Opcode;
@@ -165,6 +176,14 @@ pub fn decompile_code_with_closures(
     use crate::type_prop::TypePropagator;
     use crate::structurer::Structurer;
 
+    let findex = f.findex.0;
+
+    // Mark this function as currently being decompiled
+    // (recursive closure detection is done in structurer before calling this)
+    DECOMPILING_FUNCTIONS.with(|set| {
+        set.borrow_mut().insert(findex);
+    });
+
     // Pass 1: Build CFG
     let cfg = Cfg::build(f);
 
@@ -220,6 +239,11 @@ pub fn decompile_code_with_closures(
 
     // Pass 11: Remove unused forward declarations
     post::remove_unused_var_decls(&mut stmts);
+
+    // Clean up: remove this function from the "currently decompiling" set
+    DECOMPILING_FUNCTIONS.with(|set| {
+        set.borrow_mut().remove(&findex);
+    });
 
     stmts
 }

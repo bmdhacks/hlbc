@@ -326,7 +326,7 @@ pub fn method(expr: Expr, obj: RefType, pindex: RefField, code: &Bytecode) -> Ex
     // Use the proper method lookup that searches protos by pindex
     let method_name = obj.method(pindex.0, code)
         .map(|proto| proto.name(code).to_string())
-        .unwrap_or_else(|| format!("[method_{}]", pindex.0));
+        .unwrap_or_else(|| panic!("Failed to find method pindex={} on type {:?}", pindex.0, obj));
     Expr::Field(Box::new(expr), Str::from(method_name))
 }
 

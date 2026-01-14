@@ -817,6 +817,11 @@ impl<'a> Structurer<'a> {
                     self.processed.remove(&node);
                 }
             }
+            // Mark exit nodes as processed to prevent them from being structured
+            // as part of the loop body - they'll be handled after the loop
+            for &exit_node in &loop_info.exit_nodes {
+                self.processed.insert(exit_node);
+            }
             self.scope_depth += 1;
             let body_stmts = self.structure_from(body_node, Some(header));
             self.scope_depth -= 1;
@@ -1235,7 +1240,9 @@ impl<'a> Structurer<'a> {
                     final_merge = chain_merge;
                 }
 
-                let case_stmts = self.structure_branch(else_target, chain_merge);
+                // Use stop_at as fallback if no merge point found (e.g., inside loops)
+                let effective_stop = chain_merge.or(stop_at);
+                let case_stmts = self.structure_branch(else_target, effective_stop);
                 chain.push((preamble, eq_condition, case_stmts));
 
                 // Check if the then branch can continue the chain
@@ -1247,12 +1254,14 @@ impl<'a> Structurer<'a> {
                 }
 
                 // End of chain
-                let else_stmts = self.structure_branch(then_target, chain_merge);
+                let else_stmts = self.structure_branch(then_target, effective_stop);
                 return self.build_conditional_result(chain, else_stmts, has_preambles, final_merge, stop_at);
             }
 
             // Standard pattern: case body is in then branch
-            let then_stmts = self.structure_branch(then_target, merge);
+            // Use stop_at as fallback if no merge point found (e.g., inside loops)
+            let effective_stop = merge.or(stop_at);
+            let then_stmts = self.structure_branch(then_target, effective_stop);
             chain.push((preamble, condition, then_stmts));
 
             // Check if the else branch can continue the chain
@@ -1264,7 +1273,7 @@ impl<'a> Structurer<'a> {
             }
 
             // End of chain
-            let else_stmts = self.structure_branch(else_target, merge);
+            let else_stmts = self.structure_branch(else_target, effective_stop);
             return self.build_conditional_result(chain, else_stmts, has_preambles, final_merge, stop_at);
         }
 
@@ -2793,9 +2802,10 @@ impl<'a> Structurer<'a> {
 
             Opcode::Bytes { dst, ptr } => {
                 let var = self.reg_to_expr_dst(*dst);
-                // Bytes constants are stored separately, emit as Unknown for now
-                let val = Expr::Unknown(format!("bytes@{}", ptr.0));
-                Some(self.make_assign(var, val))
+                // Bytes constants are stored separately - not yet supported
+                panic!("Opcode::Bytes not yet supported: dst={:?}, ptr={:?}", dst, ptr);
+                #[allow(unreachable_code)]
+                Some(self.make_assign(var, Expr::Ident(Str::from("unreachable"))))
             }
 
             Opcode::GetMem { dst, bytes, index } => {
@@ -2928,6 +2938,14 @@ impl<'a> Structurer<'a> {
             Opcode::StaticClosure { dst, fun } => {
                 let var = self.reg_to_expr_dst(*dst);
 
+                // Check for self-referencing closure (recursive function that passes itself)
+                // or mutual recursion (A references B which references A)
+                // In these cases, emit a function reference instead of trying to inline
+                if *fun == self.func.findex || crate::is_currently_decompiling(fun.0) {
+                    let expr = Expr::FunRef(*fun);
+                    return Some(self.make_assign(var, expr));
+                }
+
                 // StaticClosure has no captured variables, just inline the function body
                 if let Some(inner_func) = fun.as_fn(self.code) {
                     // Decompile the inner function (no closure analysis needed since no captures)
@@ -2948,6 +2966,12 @@ impl<'a> Structurer<'a> {
 
             Opcode::InstanceClosure { dst, fun, obj } => {
                 let var = self.reg_to_expr_dst(*dst);
+
+                // Check for self-referencing closure or mutual recursion
+                if *fun == self.func.findex || crate::is_currently_decompiling(fun.0) {
+                    let expr = Expr::FunRef(*fun);
+                    return Some(self.make_assign(var, expr));
+                }
 
                 // Check if this is a detected closure that we should inline
                 if let Some(_capture_info) = self.get_closure_at_current_op() {

@@ -8,6 +8,16 @@ use hlbc::{Bytecode, Resolve};
 
 use crate::ast::{Class, Constant, ConstructorCall, Expr, Method, Operation, Statement};
 
+/// Helper to panic during Display - returns a string that will never be used
+fn panic_invalid_anon_type(ty: &Type) -> &'static str {
+    panic!("Anonymous expr with non-Virtual type: {:?}", ty)
+}
+
+/// Helper to panic for Expr::Unknown during Display
+fn panic_unknown_expr(msg: &str) -> &'static str {
+    panic!("Expr::Unknown encountered during display: {}", msg)
+}
+
 /// A formatter that produces clean Haxe-like output without index annotations.
 /// Unlike EnhancedFmt, this doesn't add @index suffixes to type names.
 #[derive(Copy, Clone, Default)]
@@ -521,7 +531,7 @@ impl<'a> Display for SimpleExprDisplay<'a> {
             },
             Expr::Ident(s) => write!(f, "{}", s),
             Expr::Variable(_, Some(name)) => write!(f, "{}", name),
-            _ => write!(f, "[complex expr]"),
+            other => panic!("display_simple called with complex expression: {:?}", other),
         }
     }
 }
@@ -564,7 +574,7 @@ impl Expr {
                                 })
                             })) }"}"
                     }
-                    _ => "[invalid anonymous type]",
+                    other => {{panic_invalid_anon_type(other)}},
                 },
                 Expr::Array(array, index) => {
                     // Check for array.bytes[index << 2] pattern (HL array access)
@@ -860,9 +870,7 @@ impl Expr {
                     }
                 }
                 Expr::Op(op) => {{disp!(op)}},
-                Expr::Unknown(msg) => {
-                     "["{msg}"]"
-                }
+                Expr::Unknown(msg) => {{panic_unknown_expr(msg)}}
                 Expr::Variable(x, name) => {{
                     if let Some(name) = name {
                         name.clone()
