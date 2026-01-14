@@ -113,6 +113,10 @@ pub struct Structurer<'a> {
     string_switches: Vec<StringSwitchRegion>,
     /// Recursion depth counter to prevent stack overflow
     recursion_depth: u32,
+    /// Expressions available for inlining (SSA var -> defining expression)
+    /// Single-use, pure expressions are stored here instead of emitting a statement.
+    /// When the variable is referenced, the stored expression is inlined at the use site.
+    inline_exprs: HashMap<SsaVar, Expr>,
 }
 
 impl<'a> Structurer<'a> {
@@ -184,6 +188,7 @@ impl<'a> Structurer<'a> {
             current_ssa_uses: Vec::new(),
             string_switches: Self::detect_string_switches(code, func),
             recursion_depth: 0,
+            inline_exprs: HashMap::new(),
         }
     }
 
@@ -798,15 +803,17 @@ impl<'a> Structurer<'a> {
         let header = loop_info.header;
         self.processed.insert(header);
 
-        // Extract condition and body start
-        let (condition, body_start, exit_target) = self.extract_loop_condition(loop_info);
-
-        // Get header block statements (these compute the loop condition and need to be inside the loop)
-        // Process with incremented scope_depth since they'll be inside the while(true) body
+        // IMPORTANT: Process header block statements FIRST before extracting condition.
+        // This populates inline_exprs so that the loop condition can use inlined expressions.
+        // Otherwise, variables marked for inlining won't have their declarations emitted,
+        // but the condition extraction won't find them in inline_exprs.
         let header_block = &self.cfg.graph[header];
         self.scope_depth += 1;
         let header_stmts = self.structure_block_range(header_block.start, header_block.end);
         self.scope_depth -= 1;
+
+        // Extract condition and body start (now inline_exprs is populated)
+        let (condition, body_start, exit_target) = self.extract_loop_condition(loop_info);
 
         // Structure body (increment scope depth to avoid declaring vars inside loop)
         let body = if let Some(body_node) = body_start {
@@ -2294,9 +2301,9 @@ impl<'a> Structurer<'a> {
                         assign: expr,
                     });
                 }
-                let var = self.reg_to_expr_dst(*dst);
                 let expr = self.reg_to_expr(*src);
-                Some(self.make_assign(var, expr))
+                // Use try_inline_or_assign for potential inlining of moves
+                self.try_inline_or_assign(*dst, expr)
             }
 
             Opcode::Int { dst, ptr } => {
@@ -2317,60 +2324,52 @@ impl<'a> Structurer<'a> {
                         assign: val,
                     });
                 }
-                let var = self.reg_to_expr_dst(*dst);
                 let val = Expr::Constant(Constant::Int(*ptr));
-                Some(self.make_assign(var, val))
+                self.try_inline_or_assign(*dst, val)
             }
 
             Opcode::Float { dst, ptr } => {
-                let var = self.reg_to_expr_dst(*dst);
                 let val = Expr::Constant(Constant::Float(*ptr));
-                Some(self.make_assign(var, val))
+                self.try_inline_or_assign(*dst, val)
             }
 
             Opcode::Bool { dst, value } => {
-                let var = self.reg_to_expr_dst(*dst);
                 let val = Expr::Constant(Constant::Bool(*value));
-                Some(self.make_assign(var, val))
+                self.try_inline_or_assign(*dst, val)
             }
 
             Opcode::String { dst, ptr } => {
-                let var = self.reg_to_expr_dst(*dst);
                 let val = Expr::Constant(Constant::String(*ptr));
-                Some(self.make_assign(var, val))
+                self.try_inline_or_assign(*dst, val)
             }
 
             Opcode::Null { dst } => {
-                let var = self.reg_to_expr_dst(*dst);
                 let val = Expr::Constant(Constant::Null);
-                Some(self.make_assign(var, val))
+                self.try_inline_or_assign(*dst, val)
             }
 
             Opcode::Add { dst, a, b } => {
-                let var = self.reg_to_expr_dst(*dst);
                 let expr = Expr::Op(Operation::Add(
                     Box::new(self.reg_to_expr(*a)),
                     Box::new(self.reg_to_expr(*b)),
                 ));
-                Some(self.make_assign(var, expr))
+                self.try_inline_or_assign(*dst, expr)
             }
 
             Opcode::Sub { dst, a, b } => {
-                let var = self.reg_to_expr_dst(*dst);
                 let expr = Expr::Op(Operation::Sub(
                     Box::new(self.reg_to_expr(*a)),
                     Box::new(self.reg_to_expr(*b)),
                 ));
-                Some(self.make_assign(var, expr))
+                self.try_inline_or_assign(*dst, expr)
             }
 
             Opcode::Mul { dst, a, b } => {
-                let var = self.reg_to_expr_dst(*dst);
                 let expr = Expr::Op(Operation::Mul(
                     Box::new(self.reg_to_expr(*a)),
                     Box::new(self.reg_to_expr(*b)),
                 ));
-                Some(self.make_assign(var, expr))
+                self.try_inline_or_assign(*dst, expr)
             }
 
             Opcode::Incr { dst } => {
@@ -2427,10 +2426,10 @@ impl<'a> Structurer<'a> {
                     return None;
                 }
 
-                let var = self.reg_to_expr_dst(*dst);
                 let obj_expr = self.reg_to_expr(*obj);
                 let expr = Expr::Field(Box::new(obj_expr), field_name);
-                Some(self.make_assign(var, expr))
+                // Use try_inline_or_assign for potential inlining of field accesses
+                self.try_inline_or_assign(*dst, expr)
             }
 
             Opcode::Call0 { dst, fun } => {
@@ -2876,11 +2875,11 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::GetThis { dst, field } => {
-                let var = self.reg_to_expr_dst(*dst);
                 let this = Expr::Variable(Reg(0), Some("this".into()));
                 let field_name = self.get_field_name(Reg(0), *field);
                 let expr = Expr::Field(Box::new(this), field_name);
-                Some(self.make_assign(var, expr))
+                // Use try_inline_or_assign for potential inlining of this.field accesses
+                self.try_inline_or_assign(*dst, expr)
             }
 
             Opcode::SetThis { field, src } => {
@@ -2892,11 +2891,8 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::Bytes { dst, ptr } => {
-                let var = self.reg_to_expr_dst(*dst);
                 // Bytes constants are stored separately - not yet supported
                 panic!("Opcode::Bytes not yet supported: dst={:?}, ptr={:?}", dst, ptr);
-                #[allow(unreachable_code)]
-                Some(self.make_assign(var, Expr::Ident(Str::from("unreachable"))))
             }
 
             Opcode::GetMem { dst, bytes, index } => {
@@ -3469,6 +3465,54 @@ impl<'a> Structurer<'a> {
         self.current_ssa_uses.iter().find(|v| v.reg == reg).copied()
     }
 
+    /// Check if an SSA variable can be inlined and return its stored expression.
+    /// Returns None if the variable shouldn't be inlined (multi-use, impure, has debug name, etc.)
+    fn try_get_inline_expr(&self, var: SsaVar) -> Option<Expr> {
+        self.inline_exprs.get(&var).cloned()
+    }
+
+    /// Check if a variable should be inlined based on use-def info and debug names.
+    /// This implements the ILSpy-style inlining safety guards.
+    fn can_inline_var(&self, var: SsaVar) -> bool {
+        // Check use-def info first
+        let use_info = match self.use_info.get(&var) {
+            Some(info) => info,
+            None => return false,
+        };
+
+        if !use_info.can_inline() {
+            return false;
+        }
+
+        // Guard 2 (Debug Name Barrier): Don't inline user-named variables
+        // This preserves meaningful variable names in the output
+        // Check if this register has a debug name at the current opcode
+        if self.get_debug_name(var.reg, false).is_some() {
+            return false;
+        }
+
+        true
+    }
+
+    /// Store an expression for potential inlining, or emit as assignment.
+    /// If the current SSA destination variable can be inlined:
+    ///   - Stores the expression and returns None (no statement emitted)
+    /// Otherwise:
+    ///   - Returns Some(assignment statement)
+    fn try_inline_or_assign(&mut self, dst: Reg, expr: Expr) -> Option<Statement> {
+        // Check if we have an SSA destination that can be inlined
+        if let Some(ssa_var) = self.current_ssa_dst {
+            if ssa_var.reg == dst && self.can_inline_var(ssa_var) {
+                // Store for inlining - don't emit statement
+                self.inline_exprs.insert(ssa_var, expr);
+                return None;
+            }
+        }
+        // Not inlinable - emit assignment statement
+        let var = self.reg_to_expr_dst(dst);
+        Some(self.make_assign(var, expr))
+    }
+
     /// Get debug name for a register, optionally for source context.
     /// When `for_source` is true, only returns names assigned BEFORE current_op.
     /// This prevents using a name before it's been assigned (e.g., `var dx = dx - r3`).
@@ -3890,6 +3934,10 @@ impl<'a> Structurer<'a> {
     fn reg_to_expr(&self, reg: Reg) -> Expr {
         // Use SSA-versioned name if we have SSA context for this register
         if let Some(ssa_var) = self.find_ssa_use(reg) {
+            // Check if this variable has an expression available for inlining
+            if let Some(inline_expr) = self.try_get_inline_expr(ssa_var) {
+                return inline_expr;
+            }
             return self.reg_to_expr_ssa_src(reg, ssa_var);
         }
         // Fallback to non-SSA naming
@@ -3922,6 +3970,13 @@ impl<'a> Structurer<'a> {
         if let Some((_dst, uses)) = self.ssa.get_instr_for_op(blk.end) {
             for ssa_var in uses {
                 if ssa_var.reg == reg {
+                    // IMPORTANT: Check if this variable has an inlined expression first.
+                    // If the variable was marked for inlining, its defining statement was
+                    // suppressed, so we must return the stored expression, not a variable name.
+                    if let Some(inline_expr) = self.try_get_inline_expr(*ssa_var) {
+                        return inline_expr;
+                    }
+
                     // Found the SSA variable for this register at block end
                     // Now find its definition to see if it's a constant
                     if let Some(def_op_idx) = self.ssa.find_def(*ssa_var) {
@@ -4003,6 +4058,13 @@ impl<'a> Structurer<'a> {
             // Find the SSA variable for this register in the uses
             for ssa_var in uses {
                 if ssa_var.reg == reg {
+                    // IMPORTANT: Check if this variable has an inlined expression first.
+                    // If the variable was marked for inlining, its defining statement was
+                    // suppressed, so we must return the stored expression, not a variable name.
+                    if let Some(inline_expr) = self.try_get_inline_expr(*ssa_var) {
+                        return inline_expr;
+                    }
+
                     // Found the SSA variable for this register
                     let is_phi_involved = self.ssa.is_same_register_phi(*ssa_var) || self.ssa.is_same_register_phi_source(*ssa_var);
 
