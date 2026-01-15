@@ -2,6 +2,140 @@
 //!
 //! Maps HashLink native function names (lib/name) to their Haxe equivalents (Class.method).
 //! Generated from Haxe stdlib @:hlNative annotations.
+//!
+//! Also provides dynamic binding lookup from bytecode type bindings.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+use hlbc::types::RefFun;
+use hlbc::{Bytecode, Resolve};
+
+// Thread-local cache for native binding maps.
+// Stores (bytecode_ptr, binding_map) to detect when we need to rebuild.
+thread_local! {
+    static NATIVE_BINDING_CACHE: RefCell<Option<(usize, HashMap<usize, (String, String)>)>> = RefCell::new(None);
+}
+
+/// Known library prefixes for native functions.
+/// Maps (library_name, native_prefix) -> haxe_class_name
+const NATIVE_PREFIX_MAP: &[(&str, &str, &str)] = &[
+    ("sdl", "gl_", "sdl.GL"),
+    ("sdl", "win_", "sdl.Window"),
+    ("sdl", "gctrl_", "sdl.GameController"),
+    ("sdl", "", "sdl.Sdl"),  // Empty prefix for base SDL functions
+    ("openal", "al_", "openal.AL"),
+    ("openal", "alc_", "openal.ALC"),
+    ("mesa", "gl_", "mesa.GL"),
+    ("directx", "", "dx.Driver"),
+];
+
+/// Convert snake_case to camelCase.
+/// e.g., "create_framebuffer" -> "createFramebuffer"
+fn snake_to_camel(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut capitalize_next = false;
+
+    for c in s.chars() {
+        if c == '_' {
+            capitalize_next = true;
+        } else if capitalize_next {
+            result.push(c.to_ascii_uppercase());
+            capitalize_next = false;
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
+/// Build a reverse mapping from native function references to their Haxe class.method names.
+/// Uses a combination of:
+/// 1. Type bindings (for wrapper functions that have implementations)
+/// 2. Name convention matching (for pure natives using known prefixes)
+fn build_native_binding_map(code: &Bytecode) -> HashMap<usize, (String, String)> {
+    let mut bindings = HashMap::new();
+
+    // First, collect bindings from types (covers wrapper functions)
+    for ty in code.types.iter() {
+        if let Some(obj) = ty.get_type_obj() {
+            let class_name = code.get(obj.name).to_string();
+
+            // Only process static holder types ($ClassName)
+            if !class_name.contains('$') {
+                continue;
+            }
+
+            // Clean class name: "sdl.$GL" → "sdl.GL"
+            let clean_name = if class_name.starts_with('$') {
+                class_name[1..].to_string()
+            } else {
+                class_name.replace(".$", ".")
+            };
+
+            for (&field_idx, &fun_ref) in &obj.bindings {
+                // Capture ALL bindings (both natives and wrapper functions)
+                if let Some(field) = obj.fields.get(field_idx.0) {
+                    let method_name = code.get(field.name).to_string();
+                    bindings.insert(fun_ref.0, (clean_name.clone(), method_name));
+                }
+            }
+        }
+    }
+
+    // Second, map native functions using prefix conventions
+    for native in &code.natives {
+        // Skip if already mapped via bindings
+        if bindings.contains_key(&native.findex.0) {
+            continue;
+        }
+
+        let lib = native.lib(code);
+        let name = native.name(code);
+
+        // Strip optional '?' prefix from library name
+        let lib = lib.strip_prefix('?').unwrap_or(&lib);
+
+        // Try to match against known prefix mappings
+        for &(map_lib, prefix, class_name) in NATIVE_PREFIX_MAP {
+            if lib == map_lib && name.starts_with(prefix) {
+                let method_snake = &name[prefix.len()..];
+                let method_name = snake_to_camel(method_snake);
+                bindings.insert(native.findex.0, (class_name.to_string(), method_name));
+                break;
+            }
+        }
+    }
+
+    bindings
+}
+
+/// Look up a native function's Haxe class.method name from bytecode bindings.
+/// This discovers mappings dynamically from type bindings, covering all libraries.
+pub fn lookup_native_binding(code: &Bytecode, fun: RefFun) -> Option<(String, String)> {
+    let bytecode_ptr = code as *const Bytecode as usize;
+
+    NATIVE_BINDING_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+
+        // Check if we need to rebuild the cache (different bytecode)
+        let needs_rebuild = match &*cache {
+            Some((cached_ptr, _)) => *cached_ptr != bytecode_ptr,
+            None => true,
+        };
+
+        if needs_rebuild {
+            let map = build_native_binding_map(code);
+            *cache = Some((bytecode_ptr, map));
+        }
+
+        // Look up the function in the cached map
+        cache
+            .as_ref()
+            .and_then(|(_, map)| map.get(&fun.0).cloned())
+    })
+}
 
 /// Look up the Haxe equivalent for a native function.
 /// Returns Some("Class.method") if found, None otherwise.

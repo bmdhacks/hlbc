@@ -8,6 +8,33 @@ use hlbc::{Bytecode, Resolve};
 
 use crate::ast::{Class, Constant, ConstructorCall, Expr, Method, Operation, Statement};
 
+/// Escape a string for output as a Haxe string literal.
+/// Handles quotes, backslashes, and control characters.
+fn escape_string(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => result.push_str("\\\\"),
+            '"' => result.push_str("\\\""),
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\t' => result.push_str("\\t"),
+            '\0' => result.push_str("\\x00"),
+            // Other control characters (0x01-0x1F, 0x7F)
+            c if c.is_control() => {
+                // Use \xNN for ASCII control chars, \uNNNN for others
+                if (c as u32) < 0x100 {
+                    result.push_str(&format!("\\x{:02X}", c as u32));
+                } else {
+                    result.push_str(&format!("\\u{:04X}", c as u32));
+                }
+            }
+            c => result.push(c),
+        }
+    }
+    result
+}
+
 /// Helper to panic during Display - returns a string that will never be used
 fn panic_invalid_anon_type(ty: &Type) -> &'static str {
     panic!("Anonymous expr with non-Virtual type: {:?}", ty)
@@ -196,6 +223,28 @@ impl Display for FormatOptions {
     }
 }
 
+/// Known generic types that require a single type parameter.
+/// These will be annotated with `<Dynamic>` if no type param is present.
+const KNOWN_SINGLE_PARAM_GENERICS: &[&str] = &[
+    "haxe.ds.IntMap",
+    "haxe.ds.StringMap",
+    "haxe.ds.List",
+    "haxe.ds.Vector",
+    "haxe.ds.BalancedTree",
+    "haxe.ds.GenericStack",
+    "haxe.iterators.ArrayIterator",
+    "haxe.iterators.MapIterator",
+];
+
+/// Known generic types that require two type parameters.
+const KNOWN_TWO_PARAM_GENERICS: &[&str] = &[
+    "haxe.ds.Map",
+    "haxe.ds.HashMap",
+    "haxe.ds.WeakMap",
+    "haxe.ds.EnumValueMap",
+    "haxe.ds.ObjectMap",
+];
+
 /// Convert a HashLink type to its Haxe equivalent string representation.
 /// Maps internal HL types to Haxe types (e.g., hl.types.ArrayDyn → Array<Dynamic>)
 pub fn to_haxe_type<'a>(ty: &Type, ctx: &'a Bytecode) -> Str {
@@ -247,7 +296,16 @@ pub fn to_haxe_type<'a>(ty: &Type, ctx: &'a Bytecode) -> Str {
                 "hl.types.ArrayBytes_Float" | "hl.types.ArrayBytes_Single" | "hl.types.ArrayBytes_hl_F64" | "hl.types.ArrayBytes_hl_F32" => Str::from_static("Array<Float>"),
                 "hl.types.ArrayObj" => Str::from_static("Array<Dynamic>"),
                 "hl.types.ArrayDyn" => Str::from_static("Array<Dynamic>"),
-                _ => name_str,
+                _ => {
+                    // Check if this is a known generic type that needs type parameters
+                    if KNOWN_SINGLE_PARAM_GENERICS.iter().any(|g| name_str.as_ref() == *g) {
+                        return Str::from(format!("{}<Dynamic>", name_str));
+                    }
+                    if KNOWN_TWO_PARAM_GENERICS.iter().any(|g| name_str.as_ref() == *g) {
+                        return Str::from(format!("{}<Dynamic, Dynamic>", name_str));
+                    }
+                    name_str
+                }
             }
         }
         Array => Str::from_static("Array<Dynamic>"),
@@ -414,7 +472,7 @@ impl Constant {
                 Ok(())
             }
             String(c) => {
-                write!(f, "\"{}\"", code[c])?;
+                write!(f, "\"{}\"", escape_string(&code[c]))?;
                 if show_indices {
                     write!(f, " /* str@{} */", c.0)?;
                 }
@@ -581,29 +639,7 @@ pub struct SimpleExprDisplay<'a> {
 impl<'a> Display for SimpleExprDisplay<'a> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.expr {
-            Expr::Constant(c) => match c {
-                Constant::InlineInt(i) => write!(f, "{}", i),
-                Constant::Int(r) => write!(f, "{}", self.code[*r]),
-                Constant::Float(r) => write!(f, "{}", self.code[*r]),
-                Constant::String(r) => write!(f, "\"{}\"", self.code[*r]),
-                Constant::Bytes(r) => {
-                    // Format bytes constant as hex string
-                    if let Some((data, offsets)) = &self.code.bytes {
-                        let start = offsets.get(r.0).copied().unwrap_or(0);
-                        let end = offsets.get(r.0 + 1).copied().unwrap_or(data.len());
-                        let bytes = &data[start..end];
-                        // Format as haxe.io.Bytes.ofHex("...")
-                        let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
-                        write!(f, "haxe.io.Bytes.ofHex(\"{}\")", hex)
-                    } else {
-                        write!(f, "haxe.io.Bytes.ofHex(\"\")")
-                    }
-                }
-                Constant::Bool(b) => write!(f, "{}", if *b { "true" } else { "false" }),
-                Constant::Null => write!(f, "null"),
-                Constant::This => write!(f, "this"),
-                Constant::TypeRef(t) => write!(f, "{}", to_haxe_type(&self.code[*t], self.code)),
-            },
+            Expr::Constant(c) => c.fmt_with_opts(f, self.code, false),
             Expr::Ident(s) => write!(f, "{}", s),
             Expr::Variable(_, Some(name)) => write!(f, "{}", name),
             other => panic!("display_simple called with complex expression: {:?}", other),
@@ -805,7 +841,12 @@ impl Expr {
                             // Add function index comment if the callee is a FunRef
                             if indent.show_fun_indices {
                                 if let Expr::FunRef(fun_ref) = &call.fun {
-                                    " /* fun@"{fun_ref.0}" */"
+                                    // Distinguish natives from regular functions in comment
+                                    if matches!(code.get(*fun_ref), hlbc::types::FunPtr::Native(_)) {
+                                        " /* native@"{fun_ref.0}" */"
+                                    } else {
+                                        " /* fun@"{fun_ref.0}" */"
+                                    }
                                 }
                             }
                         }
@@ -883,11 +924,17 @@ impl Expr {
                         hlbc::types::FunPtr::Native(n) => {
                             let lib = n.lib(code);
                             let name = n.name(code);
-                            if let Some(haxe_name) = crate::natives::lookup_native(&lib, &name) {
+                            // 1. Try dynamic binding lookup first (covers all libraries)
+                            if let Some((class_name, method_name)) = crate::natives::lookup_native_binding(code, *fun) {
+                                {class_name}"."{method_name}
+                            }
+                            // 2. Fall back to hardcoded lookup table (stdlib)
+                            else if let Some(haxe_name) = crate::natives::lookup_native(&lib, &name) {
                                 {haxe_name}
                             } else {
-                                // Unknown native - show raw name for debugging
-                                "@native("{lib}"/"{name}")"
+                                // Unknown native - emit as identifier (lib_name style)
+                                // This is valid Haxe if an extern declaration exists
+                                {lib}"_"{name}
                             }
                         }
                         hlbc::types::FunPtr::Fun(func) => {

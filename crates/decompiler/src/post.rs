@@ -1031,10 +1031,6 @@ fn inline_single_use_vars_pass(stmts: &mut Vec<Statement>) -> bool {
     let mut to_inline: Vec<(String, usize, Expr)> = Vec::new(); // (var_name, def_idx, expr)
 
     for (var_name, def_info) in &var_defs {
-        if !def_info.is_pure {
-            continue;
-        }
-
         // Count total uses of this variable in the rest of the function
         let mut use_count = 0;
         let mut use_idx = None;
@@ -1053,38 +1049,51 @@ fn inline_single_use_vars_pass(stmts: &mut Vec<Statement>) -> bool {
             continue;
         }
 
+        let use_idx = match use_idx {
+            Some(idx) => idx,
+            None => continue,
+        };
+
+        // Check if safe to inline:
+        // - Pure expressions can always be inlined (no side effects)
+        // - Impure expressions (function calls) can be inlined into adjacent return statements only
+        //   (adjacency + return means no reordering of side effects possible)
+        let is_adjacent = use_idx == def_info.def_idx + 1;
+        let is_return_stmt = matches!(stmts.get(use_idx), Some(Statement::Return { .. }));
+        if !def_info.is_pure && !(is_adjacent && is_return_stmt) {
+            continue;
+        }
+
         // Don't inline if the variable is reassigned anywhere
         // (removing the declaration would leave later reassignments without a var declaration)
         if is_reassigned_in_stmts(stmts, var_name, def_info.def_idx) {
             continue;
         }
 
-        let use_idx = match use_idx {
-            Some(idx) => idx,
-            None => continue,
-        };
-
         // Check if any variable in the expression is reassigned between def and use
         // (if so, inlining would change semantics)
-        let mut expr_vars_modified = false;
-        let mut expr_vars = Vec::new();
-        get_var_refs_in_expr(&def_info.expr, &mut expr_vars);
-        for expr_var in &expr_vars {
-            for (idx, stmt) in stmts.iter().enumerate().skip(def_info.def_idx + 1) {
-                if idx >= use_idx {
-                    break;
+        // Skip this check for adjacent statements - nothing can be reassigned in between
+        if !is_adjacent {
+            let mut expr_vars_modified = false;
+            let mut expr_vars = Vec::new();
+            get_var_refs_in_expr(&def_info.expr, &mut expr_vars);
+            for expr_var in &expr_vars {
+                for (idx, stmt) in stmts.iter().enumerate().skip(def_info.def_idx + 1) {
+                    if idx >= use_idx {
+                        break;
+                    }
+                    if is_reassigned_in_stmt(stmt, expr_var) {
+                        expr_vars_modified = true;
+                        break;
+                    }
                 }
-                if is_reassigned_in_stmt(stmt, expr_var) {
-                    expr_vars_modified = true;
+                if expr_vars_modified {
                     break;
                 }
             }
             if expr_vars_modified {
-                break;
+                continue;
             }
-        }
-        if expr_vars_modified {
-            continue;
         }
 
         to_inline.push((var_name.clone(), def_info.def_idx, def_info.expr.clone()));
@@ -1947,17 +1956,167 @@ pub fn collapse_trace_calls(stmts: &mut Vec<Statement>) {
         collapse_trace_in_stmt(stmt);
     }
 
-    // Now scan for trace patterns at this level
-    let mut i = 0;
-    while i < stmts.len() {
-        if let Some((trace_stmt, consumed)) = try_collapse_trace_pattern(&stmts[i..]) {
-            // Remove the consumed statements and insert the collapsed one
-            for _ in 0..consumed {
-                stmts.remove(i);
+    // Scan backwards from the end to find trace calls, then remove their components
+    collapse_trace_patterns_reverse(stmts);
+}
+
+/// Collapse trace patterns by scanning for trace calls and removing setup code.
+fn collapse_trace_patterns_reverse(stmts: &mut Vec<Statement>) {
+    // Process from end to start so removals don't affect indices we haven't processed yet
+    let mut i = stmts.len();
+    while i > 0 {
+        i -= 1;
+
+        // Step 1: Check if this is a trace call, and if so replace it with trace(msg)
+        if let Some((trace_var, pos_var, message)) = extract_trace_call_info(&stmts[i]) {
+            // Try to find the required components backwards
+            let mut found_trace_load = false;
+            let mut found_pos_init = false;
+            let mut found_fields = std::collections::HashSet::new();
+            let required_fields = ["fileName", "lineNumber", "className", "methodName"];
+
+            // First pass: check if all components exist
+            for j in (0..i).rev() {
+                if !found_trace_load {
+                    if let Some(name) = is_trace_load_stmt(&stmts[j]) {
+                        if name == trace_var {
+                            found_trace_load = true;
+                            continue;
+                        }
+                    }
+                }
+                if !found_pos_init {
+                    if let Some(name) = is_pos_info_init_stmt(&stmts[j]) {
+                        if name == pos_var {
+                            found_pos_init = true;
+                            continue;
+                        }
+                    }
+                }
+                if let Some(field_name) = is_pos_info_field_assign(&stmts[j], &pos_var) {
+                    if required_fields.contains(&field_name.as_str()) {
+                        found_fields.insert(field_name);
+                    }
+                }
+                if found_trace_load && found_pos_init && found_fields.len() == 4 {
+                    break;
+                }
             }
-            stmts.insert(i, trace_stmt);
+
+            // Only proceed if we found all components
+            if !found_trace_load || !found_pos_init || found_fields.len() != 4 {
+                continue;
+            }
+
+            // Replace the trace call in-place with simple trace(msg)
+            stmts[i] = Statement::ExprStatement(Expr::Call(Box::new(Call {
+                fun: Expr::Ident("trace".into()),
+                args: vec![message],
+            })));
+
+            // Step 2: Walk backwards and delete the setup components
+            let mut j = i;
+            let mut deleted_trace_load = false;
+            let mut deleted_pos_init = false;
+            let mut deleted_fields = std::collections::HashSet::new();
+
+            while j > 0 {
+                j -= 1;
+                let mut should_remove = false;
+
+                if !deleted_trace_load {
+                    if let Some(name) = is_trace_load_stmt(&stmts[j]) {
+                        if name == trace_var {
+                            deleted_trace_load = true;
+                            should_remove = true;
+                        }
+                    }
+                }
+                if !should_remove && !deleted_pos_init {
+                    if let Some(name) = is_pos_info_init_stmt(&stmts[j]) {
+                        if name == pos_var {
+                            deleted_pos_init = true;
+                            should_remove = true;
+                        }
+                    }
+                }
+                if !should_remove {
+                    if let Some(field_name) = is_pos_info_field_assign(&stmts[j], &pos_var) {
+                        if required_fields.contains(&field_name.as_str()) && !deleted_fields.contains(&field_name) {
+                            deleted_fields.insert(field_name);
+                            should_remove = true;
+                        }
+                    }
+                }
+
+                if should_remove {
+                    stmts.remove(j);
+                    i -= 1; // Adjust our position since we removed something before it
+                }
+
+                // Stop when we've deleted everything
+                if deleted_trace_load && deleted_pos_init && deleted_fields.len() == 4 {
+                    break;
+                }
+            }
         }
-        i += 1;
+    }
+}
+
+/// Extract trace call info: returns (trace_var_name, posInfo_var_name, message_expr)
+fn extract_trace_call_info(stmt: &Statement) -> Option<(Str, Str, Expr)> {
+    let call = match stmt {
+        Statement::ExprStatement(Expr::Call(call)) => call,
+        Statement::Assign { assign: Expr::Call(call), .. } => call,
+        _ => return None,
+    };
+
+    // Must be a 2-arg call
+    if call.args.len() != 2 {
+        return None;
+    }
+
+    // First arg is the message
+    let message = call.args[0].clone();
+
+    // Second arg must be a variable (the posInfo)
+    let pos_var = match &call.args[1] {
+        Expr::Variable(_, Some(name)) => name.clone(),
+        _ => return None,
+    };
+
+    // Function must be a variable (the trace function)
+    let trace_var = match &call.fun {
+        Expr::Variable(_, Some(name)) => name.clone(),
+        _ => return None,
+    };
+
+    Some((trace_var, pos_var, message))
+}
+
+/// Check if statement is a trace load: var X = haxe.Log.trace
+fn is_trace_load_stmt(stmt: &Statement) -> Option<Str> {
+    match stmt {
+        Statement::Assign { variable: Expr::Variable(_, Some(name)), assign, .. } => {
+            if is_haxe_log_trace(assign) {
+                Some(name.clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Check if statement is posInfo init: var X:Dynamic = {}
+fn is_pos_info_init_stmt(stmt: &Statement) -> Option<Str> {
+    match stmt {
+        Statement::Assign {
+            variable: Expr::Variable(_, Some(name)),
+            assign: Expr::Anonymous(_, fields),
+            ..
+        } if fields.is_empty() => Some(name.clone()),
+        _ => None,
     }
 }
 
@@ -1991,118 +2150,6 @@ fn collapse_trace_in_stmt(stmt: &mut Statement) {
         }
         _ => {}
     }
-}
-
-/// Try to match and collapse a trace pattern starting at the given slice.
-/// Returns Some((collapsed_statement, num_statements_consumed)) on success.
-fn try_collapse_trace_pattern(stmts: &[Statement]) -> Option<(Statement, usize)> {
-    // Need at least 7 statements for the minimal pattern:
-    // 1. var trace = haxe.Log.trace
-    // 2. nullcheck comment (optional, but let's require it for safety)
-    // 3. var posInfo:Dynamic = {}
-    // 4. posInfo.fileName = ...
-    // 5. posInfo.lineNumber = ...
-    // 6. posInfo.className = ...
-    // 7. posInfo.methodName = ...
-    // 8. trace(message, posInfo)
-    if stmts.len() < 7 {
-        return None;
-    }
-
-    // Step 1: Check for var trace = haxe.Log.trace (or haxe.$Log.trace)
-    let trace_var = match &stmts[0] {
-        Statement::Assign { variable: Expr::Variable(_, Some(name)), assign, .. } => {
-            if is_haxe_log_trace(assign) {
-                name.clone()
-            } else {
-                return None;
-            }
-        }
-        _ => return None,
-    };
-
-    // Step 2: Skip nullcheck comment if present
-    let mut idx = 1;
-    if let Statement::Comment(c) = &stmts[idx] {
-        if c.contains("nullcheck") {
-            idx += 1;
-        }
-    }
-
-    if idx >= stmts.len() {
-        return None;
-    }
-
-    // Step 3: Check for var posInfo:Dynamic = {}
-    let pos_var = match &stmts[idx] {
-        Statement::Assign {
-            variable: Expr::Variable(_, Some(name)),
-            assign: Expr::Anonymous(_, fields),
-            ..
-        } if fields.is_empty() => {
-            idx += 1;
-            name.clone()
-        }
-        _ => return None,
-    };
-
-    // Step 4-7: Check for the four field assignments (fileName, lineNumber, className, methodName)
-    // They might be in any order
-    let mut found_fields = std::collections::HashSet::new();
-    let required_fields = ["fileName", "lineNumber", "className", "methodName"];
-
-    while idx < stmts.len() && found_fields.len() < 4 {
-        if let Some(field_name) = is_pos_info_field_assign(&stmts[idx], &pos_var) {
-            if required_fields.contains(&field_name.as_str()) {
-                found_fields.insert(field_name);
-                idx += 1;
-            } else {
-                break;
-            }
-        } else {
-            break;
-        }
-    }
-
-    // Must have all 4 fields
-    if found_fields.len() != 4 {
-        return None;
-    }
-
-    if idx >= stmts.len() {
-        return None;
-    }
-
-    // Step 8: Check for trace(message, posInfo) call
-    let message = match &stmts[idx] {
-        Statement::ExprStatement(Expr::Call(call)) => {
-            if is_trace_call(call, &trace_var, &pos_var) {
-                call.args.get(0).cloned()
-            } else {
-                return None;
-            }
-        }
-        // Also handle case where trace call result is assigned to void
-        Statement::Assign { assign: Expr::Call(call), .. } => {
-            if is_trace_call(call, &trace_var, &pos_var) {
-                call.args.get(0).cloned()
-            } else {
-                return None;
-            }
-        }
-        _ => return None,
-    };
-
-    let message = message?;
-    idx += 1;
-
-    // Create the collapsed trace call
-    let trace_call = Statement::ExprStatement(Expr::Call(Box::new(Call {
-        fun: Expr::Ident("trace".into()),
-        args: vec![message],
-    })));
-
-    Some((trace_call, idx))
 }
 
 /// Check if an expression is haxe.Log.trace or haxe.$Log.trace
@@ -2141,24 +2188,5 @@ fn is_pos_info_field_assign(stmt: &Statement, pos_var: &Str) -> Option<String> {
             None
         }
         _ => None,
-    }
-}
-
-/// Check if a call is trace_var(message, pos_var)
-fn is_trace_call(call: &Call, trace_var: &Str, pos_var: &Str) -> bool {
-    // Check that the function is the trace variable
-    let is_trace_var = match &call.fun {
-        Expr::Variable(_, Some(name)) => name == trace_var,
-        _ => false,
-    };
-
-    if !is_trace_var || call.args.len() != 2 {
-        return false;
-    }
-
-    // Check that the second argument is the posInfo variable
-    match &call.args[1] {
-        Expr::Variable(_, Some(name)) => name == pos_var,
-        _ => false,
     }
 }
