@@ -206,6 +206,9 @@ pub enum Expr {
     Ident(Str),
     /// Type cast: cast(expr, Type)
     Cast(Box<Expr>, Str),
+    /// Type annotated variable (for declarations): var x:Type
+    /// Used when we need to specify a type hint in variable declarations
+    TypeAnnotated(Box<Expr>, Str),
 }
 
 pub const fn cst_int(cst: RefInt) -> Expr {

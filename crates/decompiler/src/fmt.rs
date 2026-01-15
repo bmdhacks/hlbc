@@ -23,6 +23,28 @@ fn panic_internal_call(fun: &Expr) -> &'static str {
     panic!("Internal function call should have been suppressed by structurer: {:?}", fun)
 }
 
+/// Check if a type name is an internal HashLink type that should not appear in decompiled output.
+/// These are implementation details that the Haxe compiler generates but aren't valid Haxe types.
+fn is_internal_hl_type(name: &str) -> bool {
+    // Strip common prefixes that get added
+    let name = name.strip_prefix("haxe.std.").unwrap_or(name);
+
+    // Array implementation types
+    if name.starts_with("hl.types.Array") {
+        return true;
+    }
+    // Iterator implementation types
+    if name.contains("Iterator") && name.starts_with("hl.") {
+        return true;
+    }
+    // Other internal hl.types
+    if name.starts_with("hl.types.") {
+        return true;
+    }
+
+    false
+}
+
 
 /// A formatter that produces clean Haxe-like output without index annotations.
 /// Unlike EnhancedFmt, this doesn't add @index suffixes to type names.
@@ -174,7 +196,9 @@ impl Display for FormatOptions {
     }
 }
 
-fn to_haxe_type<'a>(ty: &Type, ctx: &'a Bytecode) -> Str {
+/// Convert a HashLink type to its Haxe equivalent string representation.
+/// Maps internal HL types to Haxe types (e.g., hl.types.ArrayDyn → Array<Dynamic>)
+pub fn to_haxe_type<'a>(ty: &Type, ctx: &'a Bytecode) -> Str {
     use crate::Type::*;
     match ty {
         Void => Str::from_static("Void"),
@@ -188,15 +212,31 @@ fn to_haxe_type<'a>(ty: &Type, ctx: &'a Bytecode) -> Str {
         Bytes => Str::from_static("hl.Bytes"),
         Dyn | DynObj | Virtual { .. } => Str::from_static("Dynamic"),
         Fun(fun) | Method(fun) => {
-            // Format function types as (Arg1, Arg2) -> RetType or simplified for single arg
+            // Format function types: Arg -> RetType or (Arg1, Arg2) -> RetType
+            // Single arg doesn't need parentheses in Haxe: Int -> Void
+            // Multiple args need parentheses: (Int, String) -> Void
+            // Return type needs parentheses if it's a function: Int -> (Int -> Int)
             let args: Vec<_> = fun.args.iter().map(|a| to_haxe_type(&ctx[*a], ctx)).collect();
             let ret = to_haxe_type(&ctx[fun.ret], ctx);
-            if args.is_empty() {
-                Str::from(format!("Void -> {}", ret))
-            } else if args.len() == 1 {
-                Str::from(format!("{} -> {}", args[0], ret))
+            // Wrap return type in parentheses if it's a function type
+            let ret_str = if ret.contains("->") {
+                format!("({})", ret)
             } else {
-                Str::from(format!("({}) -> {}", args.join(", "), ret))
+                ret.to_string()
+            };
+            if args.is_empty() {
+                Str::from(format!("Void -> {}", ret_str))
+            } else if args.len() == 1 {
+                // Single arg: no parentheses needed
+                // But if the arg is itself a function type, wrap it
+                let arg = &args[0];
+                if arg.contains("->") {
+                    Str::from(format!("({}) -> {}", arg, ret_str))
+                } else {
+                    Str::from(format!("{} -> {}", arg, ret_str))
+                }
+            } else {
+                Str::from(format!("({}) -> {}", args.join(", "), ret_str))
             }
         }
         Obj(obj) | Struct(obj) => {
@@ -856,17 +896,22 @@ impl Expr {
                             if let Some(parent_ref) = func.parent {
                                 if let Some(parent_obj) = parent_ref.as_obj(code) {
                                     let parent_name = parent_obj.name(code);
-                                    // Strip leading $ from static class type names
-                                    let clean_name = parent_name.strip_prefix('$').unwrap_or(&parent_name);
-                                    // Check if this is a static method (parent is a static class type)
-                                    if parent_name.starts_with('$') {
-                                        {clean_name}"."{name}
+                                    // Skip class qualifier for internal HL types
+                                    if is_internal_hl_type(&parent_name) {
+                                        {name}
                                     } else {
-                                        // Parent is not a static class type - try debug inference
-                                        if let Some(class_name) = infer_class_from_debug(code, func) {
-                                            {class_name}"."{name}
+                                        // Strip leading $ from static class type names
+                                        let clean_name = parent_name.strip_prefix('$').unwrap_or(&parent_name);
+                                        // Check if this is a static method (parent is a static class type)
+                                        if parent_name.starts_with('$') {
+                                            {clean_name}"."{name}
                                         } else {
-                                            {name}
+                                            // Parent is not a static class type - try debug inference
+                                            if let Some(class_name) = infer_class_from_debug(code, func) {
+                                                {class_name}"."{name}
+                                            } else {
+                                                {name}
+                                            }
                                         }
                                     }
                                 } else {
@@ -934,6 +979,10 @@ impl Expr {
                 }}
                 Expr::Cast(expr, type_name) => {
                     "cast("{disp!(expr)}", "{type_name}")"
+                }
+                Expr::TypeAnnotated(expr, type_name) => {
+                    // For variable declarations: var x:Type
+                    {disp!(expr)}":"{type_name}
                 }
             }
         }

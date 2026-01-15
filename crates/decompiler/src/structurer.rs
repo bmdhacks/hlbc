@@ -98,6 +98,8 @@ pub struct Structurer<'a> {
     hoisted_vars: HashSet<Str>,
     /// Hoisted vars that need :Dynamic type (assigned empty anonymous objects)
     needs_dynamic_type: HashSet<Str>,
+    /// Hoisted vars -> their types (for type hints in declarations)
+    hoisted_var_types: HashMap<Str, RefType>,
     /// Array bytes tracking: maps bytes register -> array register
     /// Used to reconstruct arr[i] from bytes[shifted_i] pattern
     array_bytes_source: HashMap<Reg, Reg>,
@@ -205,6 +207,7 @@ impl<'a> Structurer<'a> {
             scope_depth: 0,
             hoisted_vars: HashSet::new(),
             needs_dynamic_type: HashSet::new(),
+            hoisted_var_types: HashMap::new(),
             array_bytes_source: HashMap::new(),
             shifted_indices: HashMap::new(),
             enum_global_map: Self::build_enum_global_map(code),
@@ -625,42 +628,69 @@ impl<'a> Structurer<'a> {
         // NOT visible outside. So if we're inside a scope (scope_depth > 0),
         // we don't emit `var` inline - instead we track it for hoisting to
         // function level.
-        let is_declaration = match &variable {
-            Expr::Variable(_, Some(name)) | Expr::Ident(name) => {
-                if self.declared_vars.contains(name) {
+        // Extract the actual variable name from the variable expression
+        // Handle TypeAnnotated by unwrapping to the inner variable
+        let (var_name, is_typed) = match &variable {
+            Expr::Variable(_, Some(name)) | Expr::Ident(name) => (Some(name.clone()), false),
+            Expr::TypeAnnotated(inner, _) => {
+                match inner.as_ref() {
+                    Expr::Variable(_, Some(name)) | Expr::Ident(name) => (Some(name.clone()), true),
+                    _ => (None, true),
+                }
+            }
+            _ => (None, false),
+        };
+
+        let is_declaration = match var_name {
+            Some(name) => {
+                if self.declared_vars.contains(&name) {
                     // Already declared - but if assigning empty object, track for :Dynamic
                     if Self::is_empty_anonymous(&assign) {
                         self.needs_dynamic_type.insert(name.clone());
                     }
                     false
-                } else if self.scope_depth > 0 {
-                    // Inside a scope - don't declare inline, hoist instead
+                } else if self.scope_depth > 0 && !is_typed {
+                    // Inside a scope and no explicit type - don't declare inline, hoist instead
+                    // (But if type-annotated, we want to declare it with the type)
                     self.hoisted_vars.insert(name.clone());
                     self.declared_vars.insert(name.clone());
+                    // Track the type for type hints
+                    if let Some(ssa_var) = self.current_ssa_dst {
+                        let type_ref = self.func.regs.get(ssa_var.reg.0 as usize).copied();
+                        if let Some(tr) = type_ref {
+                            self.hoisted_var_types.insert(name.clone(), tr);
+                        }
+                    }
                     // Track if this hoisted var needs :Dynamic
                     if Self::is_empty_anonymous(&assign) {
                         self.needs_dynamic_type.insert(name.clone());
                     }
                     false
                 } else {
-                    // At function level - declare normally
+                    // At function level or type-annotated - declare normally
                     self.declared_vars.insert(name.clone());
                     true
                 }
             }
-            // Field access (obj.field) - never a declaration
-            Expr::Field(_, _) => false,
-            // Array access (arr[i]) - never a declaration
-            Expr::Array(_, _) => false,
-            // Any other expression type - never a declaration
-            _ => false,
+            None => {
+                // Field access (obj.field), Array access (arr[i]), etc. - never a declaration
+                false
+            }
         };
 
         // Clear array_bytes_source mapping when a register is reassigned.
         // This is important because registers can be reused (e.g., alloc_bytes reuses a reg
         // that previously held array.bytes from a different array).
-        if let Expr::Variable(reg, _) = &variable {
-            self.array_bytes_source.remove(reg);
+        let reg_to_clear = match &variable {
+            Expr::Variable(reg, _) => Some(*reg),
+            Expr::TypeAnnotated(inner, _) => match inner.as_ref() {
+                Expr::Variable(reg, _) => Some(*reg),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(reg) = reg_to_clear {
+            self.array_bytes_source.remove(&reg);
         }
 
         Statement::Assign {
@@ -705,9 +735,24 @@ impl<'a> Structurer<'a> {
         // Prepend hoisted variable declarations (for vars first assigned inside scopes)
         let mut result = Vec::new();
         for name in &self.hoisted_vars {
-            // Add :Dynamic type hint for vars that will hold empty anonymous objects
+            // Add type hint based on:
+            // 1. :Dynamic for vars that will hold empty anonymous objects
+            // 2. Type from hoisted_var_types if available
+            // 3. None if no type info
             let type_hint = if self.needs_dynamic_type.contains(name) {
                 Some("Dynamic".into())
+            } else if let Some(type_ref) = self.hoisted_var_types.get(name) {
+                let ty = &self.code.types[type_ref.0];
+                let type_str = crate::fmt::to_haxe_type(ty, self.code);
+                // Don't emit Void type hints - use Dynamic instead
+                // (Void variables are not valid in Haxe)
+                // Also use Dynamic for haxe.Exception since catch blocks
+                // can catch any type, not just Exception
+                if type_str == "Void" || type_str == "haxe.Exception" {
+                    Some("Dynamic".into())
+                } else {
+                    Some(type_str)
+                }
             } else {
                 None
             };
@@ -2745,7 +2790,11 @@ impl<'a> Structurer<'a> {
                     let expr = self.reg_to_expr(*src);
                     // Hoist to function level so it's available outside the loop
                     self.hoisted_vars.insert(raw_name.clone());
-                    self.declared_vars.insert(raw_name);
+                    self.declared_vars.insert(raw_name.clone());
+                    // Track type for hoisted var
+                    if let Some(tr) = self.func.regs.get(dst.0 as usize).copied() {
+                        self.hoisted_var_types.insert(raw_name, tr);
+                    }
                     stmts.push(Statement::Assign {
                         declaration: false, // Declaration is hoisted to function level
                         variable: var,
@@ -2769,7 +2818,11 @@ impl<'a> Structurer<'a> {
                     let val = Expr::Constant(Constant::Int(*ptr));
                     // Hoist to function level so it's available outside the loop
                     self.hoisted_vars.insert(raw_name.clone());
-                    self.declared_vars.insert(raw_name);
+                    self.declared_vars.insert(raw_name.clone());
+                    // Track type for hoisted var
+                    if let Some(tr) = self.func.regs.get(dst.0 as usize).copied() {
+                        self.hoisted_var_types.insert(raw_name, tr);
+                    }
                     stmts.push(Statement::Assign {
                         declaration: false, // Declaration is hoisted to function level
                         variable: var,
@@ -2945,6 +2998,24 @@ impl<'a> Structurer<'a> {
                     }
                 }
 
+                // Check if this is an internal array property accessor (get_length -> .length)
+                let fun_name = fun.name(self.code);
+                if fun_name.as_ref() == "get_length" {
+                    if let Some((owner_type, _)) = self.method_info.get(fun) {
+                        if let Some(hlbc::types::Type::Obj(owner_obj)) = self.code.types.get(owner_type.0) {
+                            let owner_name = self.code.get(owner_obj.name);
+                            if owner_name.contains("hl.types.") && owner_name.contains("Array") {
+                                // Emit as .length property access instead of method call
+                                let var = self.reg_to_expr_dst(*dst);
+                                let obj = self.reg_to_expr(*arg0);
+                                let field_access = Expr::Field(Box::new(obj), "length".into());
+                                stmts.push(self.make_assign(var, field_access));
+                                return stmts;
+                            }
+                        }
+                    }
+                }
+
                 let args = [*arg0];
                 let call = self.try_make_method_call(*fun, &args)
                     .unwrap_or_else(|| Call::new_fun(*fun, vec![self.reg_to_expr(*arg0)]));
@@ -2957,8 +3028,22 @@ impl<'a> Structurer<'a> {
                 // Handle alloc_array(type, size) -> output as empty array literal []
                 // This native allocates a raw array that gets filled by SetArray ops
                 if name.as_ref() == "alloc_array" {
+                    // Check if the element type (arg0) is a nullable type from a preceding Type opcode
+                    // If so, we need to emit a type hint to allow null values
+                    let needs_dynamic_hint = self.is_nullable_element_type(*arg0);
+
                     let var = self.reg_to_expr_dst(*dst);
-                    stmts.push(self.make_assign(var, Expr::ArrayLiteral(vec![])));
+                    if needs_dynamic_hint {
+                        // For nullable element types, emit with Dynamic hint
+                        // This allows pushing both Int and null
+                        let typed_var = Expr::TypeAnnotated(
+                            Box::new(var),
+                            "Array<Dynamic>".into()
+                        );
+                        stmts.push(self.make_assign(typed_var, Expr::ArrayLiteral(vec![])));
+                    } else {
+                        stmts.push(self.make_assign(var, Expr::ArrayLiteral(vec![])));
+                    }
                     return stmts;
                 }
 
@@ -2989,6 +3074,28 @@ impl<'a> Structurer<'a> {
                         let var = self.reg_to_expr_dst(*dst);
                         stmts.push(self.make_assign(var, Expr::Call(Box::new(call))));
                         return stmts;
+                    }
+                }
+
+                // Check if this is a call to an internal HL type allocator function
+                // (e.g., hl.types.ArrayDyn.alloc) - these just wrap arrays so pass through arg0
+                if name.as_ref() == "alloc" {
+                    if let hlbc::types::FunPtr::Fun(func) = self.code.get(*fun) {
+                        if let Some(parent_ref) = func.parent {
+                            if let Some(hlbc::types::Type::Obj(parent_obj)) = self.code.types.get(parent_ref.0) {
+                                let parent_name = self.code.get(parent_obj.name);
+                                // Check if parent is an internal HL Array type
+                                // Static types look like "hl.types.$ArrayDyn"
+                                // Instance types look like "hl.types.ArrayDyn"
+                                if parent_name.contains("hl.types.") && parent_name.contains("Array") {
+                                    // Internal allocator - just pass through the first argument
+                                    let var = self.reg_to_expr_dst(*dst);
+                                    let source = self.reg_to_expr(*arg0);
+                                    stmts.push(self.make_assign(var, source));
+                                    return stmts;
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -3069,7 +3176,11 @@ impl<'a> Structurer<'a> {
                     self.use_raw_name_regs.insert(*dst);
                     // Hoist to function level so it's available outside the loop
                     self.hoisted_vars.insert(raw_name.clone());
-                    self.declared_vars.insert(raw_name);
+                    self.declared_vars.insert(raw_name.clone());
+                    // Track type for hoisted var
+                    if let Some(tr) = self.func.regs.get(dst.0 as usize).copied() {
+                        self.hoisted_var_types.insert(raw_name, tr);
+                    }
                     Some(Statement::Assign {
                         declaration: false, // Declaration is hoisted to function level
                         variable: var,
@@ -3899,6 +4010,24 @@ impl<'a> Structurer<'a> {
         false
     }
 
+    /// Check if a type register (from alloc_array arg0) holds a nullable element type
+    /// by looking back at the Type opcode that set it
+    fn is_nullable_element_type(&self, type_reg: Reg) -> bool {
+        // Look back at instructions to find the Type opcode that set this register
+        for idx in (0..self.current_op).rev() {
+            if let Some(Opcode::Type { dst, ty }) = self.func.ops.get(idx) {
+                if *dst == type_reg {
+                    // Found the Type opcode that set this register
+                    // Check if the type is nullable (null<T>) or dynamic
+                    if let Some(element_type) = self.code.types.get(ty.0) {
+                        return matches!(element_type, Type::Null(_) | Type::Dyn | Type::DynObj);
+                    }
+                }
+            }
+        }
+        false
+    }
+
     fn reg_name(&self, reg: Reg) -> Str {
         // If this register was marked to use raw name (to avoid type conflicts),
         // always use the raw rN format
@@ -4195,7 +4324,11 @@ impl<'a> Structurer<'a> {
                     // Ensure variable is declared
                     if !self.declared_vars.contains(&var_name) {
                         self.declared_vars.insert(var_name.clone());
-                        self.hoisted_vars.insert(var_name);
+                        self.hoisted_vars.insert(var_name.clone());
+                        // Track type for hoisted var
+                        if let Some(tr) = self.func.regs.get(ssa_var.reg.0 as usize).copied() {
+                            self.hoisted_var_types.insert(var_name, tr);
+                        }
                     }
                     stmts.push(Statement::Assign {
                         declaration: false,
@@ -5188,7 +5321,7 @@ fn is_var_used_in_expr(reg: &Reg, expr: &Expr) -> bool {
         Expr::ArrayLiteral(elems) => elems.iter().any(|e| is_var_used_in_expr(reg, e)),
         Expr::EnumConstr(_, _, args) => args.iter().any(|a| is_var_used_in_expr(reg, a)),
         Expr::Closure(_, stmts) => stmts.iter().any(|s| is_var_used_in_stmt(reg, s)),
-        Expr::Cast(inner, _) => is_var_used_in_expr(reg, inner),
+        Expr::Cast(inner, _) | Expr::TypeAnnotated(inner, _) => is_var_used_in_expr(reg, inner),
         // These don't contain variable references
         Expr::Constant(_) | Expr::Ident(_) | Expr::FunRef(_) | Expr::Unknown(_) => false,
     }

@@ -233,7 +233,7 @@ pub(crate) fn visit_expr(code: &Bytecode, expr: &mut Expr, visitors: &mut [Box<d
         Expr::Unknown(_) => {}
         Expr::Variable(_, _) => {}
         Expr::Ident(_) => {}
-        Expr::Cast(inner, _) => {
+        Expr::Cast(inner, _) | Expr::TypeAnnotated(inner, _) => {
             rec!(inner);
         }
     }
@@ -1888,7 +1888,7 @@ fn apply_string_concat_expr(code: &Bytecode, expr: &mut Expr) {
                 }
             }
         }
-        Expr::Cast(inner, _) => {
+        Expr::Cast(inner, _) | Expr::TypeAnnotated(inner, _) => {
             apply_string_concat_expr(code, inner);
         }
         Expr::ArrayLiteral(elems) => {
