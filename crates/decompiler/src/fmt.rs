@@ -18,6 +18,11 @@ fn panic_unknown_expr(msg: &str) -> &'static str {
     panic!("Expr::Unknown encountered during display: {}", msg)
 }
 
+/// Helper to panic for internal function calls that should have been suppressed
+fn panic_internal_call(fun: &Expr) -> &'static str {
+    panic!("Internal function call should have been suppressed by structurer: {:?}", fun)
+}
+
 
 /// A formatter that produces clean Haxe-like output without index annotations.
 /// Unlike EnhancedFmt, this doesn't add @index suffixes to type names.
@@ -754,7 +759,7 @@ impl Expr {
                     match handling {
                         CallHandling::SpecialFormat(s) => {{s}}
                         CallHandling::Elide(replacement) => {{disp!(replacement)}}
-                        CallHandling::Skip => {"0 /* internal */"}
+                        CallHandling::Skip => {|_f| { panic_internal_call(&call.fun); }},
                         CallHandling::Normal => {
                             {disp!(call.fun)}"("{fmtools::join(", ", call.args.iter().map(|e| disp!(e)))}")"
                             // Add function index comment if the callee is a FunRef

@@ -254,6 +254,45 @@ impl<'a> Structurer<'a> {
         }
     }
 
+    /// Detect internal function calls (__expand, __construct, __constructor__) and suppress them.
+    /// These are runtime implementation details that shouldn't appear in decompiled output.
+    fn detect_internal_function_calls(&mut self) {
+        let ops = &self.func.ops;
+
+        for (i, op) in ops.iter().enumerate() {
+            // Extract function ref and first argument (if any) from call opcodes
+            let (fun, first_arg) = match op {
+                Opcode::Call2 { fun, arg0, .. } => (Some(*fun), Some(*arg0)),
+                Opcode::Call3 { fun, arg0, .. } => (Some(*fun), Some(*arg0)),
+                Opcode::Call4 { fun, arg0, .. } => (Some(*fun), Some(*arg0)),
+                Opcode::CallN { fun, args, .. } => (Some(*fun), args.first().copied()),
+                _ => (None, None),
+            };
+
+            if let Some(fun) = fun {
+                if let Some(func) = fun.as_fn(self.code) {
+                    if let Some(name) = self.code.strings.get(func.name.0) {
+                        // Suppress internal functions:
+                        // - __expand: array growth
+                        // - __construct: object construction helper
+                        if name == "__expand" || name == "__construct" {
+                            self.suppressed_ops.insert(i);
+                        }
+                        // - __constructor__: constructor call (folded into `new Type(...)`)
+                        //   BUT NOT super constructor calls (where first arg is `this`, i.e., reg0)
+                        else if name.starts_with("__constructor__") {
+                            // Don't suppress if first arg is reg0 (this) - that's a super() call
+                            let is_super_call = first_arg == Some(Reg(0));
+                            if !is_super_call {
+                                self.suppressed_ops.insert(i);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Detect string switch patterns in bytecode.
     /// Pattern per case (9 ops):
     ///   JNull reg0 -> next_case        // null check
@@ -650,8 +689,9 @@ impl<'a> Structurer<'a> {
 
     /// Structure the entire function into statements
     pub fn structure(&mut self) -> Vec<Statement> {
-        // Pre-process: detect EnumIndex → Switch patterns and mark EnumIndex for suppression
+        // Pre-process: detect patterns that should be suppressed
         self.detect_enum_switch_patterns();
+        self.detect_internal_function_calls();
 
         // For functions with exception regions, use opcode-range-based structuring
         // which handles nested Trap/EndTrap correctly without CFG edge interference.
@@ -1532,12 +1572,16 @@ impl<'a> Structurer<'a> {
                 }]
             } else if flat_chain.len() == 1 {
                 let (cond, then_stmts) = flat_chain.into_iter().next().unwrap();
+                // Skip if-else entirely if both branches are empty (e.g., suppressed internal ops)
+                if then_stmts.is_empty() && else_stmts.is_empty() {
+                    vec![]
+                }
                 // Try phi-return optimization: both branches assign, merge returns the phi var
-                if let Some(optimized) = self.try_simplify_phi_return(&cond, &then_stmts, &else_stmts, final_merge) {
+                else if let Some(optimized) = self.try_simplify_phi_return(&cond, &then_stmts, &else_stmts, final_merge) {
                     return optimized;
                 }
                 // Try ternary condensation: both branches return directly
-                if let Some(ternary) = self.try_condense_ternary_return(&cond, &then_stmts, &else_stmts) {
+                else if let Some(ternary) = self.try_condense_ternary_return(&cond, &then_stmts, &else_stmts) {
                     vec![ternary]
                 }
                 // Try ternary assignment: both branches assign to same variable
@@ -3091,7 +3135,11 @@ impl<'a> Structurer<'a> {
                     Some(self.make_assign(var, Expr::Anonymous(type_ref, HashMap::new())))
                 } else {
                     // Look ahead for __constructor__ call to get constructor arguments
-                    let ctor_args = self.find_constructor_args(*dst, op_idx);
+                    let (ctor_args, ctor_op_idx) = self.find_constructor_args(*dst, op_idx);
+                    // Suppress the constructor call opcode since we're inlining it into `new Type(...)`
+                    if let Some(idx) = ctor_op_idx {
+                        self.suppressed_ops.insert(idx);
+                    }
                     let ctor = ConstructorCall::new(type_ref, ctor_args);
                     Some(self.make_assign(var, Expr::Constructor(ctor)))
                 }
@@ -4417,7 +4465,8 @@ impl<'a> Structurer<'a> {
     ///   GetGlobal reg1 = global@5  // "Hello World"
     ///   Call2 __constructor__(reg0, reg1)
     /// We need to combine these into: new Type("Hello World")
-    fn find_constructor_args(&self, new_dst: Reg, new_op_idx: usize) -> Vec<Expr> {
+    /// Returns (constructor_args, constructor_call_opcode_index)
+    fn find_constructor_args(&self, new_dst: Reg, new_op_idx: usize) -> (Vec<Expr>, Option<usize>) {
         // Search forward within the same basic block for a constructor call
         let block = self.cfg.op_to_block.get(&new_op_idx);
         let search_end = block
@@ -4427,8 +4476,8 @@ impl<'a> Structurer<'a> {
         // Track register values from intermediate opcodes
         let mut reg_values: HashMap<Reg, Expr> = HashMap::new();
 
-        for idx in (new_op_idx + 1)..=search_end.min(new_op_idx + 20) {
-            // Search further for constructor args (complex expressions may need many ops)
+        for idx in (new_op_idx + 1)..=search_end {
+            // Search within the same basic block for constructor call
             if idx >= self.func.ops.len() {
                 break;
             }
@@ -4527,35 +4576,35 @@ impl<'a> Structurer<'a> {
                 // Call2 __constructor__(obj, arg1)
                 Opcode::Call2 { fun, arg0, arg1, .. } if *arg0 == new_dst => {
                     if self.is_constructor_function(*fun) {
-                        return vec![get_arg_expr(*arg1)];
+                        return (vec![get_arg_expr(*arg1)], Some(idx));
                     }
                 }
                 // Call3 __constructor__(obj, arg1, arg2)
                 Opcode::Call3 { fun, arg0, arg1, arg2, .. } if *arg0 == new_dst => {
                     if self.is_constructor_function(*fun) {
-                        return vec![get_arg_expr(*arg1), get_arg_expr(*arg2)];
+                        return (vec![get_arg_expr(*arg1), get_arg_expr(*arg2)], Some(idx));
                     }
                 }
                 // Call4 __constructor__(obj, arg1, arg2, arg3)
                 Opcode::Call4 { fun, arg0, arg1, arg2, arg3, .. } if *arg0 == new_dst => {
                     if self.is_constructor_function(*fun) {
-                        return vec![
+                        return (vec![
                             get_arg_expr(*arg1),
                             get_arg_expr(*arg2),
                             get_arg_expr(*arg3),
-                        ];
+                        ], Some(idx));
                     }
                 }
                 // CallN __constructor__(obj, args...)
                 Opcode::CallN { fun, args, .. } if !args.is_empty() && args[0] == new_dst => {
                     if self.is_constructor_function(*fun) {
-                        return args[1..].iter().map(|r| get_arg_expr(*r)).collect();
+                        return (args[1..].iter().map(|r| get_arg_expr(*r)).collect(), Some(idx));
                     }
                 }
                 _ => {}
             }
         }
-        vec![] // No constructor call found
+        (vec![], None) // No constructor call found
     }
 
     /// Check if a function is a __constructor__
