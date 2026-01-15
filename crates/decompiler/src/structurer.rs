@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use hlbc::opcodes::Opcode;
-use hlbc::types::{Function, Reg, RefFun, RefField, RefString, Type};
+use hlbc::types::{Function, Reg, RefFun, RefField, RefString, RefEnumConstruct, Type};
 use hlbc::{Bytecode, Resolve, Str};
 
 use crate::analyzer::{CfgAnalysis, NaturalLoop};
@@ -142,6 +142,9 @@ pub struct Structurer<'a> {
     /// invalidation when conflicting writes occur.
     /// Uses RefCell for interior mutability so we can remove entries when inlined.
     inline_exprs: RefCell<HashMap<SsaVar, (Expr, MemoryDep)>>,
+    /// Opcodes to suppress (not emit as statements)
+    /// Used when an opcode's result is consumed by another construct (e.g., EnumIndex for switch)
+    suppressed_ops: HashSet<usize>,
 }
 
 impl<'a> Structurer<'a> {
@@ -215,6 +218,39 @@ impl<'a> Structurer<'a> {
             recursion_depth: 0,
             current_loop_header: None,
             inline_exprs: RefCell::new(HashMap::new()),
+            suppressed_ops: HashSet::new(),
+        }
+    }
+
+    /// Detect EnumIndex → Switch patterns and mark EnumIndex for suppression.
+    /// Pattern:
+    ///   EnumIndex dst = value
+    ///   ... (0 or more ops)
+    ///   Switch dst
+    /// When detected, the EnumIndex opcode is suppressed and the switch uses the original enum.
+    fn detect_enum_switch_patterns(&mut self) {
+        let ops = &self.func.ops;
+
+        for (i, op) in ops.iter().enumerate() {
+            if let Opcode::EnumIndex { dst, value: _ } = op {
+                // Look for a Switch that uses this dst register
+                // Search forward (within reasonable distance)
+                for j in (i + 1)..ops.len().min(i + 20) {
+                    if let Opcode::Switch { reg, .. } = &ops[j] {
+                        if reg == dst {
+                            // Found EnumIndex → Switch pattern
+                            self.suppressed_ops.insert(i);
+                            break;
+                        }
+                    }
+                    // Stop if dst is overwritten
+                    if let Some(def_dst) = crate::ssa::get_dst_reg(&ops[j]) {
+                        if def_dst == *dst {
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -614,6 +650,9 @@ impl<'a> Structurer<'a> {
 
     /// Structure the entire function into statements
     pub fn structure(&mut self) -> Vec<Statement> {
+        // Pre-process: detect EnumIndex → Switch patterns and mark EnumIndex for suppression
+        self.detect_enum_switch_patterns();
+
         // For functions with exception regions, use opcode-range-based structuring
         // which handles nested Trap/EndTrap correctly without CFG edge interference.
         // For functions without exceptions, use CFG-based structuring.
@@ -2158,6 +2197,10 @@ impl<'a> Structurer<'a> {
         }
         let switch_arg = self.reg_to_expr(switch_reg);
 
+        // Check if switch_arg is Type.enumIndex(x) and unwrap to just x
+        // Also extract the enum type for proper case pattern formatting
+        let (switch_arg, enum_type) = self.unwrap_enum_index_switch(switch_arg, switch_reg);
+
         // Group cases by their target opcode
         // offsets[i] = offset for case value i, target = switch_op_idx + 1 + offset
         let mut target_to_cases: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -2202,10 +2245,32 @@ impl<'a> Structurer<'a> {
             }
             processed_targets.insert(target_op);
 
-            // Convert integer case values to expressions
+            // Convert case values to expressions
+            // If we have an enum type, use constructor names instead of integers
             let case_exprs: Vec<Expr> = case_vals
                 .iter()
-                .map(|&v| Expr::Constant(Constant::InlineInt(v)))
+                .map(|&v| {
+                    if let Some(ref_type) = enum_type {
+                        // Try to get enum constructor name for this index
+                        if let Type::Enum { constructs, .. } = &self.code[ref_type] {
+                            if let Some(construct) = constructs.get(v) {
+                                let name = self.code.strings.get(construct.name.0)
+                                    .cloned()
+                                    .unwrap_or_else(|| format!("_{}", v).into());
+                                // If constructor has parameters, emit EnumConstr with wildcards
+                                if !construct.params.is_empty() {
+                                    let wildcards: Vec<Expr> = construct.params.iter()
+                                        .map(|_| Expr::Ident("_".into()))
+                                        .collect();
+                                    return Expr::EnumConstr(ref_type, RefEnumConstruct(v), wildcards);
+                                }
+                                return Expr::Ident(name);
+                            }
+                        }
+                    }
+                    // Fallback to integer
+                    Expr::Constant(Constant::InlineInt(v))
+                })
                 .collect();
 
             // Skip default case target if it's also a case target
@@ -2303,7 +2368,7 @@ impl<'a> Structurer<'a> {
             arg: switch_arg,
             default: default_stmts,
             cases,
-            enum_type: None,
+            enum_type,
         });
 
         // Continue after merge
@@ -2342,6 +2407,88 @@ impl<'a> Structurer<'a> {
             .into_iter()
             .max_by_key(|(_, count)| *count)
             .map(|(node, _)| node)
+    }
+
+    /// Check if switch_arg is Type.enumIndex(x) and unwrap to just x
+    /// Also check if switch_reg was produced by EnumIndex opcode
+    /// Returns (unwrapped_arg, optional_enum_type)
+    fn unwrap_enum_index_switch(
+        &mut self,
+        switch_arg: Expr,
+        switch_reg: Reg,
+    ) -> (Expr, Option<RefType>) {
+        // Check if switch_arg is Type.enumIndex(x) (already inlined)
+        if let Expr::Call(call) = &switch_arg {
+            if let Expr::Field(base, method) = &call.fun {
+                if method.as_ref() == "enumIndex" {
+                    if let Expr::Ident(name) = base.as_ref() {
+                        if name.as_ref() == "Type" {
+                            if let Some(inner_arg) = call.args.first() {
+                                // Try to get enum type from the inner argument
+                                let enum_type = self.get_enum_type_from_expr(inner_arg);
+                                return (inner_arg.clone(), enum_type);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check if switch_reg was produced by EnumIndex opcode
+        // Find the SSA variable for switch_reg in the current uses
+        let ssa_var = self.current_ssa_uses.iter()
+            .find(|&&v| v.reg == switch_reg)
+            .copied();
+
+        if let Some(var) = ssa_var {
+            if let Some(def_op_idx) = self.ssa.find_def(var) {
+                if let Opcode::EnumIndex { dst: _, value } = &self.func.ops[def_op_idx] {
+                    // The switch should use the original enum value
+                    let enum_reg = *value;
+
+                    // Set SSA context to the EnumIndex opcode to get correct variable names
+                    let saved_op = self.current_op;
+                    let saved_uses = self.current_ssa_uses.clone();
+                    self.current_op = def_op_idx;
+                    if let Some((_, ssa_uses)) = self.ssa.get_instr_for_op(def_op_idx) {
+                        self.current_ssa_uses = ssa_uses.clone();
+                    }
+
+                    let enum_expr = self.reg_to_expr(enum_reg);
+
+                    // Restore SSA context
+                    self.current_op = saved_op;
+                    self.current_ssa_uses = saved_uses;
+
+                    let enum_type = self.get_enum_type_for_reg(enum_reg);
+                    // Suppress the EnumIndex opcode since we're using the enum directly
+                    self.suppressed_ops.insert(def_op_idx);
+                    return (enum_expr, enum_type);
+                }
+            }
+        }
+
+        // Not a Type.enumIndex call - try to get enum type from the register's type
+        let enum_type = self.get_enum_type_for_reg(switch_reg);
+        (switch_arg, enum_type)
+    }
+
+    /// Try to get the enum type from an expression
+    fn get_enum_type_from_expr(&self, expr: &Expr) -> Option<RefType> {
+        match expr {
+            Expr::Variable(reg, _) => self.get_enum_type_for_reg(*reg),
+            _ => None,
+        }
+    }
+
+    /// Try to get the enum type for a register
+    fn get_enum_type_for_reg(&self, reg: Reg) -> Option<RefType> {
+        let reg_type = self.func.regs.get(reg.0 as usize)?;
+        if let Type::Enum { .. } = &self.code[*reg_type] {
+            Some(*reg_type)
+        } else {
+            None
+        }
     }
 
     /// Structure a single basic block into statements
@@ -2495,6 +2642,11 @@ impl<'a> Structurer<'a> {
     /// May return multiple statements if inline expressions need to be materialized
     /// due to memory conflicts.
     fn opcode_to_statements(&mut self, op_idx: usize) -> Vec<Statement> {
+        // Check if this opcode was consumed by another construct (e.g., EnumIndex for switch)
+        if self.suppressed_ops.contains(&op_idx) {
+            return vec![];
+        }
+
         let op = &self.func.ops[op_idx];
 
         // Invalidate any pending inline expressions that conflict with this opcode
@@ -3361,8 +3513,10 @@ impl<'a> Structurer<'a> {
                     return stmts;
                 }
 
-                // Function not found - this shouldn't happen with valid bytecode
-                panic!("Failed to resolve closure function fun@{} - invalid bytecode?", fun.0);
+                // Native function used as callback - emit function reference
+                let expr = Expr::FunRef(*fun);
+                stmts.push(self.make_assign(var, expr));
+                return stmts;
             }
 
             Opcode::InstanceClosure { dst, fun, obj } => {
