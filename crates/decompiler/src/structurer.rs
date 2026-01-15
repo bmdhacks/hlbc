@@ -972,6 +972,33 @@ impl<'a> Structurer<'a> {
                 continue;
             }
 
+            // Check if this is a Switch opcode - needs special handling
+            if let Opcode::Switch { .. } = &self.func.ops[op_idx] {
+                if let Some(block) = self.cfg.op_to_block.get(&op_idx).copied() {
+                    // Use CFG-based switch structuring
+                    let succs = self.cfg.successors(block);
+                    let switch_stmts = self.structure_switch(block, &succs, None);
+                    stmts.extend(switch_stmts);
+                    // Skip to merge point or continue after switch
+                    if let Some(merge) = self.find_switch_merge_point(block) {
+                        let merge_block = &self.cfg.graph[merge];
+                        op_idx = merge_block.start;
+                    } else {
+                        // No merge point found, just continue past the switch opcode
+                        op_idx += 1;
+                    }
+                    continue;
+                } else {
+                    // No CFG block for this switch - emit a comment and continue
+                    stmts.push(Statement::Comment(format!(
+                        "switch at {} (no CFG block)",
+                        op_idx
+                    )));
+                    op_idx += 1;
+                    continue;
+                }
+            }
+
             stmts.extend(self.opcode_to_statements(op_idx));
             op_idx += 1;
         }
@@ -1055,6 +1082,31 @@ impl<'a> Structurer<'a> {
                 // The catch body was processed from handler_op to 'end', so skip there
                 op_idx = end;
                 continue;
+            }
+
+            // Check if this is a Switch opcode - needs special handling
+            if let Opcode::Switch { .. } = &self.func.ops[op_idx] {
+                if let Some(block) = self.cfg.op_to_block.get(&op_idx).copied() {
+                    // Use CFG-based switch structuring
+                    let succs = self.cfg.successors(block);
+                    let switch_stmts = self.structure_switch(block, &succs, None);
+                    stmts.extend(switch_stmts);
+                    // Skip to merge point or continue after switch
+                    if let Some(merge) = self.find_switch_merge_point(block) {
+                        let merge_block = &self.cfg.graph[merge];
+                        op_idx = merge_block.start;
+                    } else {
+                        op_idx += 1;
+                    }
+                    continue;
+                } else {
+                    stmts.push(Statement::Comment(format!(
+                        "switch at {} (no CFG block)",
+                        op_idx
+                    )));
+                    op_idx += 1;
+                    continue;
+                }
             }
 
             stmts.extend(self.opcode_to_statements(op_idx));
@@ -1207,6 +1259,28 @@ impl<'a> Structurer<'a> {
                     // Jump stays in loop when a >= b
                     (
                         Expr::Op(Operation::Gte(Box::new(a_expr), Box::new(b_expr))),
+                        target,
+                        self.cfg.block_for_op(block.end + 1),
+                    )
+                }
+            }
+            Opcode::JNotGte { a, b, offset } => {
+                // JNotGte: jump if NOT (a >= b), i.e., jump if a < b
+                let target = self.compute_target(block.end, *offset);
+                let a_expr = self.reg_to_expr_in_block(*a, header);
+                let b_expr = self.reg_to_expr_in_block(*b, header);
+
+                if target.map_or(false, |t| !loop_info.body.contains(&t)) {
+                    // Jump exits loop when a < b, so continue while a >= b
+                    (
+                        Expr::Op(Operation::Gte(Box::new(a_expr), Box::new(b_expr))),
+                        self.cfg.block_for_op(block.end + 1),
+                        target,
+                    )
+                } else {
+                    // Jump stays in loop when a < b
+                    (
+                        Expr::Op(Operation::Lt(Box::new(a_expr), Box::new(b_expr))),
                         target,
                         self.cfg.block_for_op(block.end + 1),
                     )
@@ -1558,6 +1632,14 @@ impl<'a> Structurer<'a> {
             Opcode::JNotLt { a, b, offset } => {
                 // not(a < b) is equivalent to a >= b
                 let cond = Expr::Op(Operation::Gte(
+                    Box::new(self.reg_to_expr(*a)),
+                    Box::new(self.reg_to_expr(*b)),
+                ));
+                (cond, target(*offset), fall)
+            }
+            Opcode::JNotGte { a, b, offset } => {
+                // not(a >= b) is equivalent to a < b
+                let cond = Expr::Op(Operation::Lt(
                     Box::new(self.reg_to_expr(*a)),
                     Box::new(self.reg_to_expr(*b)),
                 ));
@@ -2287,8 +2369,15 @@ impl<'a> Structurer<'a> {
         // 3. The register will be declared when first assigned in regular code
 
         // Process opcodes
+        // Skip control flow ops at block.end - they're handled by structuring logic
         let end = if self.is_control_flow_op(block.end) {
-            block.end.saturating_sub(1)
+            // If block.end is a control flow op, process up to (but not including) it
+            // Special case: if block is just one control flow op (start == end), skip entirely
+            if block.start >= block.end {
+                // No non-control-flow ops to process
+                return stmts;
+            }
+            block.end - 1
         } else {
             block.end
         };
@@ -2336,6 +2425,8 @@ impl<'a> Structurer<'a> {
                     | Opcode::SetField { .. }
                     | Opcode::SetArray { .. }
                     | Opcode::SetMem { .. }
+                    | Opcode::SetI8 { .. }
+                    | Opcode::SetI16 { .. }
                     | Opcode::SetGlobal { .. }
                     | Opcode::Throw { .. }
             );
@@ -2346,6 +2437,10 @@ impl<'a> Structurer<'a> {
             }
 
             // Emit statement for this opcode
+            if self.is_control_flow_op(op_idx) {
+                eprintln!("BUG: Control flow op {} in opcode_to_statements: {:?}", op_idx, &self.func.ops[op_idx]);
+                eprintln!("  block.start={}, block.end={}, end={}", block.start, block.end, end);
+            }
             stmts.extend(self.opcode_to_statements(op_idx));
             op_idx += 1;
         }
@@ -2373,6 +2468,7 @@ impl<'a> Structurer<'a> {
                 | Opcode::JULt { .. }
                 | Opcode::JUGte { .. }
                 | Opcode::JNotLt { .. }
+                | Opcode::JNotGte { .. }
                 | Opcode::JEq { .. }
                 | Opcode::JNotEq { .. }
                 | Opcode::JAlways { .. }
@@ -2422,7 +2518,8 @@ impl<'a> Structurer<'a> {
             | Opcode::JNotNull { .. } | Opcode::JAlways { .. } | Opcode::Ret { .. }
             | Opcode::JSLt { .. } | Opcode::JSGte { .. } | Opcode::JSLte { .. }
             | Opcode::JSGt { .. } | Opcode::JEq { .. } | Opcode::JNotEq { .. }
-            | Opcode::JULt { .. } | Opcode::JUGte { .. } | Opcode::JNotLt { .. } => None,
+            | Opcode::JULt { .. } | Opcode::JUGte { .. } | Opcode::JNotLt { .. }
+            | Opcode::JNotGte { .. } => None,
 
             // Exception handling opcodes are control flow - handled by structure_block_range
             Opcode::Trap { .. } | Opcode::EndTrap { .. } => None,
@@ -3113,6 +3210,54 @@ impl<'a> Structurer<'a> {
                 }
             }
 
+            // GetI8: Read 8-bit integer from bytes
+            // haxe.io.Bytes uses get(pos), hl.Bytes uses getUI8(pos)
+            Opcode::GetI8 { dst, bytes, index } => {
+                let var = self.reg_to_expr_dst(*dst);
+                let bytes_expr = self.reg_to_expr(*bytes);
+                let index_expr = self.reg_to_expr(*index);
+                // Use haxe.io.Bytes.get() for compatibility
+                let method = Expr::Field(Box::new(bytes_expr), "get".into());
+                let call = Expr::Call(Box::new(Call::new(method, vec![index_expr])));
+                Some(self.make_assign(var, call))
+            }
+
+            // GetI16: Read 16-bit integer from bytes
+            // haxe.io.Bytes uses getUInt16(pos), hl.Bytes uses getUI16(pos)
+            Opcode::GetI16 { dst, bytes, index } => {
+                let var = self.reg_to_expr_dst(*dst);
+                let bytes_expr = self.reg_to_expr(*bytes);
+                let index_expr = self.reg_to_expr(*index);
+                // Use haxe.io.Bytes.getUInt16() for compatibility
+                let method = Expr::Field(Box::new(bytes_expr), "getUInt16".into());
+                let call = Expr::Call(Box::new(Call::new(method, vec![index_expr])));
+                Some(self.make_assign(var, call))
+            }
+
+            // SetI8: Write 8-bit integer to bytes
+            // haxe.io.Bytes uses set(pos, value), hl.Bytes uses setUI8(pos, value)
+            Opcode::SetI8 { bytes, index, src } => {
+                let bytes_expr = self.reg_to_expr(*bytes);
+                let index_expr = self.reg_to_expr(*index);
+                let value_expr = self.reg_to_expr(*src);
+                // Use haxe.io.Bytes.set() for compatibility
+                let method = Expr::Field(Box::new(bytes_expr), "set".into());
+                let call = Call::new(method, vec![index_expr, value_expr]);
+                Some(Statement::ExprStatement(Expr::Call(Box::new(call))))
+            }
+
+            // SetI16: Write 16-bit integer to bytes
+            // haxe.io.Bytes uses setUInt16(pos, value), hl.Bytes uses setUI16(pos, value)
+            Opcode::SetI16 { bytes, index, src } => {
+                let bytes_expr = self.reg_to_expr(*bytes);
+                let index_expr = self.reg_to_expr(*index);
+                let value_expr = self.reg_to_expr(*src);
+                // Use haxe.io.Bytes.setUInt16() for compatibility
+                let method = Expr::Field(Box::new(bytes_expr), "setUInt16".into());
+                let call = Call::new(method, vec![index_expr, value_expr]);
+                Some(Statement::ExprStatement(Expr::Call(Box::new(call))))
+            }
+
             Opcode::Ref { dst, src } => {
                 // Reference - creates a pointer to a value
                 // Two patterns:
@@ -3755,6 +3900,8 @@ impl<'a> Structurer<'a> {
             | Opcode::CallClosure { .. }
             | Opcode::GetArray { .. }
             | Opcode::GetMem { .. }
+            | Opcode::GetI8 { .. }
+            | Opcode::GetI16 { .. }
             | Opcode::ArraySize { .. }
             | Opcode::Unref { .. }
             | Opcode::EnumAlloc { .. }
@@ -3805,8 +3952,9 @@ impl<'a> Structurer<'a> {
             | Opcode::CallClosure { .. } => {
                 Box::new(|dep: &MemoryDep| !matches!(dep, MemoryDep::None))
             }
-            // SetArray/SetMem could modify anything accessed via pointers
-            Opcode::SetArray { .. } | Opcode::SetMem { .. } | Opcode::Setref { .. } => {
+            // SetArray/SetMem/SetI* could modify anything accessed via pointers
+            Opcode::SetArray { .. } | Opcode::SetMem { .. } | Opcode::Setref { .. }
+            | Opcode::SetI8 { .. } | Opcode::SetI16 { .. } => {
                 Box::new(|dep: &MemoryDep| !matches!(dep, MemoryDep::None))
             }
             // Other opcodes don't modify memory - no invalidation needed

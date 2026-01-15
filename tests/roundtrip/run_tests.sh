@@ -124,10 +124,23 @@ run_test() {
     done
 
     # Step 4: Recompile
-    if ! $HAXE -cp "$single_dir" --main "$name" -hl "$rt_file" 2>/dev/null; then
+    # For resources: use extracted bytes from decompiled output, OR fall back to original .resource file
+    local rt_resource_args=""
+    if [ -f "$decompiled_dir/resources/bytes_0.bin" ]; then
+        # Use extracted resources (need to figure out the resource name)
+        # For now, use the same name pattern as original .resource file
+        if [ -n "$resource_args" ]; then
+            rt_resource_args="-resource $decompiled_dir/resources/bytes_0.bin@testdata"
+        fi
+    elif [ -n "$resource_args" ]; then
+        # Fall back to original resource file
+        rt_resource_args="$resource_args"
+    fi
+
+    if ! $HAXE -cp "$single_dir" --main "$name" -hl "$rt_file" $rt_resource_args 2>/dev/null; then
         echo -e "${RED}FAIL${NC} (recompile failed)"
         # Show the error for debugging
-        $HAXE -cp "$single_dir" --main "$name" -hl "$rt_file" 2>&1 | head -5
+        $HAXE -cp "$single_dir" --main "$name" -hl "$rt_file" $rt_resource_args 2>&1 | head -5
         ((FAILED++))
         return
     fi

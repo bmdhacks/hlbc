@@ -247,6 +247,9 @@ impl<'a> BatchDecompiler<'a> {
         // Write enum types
         self.write_enums(output_dir, &mut index)?;
 
+        // Extract embedded bytes/resources
+        self.write_resources(output_dir)?;
+
         // Write metadata files only if requested (they can break recompilation)
         if self.batch_opts.include_metadata {
             // Write standalone functions (not part of a class)
@@ -420,6 +423,60 @@ impl<'a> BatchDecompiler<'a> {
 
         let path = output_dir.join("_globals.hx");
         fs::write(path, globals)?;
+        Ok(())
+    }
+
+    /// Extract embedded bytes constants to files.
+    ///
+    /// Creates a `resources/` subdirectory and saves each bytes constant
+    /// as a binary file. Also generates a `_resources.txt` manifest that
+    /// can be used for recompilation with `-resource` flags.
+    fn write_resources(&self, output_dir: &Path) -> io::Result<()> {
+        // Check if there are any bytes constants
+        let (data, offsets) = match &self.code.bytes {
+            Some((data, offsets)) if !offsets.is_empty() => (data, offsets),
+            _ => return Ok(()), // No bytes to extract
+        };
+
+        // Create resources directory
+        let resources_dir = output_dir.join("resources");
+        fs::create_dir_all(&resources_dir)?;
+
+        let mut manifest = String::new();
+        manifest.push_str("# Embedded bytes resources extracted from bytecode\n");
+        manifest.push_str("# Format: index filename size\n");
+        manifest.push_str("# To recompile, add -resource flags for each resource\n\n");
+
+        for (idx, &start) in offsets.iter().enumerate() {
+            // Calculate end position (next offset or data length)
+            let end = offsets.get(idx + 1).copied().unwrap_or(data.len());
+            let mut bytes_slice = &data[start..end];
+
+            // Strip trailing null terminator if present
+            // HashLink adds a null terminator when storing resources, but the
+            // original file size (without null) is stored in ResourceContent.dataLen.
+            // To round-trip correctly, we need to extract the original content.
+            if bytes_slice.last() == Some(&0) {
+                bytes_slice = &bytes_slice[..bytes_slice.len() - 1];
+            }
+
+            // Save as binary file
+            let filename = format!("bytes_{}.bin", idx);
+            let file_path = resources_dir.join(&filename);
+            fs::write(&file_path, bytes_slice)?;
+
+            // Add to manifest
+            manifest.push_str(&format!("{} {} {}\n", idx, filename, bytes_slice.len()));
+
+            if self.batch_opts.verbose {
+                eprintln!("Extracted bytes@{}: {} bytes", idx, bytes_slice.len());
+            }
+        }
+
+        // Write manifest
+        let manifest_path = output_dir.join("_resources.txt");
+        fs::write(manifest_path, manifest)?;
+
         Ok(())
     }
 }
