@@ -47,6 +47,8 @@ mod post;
 pub mod closure_analysis;
 /// Exception region analysis for try/catch structuring
 pub mod exception_analysis;
+/// Generic type parameter inference
+pub mod generic_inference;
 
 // Re-export ClosureAnalysis for convenience
 pub use closure_analysis::ClosureAnalysis;
@@ -315,6 +317,7 @@ pub fn decompile_class_with_closures(
             static_: false,
             ty: f.t,
             initializer: None, // Instance fields don't have initializers from entrypoint
+            inferred_generics: None,
         });
     }
     if let Some(ty) = static_type {
@@ -343,6 +346,7 @@ pub fn decompile_class_with_closures(
                 static_: true,
                 ty: f.t,
                 initializer,
+                inferred_generics: None,
             });
         }
     }
@@ -425,6 +429,13 @@ pub fn decompile_class_with_closures(
             })
         }
     }
+
+    // Run generic type parameter inference
+    // Collect method statement references for analysis
+    let method_stmts: Vec<Vec<Statement>> = methods.iter()
+        .map(|m| m.statements.clone())
+        .collect();
+    generic_inference::infer_generic_params_for_class(&mut fields, &method_stmts, code);
 
     Class {
         name: obj.name(code).to_owned(),

@@ -6,7 +6,7 @@ use hlbc::types::{Function, RefField, RefType, Type, TypeFun, TypeObj};
 use hlbc::Str;
 use hlbc::{Bytecode, Resolve};
 
-use crate::ast::{Class, Constant, ConstructorCall, Expr, Method, Operation, Statement};
+use crate::ast::{Class, ClassField, Confidence, Constant, ConstructorCall, Expr, Method, Operation, Statement};
 
 /// Escape a string for output as a Haxe string literal.
 /// Handles quotes, backslashes, and control characters.
@@ -225,7 +225,7 @@ impl Display for FormatOptions {
 
 /// Known generic types that require a single type parameter.
 /// These will be annotated with `<Dynamic>` if no type param is present.
-const KNOWN_SINGLE_PARAM_GENERICS: &[&str] = &[
+pub const KNOWN_SINGLE_PARAM_GENERICS: &[&str] = &[
     "haxe.ds.IntMap",
     "haxe.ds.StringMap",
     "haxe.ds.List",
@@ -237,13 +237,108 @@ const KNOWN_SINGLE_PARAM_GENERICS: &[&str] = &[
 ];
 
 /// Known generic types that require two type parameters.
-const KNOWN_TWO_PARAM_GENERICS: &[&str] = &[
+pub const KNOWN_TWO_PARAM_GENERICS: &[&str] = &[
     "haxe.ds.Map",
     "haxe.ds.HashMap",
     "haxe.ds.WeakMap",
     "haxe.ds.EnumValueMap",
     "haxe.ds.ObjectMap",
 ];
+
+/// Known base names for monomorphized generics (without package prefix).
+/// When @:generic is used, Haxe creates types like `List_Int`, `Vector_Float`.
+const MONOMORPHIZED_SINGLE_PARAM: &[&str] = &[
+    "List",
+    "Vector",
+    "GenericStack",
+];
+
+const MONOMORPHIZED_TWO_PARAM: &[&str] = &[
+    "Map",
+    "ObjectMap",
+];
+
+/// Packages that are known to contain monomorphized generic types.
+/// Only types in these packages (or no package) will be demangled.
+const KNOWN_STDLIB_PACKAGES: &[&str] = &[
+    "haxe.ds",
+    "hl.types",
+];
+
+/// Try to demangle a monomorphized generic type name.
+/// E.g., "haxe.ds.List_Int" → "haxe.ds.List<Int>"
+/// Only demaangles types from known stdlib packages to avoid false positives
+/// with external libraries that might have types like "mylib.Vector_Float".
+fn demangle_generic_name(name: &str) -> Option<String> {
+    // Extract simple name (after last dot)
+    let simple_name = name.rsplit('.').next().unwrap_or(name);
+    let package = if name.contains('.') {
+        Some(&name[..name.len() - simple_name.len() - 1])
+    } else {
+        None
+    };
+
+    // Only demangle types from known stdlib packages (or no package for top-level)
+    let is_known_package = package.map_or(true, |pkg| {
+        KNOWN_STDLIB_PACKAGES.iter().any(|known| pkg == *known)
+    });
+    if !is_known_package {
+        return None;
+    }
+
+    // Try single-param generics first
+    for base in MONOMORPHIZED_SINGLE_PARAM {
+        let prefix = format!("{}_", base);
+        if simple_name.starts_with(&prefix) {
+            let type_param = &simple_name[prefix.len()..];
+            let type_param = demangle_type_param(type_param);
+            return Some(if let Some(pkg) = package {
+                format!("{}.{}<{}>", pkg, base, type_param)
+            } else {
+                format!("{}<{}>", base, type_param)
+            });
+        }
+    }
+
+    // Try two-param generics
+    for base in MONOMORPHIZED_TWO_PARAM {
+        let prefix = format!("{}_", base);
+        if simple_name.starts_with(&prefix) {
+            let params_part = &simple_name[prefix.len()..];
+            // Split on underscore - first part is key type, rest is value type
+            if let Some(underscore_pos) = params_part.find('_') {
+                let key_type = demangle_type_param(&params_part[..underscore_pos]);
+                let val_type = demangle_type_param(&params_part[underscore_pos + 1..]);
+                return Some(if let Some(pkg) = package {
+                    format!("{}.{}<{}, {}>", pkg, base, key_type, val_type)
+                } else {
+                    format!("{}<{}, {}>", base, key_type, val_type)
+                });
+            }
+        }
+    }
+
+    None
+}
+
+/// Convert mangled type parameter names to proper Haxe types.
+/// E.g., "Int" → "Int", "String" → "String", "hl_I64" → "hl.I64"
+fn demangle_type_param(param: &str) -> String {
+    // Handle hl_ prefix types
+    if let Some(rest) = param.strip_prefix("hl_") {
+        return format!("hl.{}", rest);
+    }
+    // Common primitive mappings
+    match param {
+        "Int" => "Int".to_string(),
+        "Float" => "Float".to_string(),
+        "Single" => "Single".to_string(),
+        "Bool" => "Bool".to_string(),
+        "String" => "String".to_string(),
+        "Dynamic" => "Dynamic".to_string(),
+        other => other.to_string(),
+    }
+}
 
 /// Convert a HashLink type to its Haxe equivalent string representation.
 /// Maps internal HL types to Haxe types (e.g., hl.types.ArrayDyn → Array<Dynamic>)
@@ -297,6 +392,10 @@ pub fn to_haxe_type<'a>(ty: &Type, ctx: &'a Bytecode) -> Str {
                 "hl.types.ArrayObj" => Str::from_static("Array<Dynamic>"),
                 "hl.types.ArrayDyn" => Str::from_static("Array<Dynamic>"),
                 _ => {
+                    // Try to demangle monomorphized generic types (e.g., List_Int → List<Int>)
+                    if let Some(demangled) = demangle_generic_name(name_str.as_ref()) {
+                        return Str::from(demangled);
+                    }
                     // Check if this is a known generic type that needs type parameters
                     if KNOWN_SINGLE_PARAM_GENERICS.iter().any(|g| name_str.as_ref() == *g) {
                         return Str::from(format!("{}<Dynamic>", name_str));
@@ -336,6 +435,86 @@ pub fn to_haxe_type<'a>(ty: &Type, ctx: &'a Bytecode) -> Str {
     }
 }
 
+/// Result of formatting a field type with inferred generics.
+pub struct FieldTypeFormat {
+    /// The formatted type string.
+    pub type_str: String,
+    /// Optional comment about inference (e.g., "// likely String").
+    pub comment: Option<String>,
+}
+
+/// Format a field's type, using inferred generic parameters if available.
+/// Returns the type string and an optional comment about the inference.
+pub fn format_field_type(field: &ClassField, ctx: &Bytecode) -> FieldTypeFormat {
+    let base_type = to_haxe_type(&ctx[field.ty], ctx);
+
+    // If we have inferred generics and this is a known generic type, use them
+    if let Some(ref inference) = field.inferred_generics {
+        // Get type name from TypeObj if available
+        let type_name = ctx[field.ty].get_type_obj()
+            .map(|obj| obj.name(ctx).to_string());
+        let type_name = type_name.as_deref().unwrap_or("");
+
+        // Check if this is a generic type that we might have inference for
+        let is_single_param = KNOWN_SINGLE_PARAM_GENERICS.iter().any(|g| type_name == *g);
+        let is_two_param = KNOWN_TWO_PARAM_GENERICS.iter().any(|g| type_name == *g);
+
+        if is_single_param || is_two_param {
+            let param_count = if is_single_param { 1 } else { 2 };
+
+            // Build the type parameters from inference
+            let params: Vec<String> = (0..param_count)
+                .map(|i| {
+                    inference.params.get(i)
+                        .and_then(|p| p.clone())
+                        .unwrap_or_else(|| "Dynamic".to_string())
+                })
+                .collect();
+
+            let type_str = format!("{}<{}>", type_name, params.join(", "));
+
+            // Generate comment based on confidence and observations
+            let has_observations = inference.observed_types.iter()
+                .any(|obs| !obs.is_empty());
+
+            let comment = if !has_observations {
+                // No observations made - indicate inference found nothing
+                Some("// no type usage observed".to_string())
+            } else {
+                match inference.confidence {
+                    Confidence::High => None, // High confidence - no comment needed
+                    Confidence::Medium => {
+                        // Medium confidence - add "// likely X" comment
+                        let observed = &inference.observed_types;
+                        if !observed.is_empty() && !observed[0].is_empty() {
+                            Some(format!("// inferred: {}", observed[0].join(" | ")))
+                        } else {
+                            None
+                        }
+                    }
+                    Confidence::Low => {
+                        // Low confidence - add "// could be X or Y" comment
+                        let observed = &inference.observed_types;
+                        if !observed.is_empty() && observed[0].len() > 1 {
+                            Some(format!("// could be: {}", observed[0].join(" | ")))
+                        } else {
+                            None
+                        }
+                    }
+                }
+            };
+
+            return FieldTypeFormat { type_str, comment };
+        }
+    }
+
+    // No inference or not a generic type - use base type
+    FieldTypeFormat {
+        type_str: base_type.to_string(),
+        comment: None,
+    }
+}
+
 impl Class {
     /// Display without type index (for backward compatibility)
     pub fn display<'a>(&'a self, ctx: &'a Bytecode, opts: &'a FormatOptions) -> impl Display + 'a {
@@ -370,6 +549,12 @@ impl Class {
                 p.as_str()
             }
         });
+
+        // Precompute field type info (for inference comments)
+        let field_types: Vec<FieldTypeFormat> = self.fields.iter()
+            .map(|f| format_field_type(f, ctx))
+            .collect();
+
         fmtools::fmt! { move
             // Package declaration
             if let Some(pkg) = package {
@@ -387,14 +572,17 @@ impl Class {
             }
             " {\n"
             // Fields - bytecode doesn't preserve visibility, so make all public (private by default in Haxe)
-            for (i, f) in self.fields.iter().enumerate() {
-                {new_opts}if f.static_ { "public static " } else { "public " } "var "{f.name}": "{to_haxe_type(&ctx[f.ty], ctx)}
+            for (i, (f, ft)) in self.fields.iter().zip(field_types.iter()).enumerate() {
+                {new_opts}if f.static_ { "public static " } else { "public " } "var "{f.name}": "{&ft.type_str}
                 if let Some(init) = &f.initializer {
                     " = "{init.display_simple(ctx, &new_opts)}
                 }
                 ";"
                 if opts.show_field_indices {
                     "  // F"{i}", type@"{f.ty.0}
+                }
+                if let Some(comment) = &ft.comment {
+                    "  "{comment}
                 }
                 "\n"
             }

@@ -17,12 +17,92 @@ pub struct Class {
     pub methods: Vec<Method>,
 }
 
+/// Confidence level for inferred type parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confidence {
+    /// All usages agree on the same type.
+    High,
+    /// Most usages agree, but some use Dynamic or are inconclusive.
+    Medium,
+    /// Multiple different types observed.
+    Low,
+}
+
+/// Inferred generic type parameters for a field.
+#[derive(Debug, Clone)]
+pub struct InferredGenericParams {
+    /// Type parameters (None = couldn't infer, use Dynamic).
+    pub params: Vec<Option<String>>,
+    /// Confidence level of the inference.
+    pub confidence: Confidence,
+    /// All observed types for each parameter (for debugging/comments).
+    pub observed_types: Vec<Vec<String>>,
+}
+
+impl InferredGenericParams {
+    pub fn new(param_count: usize) -> Self {
+        InferredGenericParams {
+            params: vec![None; param_count],
+            confidence: Confidence::Low,
+            observed_types: vec![Vec::new(); param_count],
+        }
+    }
+
+    /// Record an observed type for the given parameter index.
+    pub fn observe_type(&mut self, param_idx: usize, type_name: String) {
+        if param_idx < self.observed_types.len() {
+            if !self.observed_types[param_idx].contains(&type_name) {
+                self.observed_types[param_idx].push(type_name);
+            }
+        }
+    }
+
+    /// Finalize inference: set params based on observed types.
+    pub fn finalize(&mut self) {
+        for (i, observed) in self.observed_types.iter().enumerate() {
+            if i >= self.params.len() {
+                break;
+            }
+            // Filter out Dynamic observations for inference
+            let non_dynamic: Vec<_> = observed.iter()
+                .filter(|t| *t != "Dynamic")
+                .collect();
+
+            if non_dynamic.len() == 1 {
+                // Single non-Dynamic type observed - high confidence
+                self.params[i] = Some(non_dynamic[0].clone());
+            } else if non_dynamic.is_empty() && !observed.is_empty() {
+                // Only Dynamic observed
+                self.params[i] = None; // Will use Dynamic
+            } else if non_dynamic.len() > 1 {
+                // Multiple types - low confidence, leave as None
+                self.params[i] = None;
+            }
+        }
+
+        // Determine overall confidence
+        let all_inferred = self.params.iter().all(|p| p.is_some());
+        let any_multiple = self.observed_types.iter()
+            .any(|obs| obs.iter().filter(|t| *t != "Dynamic").count() > 1);
+
+        self.confidence = if all_inferred && !any_multiple {
+            Confidence::High
+        } else if any_multiple {
+            Confidence::Low
+        } else {
+            Confidence::Medium
+        };
+    }
+}
+
 #[derive(Debug)]
 pub struct ClassField {
     pub name: Str,
     pub ty: RefType,
     pub static_: bool,
     pub initializer: Option<Expr>,
+    /// Inferred generic type parameters (for generic container types).
+    pub inferred_generics: Option<InferredGenericParams>,
 }
 
 #[derive(Debug)]
