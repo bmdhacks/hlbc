@@ -1,7 +1,6 @@
 use hlbc::{Bytecode, Str};
 
-use crate::ast::{add, not, Constant, ConstructorCall, Expr, Operation, Statement};
-use crate::call_fun;
+use crate::ast::{add, not, Constant, ConstructorCall, Expr, Operation, Statement, Call};
 
 pub(crate) trait AstVisitor {
     fn visit_stmt(&mut self, _code: &Bytecode, _stmt: &mut Statement) {}
@@ -243,437 +242,9 @@ pub(crate) fn visit_expr(code: &Bytecode, expr: &mut Expr, visitors: &mut [Box<d
     }
 }
 
-/// Transforms an if/else statement where both branches assign a value to the same variable to an if/else expression.
-/// ```haxe
-/// if (cond) {
-///     var a = 1;
-/// } else {
-///     a = 2;
-/// }
-/// ```
-/// becomes this :
-/// ```haxe
-/// var a = if (cond) {
-///     1
-/// } else {
-///     2
-/// };
-/// ```
-pub(crate) struct IfExpressions;
-
-/// Simplify bounds-check patterns for array access.
-///
-/// When Haxe accesses `arr[index]`, HashLink generates a bounds check:
-/// ```
-/// if (arr.length <= index) {
-///     var x = default;  // Out of bounds - use default
-/// } else {
-///     var x = arr[...]; // In bounds - read value
-/// }
-/// ```
-///
-/// The decompiler incorrectly reconstructs this with self-referential variables:
-/// `var first = if (...) { 0 } else { arr[first] };`
-///
-/// This visitor detects the pattern and simplifies to just the array access,
-/// extracting the correct index from the condition.
-pub(crate) struct BoundsCheckSimplify;
-
-impl AstVisitor for BoundsCheckSimplify {
-    fn visit_stmt(&mut self, _code: &Bytecode, stmt: &mut Statement) {
-        // Match the bounds-check if/else pattern
-        let replacement = match stmt {
-            Statement::IfElse { cond, if_, else_ } => {
-                // Check if both branches assign to the same variable
-                match (if_.last(), else_.last()) {
-                    (
-                        Some(Statement::Assign {
-                            declaration: if_decl,
-                            variable: if_var,
-                            assign: if_assign,
-                        }),
-                        Some(Statement::Assign {
-                            variable: else_var,
-                            assign: else_assign,
-                            ..
-                        }),
-                    ) => {
-                        // Both must assign to the same register
-                        match (if_var, else_var) {
-                            (Expr::Variable(r1, name1), Expr::Variable(r2, _)) if r1 == r2 => {
-                                // Try to extract arr and index from the bounds check
-                                if let Some((arr_expr, index_expr)) = extract_bounds_check_parts(cond) {
-                                    if is_default_value(if_assign) && is_array_access(else_assign) {
-                                        // Rebuild array access with correct index
-                                        let fixed_array_access = Expr::Array(
-                                            Box::new(arr_expr),
-                                            Box::new(index_expr),
-                                        );
-                                        Some(Statement::Assign {
-                                            declaration: *if_decl,
-                                            variable: Expr::Variable(*r1, name1.clone()),
-                                            assign: fixed_array_access,
-                                        })
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                }
-                            }
-                            _ => None,
-                        }
-                    }
-                    _ => None,
-                }
-            }
-            _ => None,
-        };
-
-        if let Some(new_stmt) = replacement {
-            *stmt = new_stmt;
-        }
-    }
-}
-
-/// Extract array and index from a bounds check condition.
-/// Returns (arr, index) if this looks like `arr.length <= index` or similar.
-fn extract_bounds_check_parts(cond: &Expr) -> Option<(Expr, Expr)> {
-    match cond {
-        Expr::Op(Operation::Lte(left, right)) => {
-            // arr.length <= INDEX
-            if let Expr::Field(arr, name) = left.as_ref() {
-                if name == "length" {
-                    return Some((*arr.clone(), *right.clone()));
-                }
-            }
-            None
-        }
-        Expr::Op(Operation::Lt(left, right)) => {
-            // INDEX < arr.length (inverted check)
-            if let Expr::Field(arr, name) = right.as_ref() {
-                if name == "length" {
-                    return Some((*arr.clone(), *left.clone()));
-                }
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
-/// Check if expression is a default value (constant 0, null, or empty)
-fn is_default_value(expr: &Expr) -> bool {
-    match expr {
-        Expr::Constant(Constant::InlineInt(0)) => true,
-        Expr::Constant(Constant::Null) => true,
-        // Match any constant as a default
-        Expr::Constant(_) => true,
-        _ => false,
-    }
-}
-
-/// Check if expression is an array access
-fn is_array_access(expr: &Expr) -> bool {
-    matches!(expr, Expr::Array(_, _))
-}
-
-impl AstVisitor for IfExpressions {
-    fn visit_stmt(&mut self, _code: &Bytecode, stmt: &mut Statement) {
-        let opt = match stmt {
-            Statement::IfElse { cond, if_, else_ } => {
-                // We only have to check the last statement in each branches.
-                // We assume their types to be the same (checked by the haxe compiler)
-                match if_.last() {
-                    Some(Statement::Assign {
-                        declaration,
-                        variable: if_var,
-                        assign: if_assign,
-                    }) => match else_.last() {
-                        Some(Statement::Assign {
-                            variable: else_var,
-                            assign: else_assign,
-                            ..
-                        }) => match if_var {
-                            Expr::Variable(r1, _) => match else_var {
-                                Expr::Variable(r2, _) if r1 == r2 => Some((
-                                    *declaration,
-                                    if_var.clone(),
-                                    cond.clone(),
-                                    if_assign.clone(),
-                                    else_assign.clone(),
-                                    if_.clone(),
-                                    else_.clone(),
-                                )),
-                                _ => None,
-                            },
-                            _ => None,
-                        },
-                        _ => None,
-                    },
-                    _ => None,
-                }
-            }
-            _ => None,
-        };
-
-        if let Some((decl, var, cond, if_assign, else_assign, mut if_stmts, mut else_stmts)) = opt {
-            *if_stmts.last_mut().unwrap() = Statement::ExprStatement(if_assign);
-            *else_stmts.last_mut().unwrap() = Statement::ExprStatement(else_assign);
-            *stmt = Statement::Assign {
-                declaration: decl,
-                variable: var,
-                assign: Expr::IfElse {
-                    cond: Box::new(cond),
-                    if_: if_stmts,
-                    else_: else_stmts,
-                },
-            }
-        }
-    }
-}
-
-/// Hoists variable declarations from switch cases to before the switch.
-/// In Haxe, each switch case has its own scope, so a variable declared in one case
-/// isn't visible in others. When a switch is used as an expression (assigning to a variable
-/// in each case), the decompiler may put the declaration in one case (e.g., default).
-///
-/// This transforms:
-/// ```haxe
-/// switch (x) {
-///     default: var result = "other";
-///     case 0: result = "zero";  // ERROR: result not in scope
-/// }
-/// ```
-/// into:
-/// ```haxe
-/// var result;
-/// switch (x) {
-///     default: result = "other";
-///     case 0: result = "zero";
-/// }
-/// ```
-pub(crate) struct SwitchExpressions;
-
-impl SwitchExpressions {
-    /// Collect all variables declared in statements (returns (name, register))
-    fn find_declarations(stmts: &[Statement]) -> Vec<(String, hlbc::types::Reg)> {
-        let mut decls = Vec::new();
-        for stmt in stmts {
-            if let Statement::Assign {
-                declaration: true,
-                variable: Expr::Variable(reg, Some(name)),
-                ..
-            } = stmt
-            {
-                decls.push((name.to_string(), *reg));
-            }
-        }
-        decls
-    }
-
-    /// Check if a variable name is used (not declared) in statements
-    fn is_used_in(stmts: &[Statement], name: &str) -> bool {
-        for stmt in stmts {
-            match stmt {
-                Statement::Assign {
-                    declaration: false,
-                    variable: Expr::Variable(_, Some(var_name)),
-                    ..
-                } if var_name.as_ref() == name => return true,
-                Statement::Assign { assign, .. } => {
-                    if Self::expr_uses_var(assign, name) {
-                        return true;
-                    }
-                }
-                Statement::ExprStatement(e) => {
-                    if Self::expr_uses_var(e, name) {
-                        return true;
-                    }
-                }
-                Statement::Return(Some(e)) => {
-                    if Self::expr_uses_var(e, name) {
-                        return true;
-                    }
-                }
-                _ => {}
-            }
-        }
-        false
-    }
-
-    /// Check if an expression uses a variable by name
-    fn expr_uses_var(expr: &Expr, name: &str) -> bool {
-        match expr {
-            Expr::Variable(_, Some(var_name)) if var_name.as_ref() == name => true,
-            Expr::Op(op) => match op {
-                Operation::Add(a, b)
-                | Operation::Sub(a, b)
-                | Operation::Mul(a, b)
-                | Operation::Div(a, b)
-                | Operation::Mod(a, b)
-                | Operation::Eq(a, b)
-                | Operation::NotEq(a, b)
-                | Operation::Gt(a, b)
-                | Operation::Gte(a, b)
-                | Operation::Lt(a, b)
-                | Operation::Lte(a, b) => Self::expr_uses_var(a, name) || Self::expr_uses_var(b, name),
-                Operation::Neg(a) | Operation::Not(a) | Operation::Incr(a) | Operation::Decr(a) => {
-                    Self::expr_uses_var(a, name)
-                }
-                _ => false,
-            },
-            Expr::Call(call) => {
-                call.args.iter().any(|a| Self::expr_uses_var(a, name))
-            }
-            Expr::Field(obj, _) => Self::expr_uses_var(obj, name),
-            _ => false,
-        }
-    }
-
-    /// Remove the declaration flag from an assignment
-    fn undeclare(stmts: &mut [Statement], name: &str) {
-        for stmt in stmts {
-            if let Statement::Assign {
-                declaration,
-                variable: Expr::Variable(_, Some(var_name)),
-                ..
-            } = stmt
-            {
-                if var_name.as_ref() == name && *declaration {
-                    *declaration = false;
-                }
-            }
-        }
-    }
-}
-
-impl AstVisitor for SwitchExpressions {
-    fn visit_stmt(&mut self, _code: &Bytecode, stmt: &mut Statement) {
-        let hoisted = match stmt {
-            Statement::Switch {
-                default, cases, ..
-            } => {
-                // Collect all declarations from all cases
-                let mut all_decls: Vec<(String, hlbc::types::Reg)> = Vec::new();
-                all_decls.extend(Self::find_declarations(default));
-                for (_, case_stmts) in cases.iter() {
-                    all_decls.extend(Self::find_declarations(case_stmts));
-                }
-
-                // Find which declarations are used in other cases
-                let mut to_hoist = Vec::new();
-                for (name, reg) in &all_decls {
-                    // Check if this variable is used in default or any case
-                    let used_in_default = Self::is_used_in(default, name);
-                    let used_in_cases = cases.iter().any(|(_, stmts)| Self::is_used_in(stmts, name));
-
-                    if used_in_default || used_in_cases {
-                        to_hoist.push((name.clone(), *reg));
-                    }
-                }
-
-                // Remove duplicates
-                to_hoist.sort_by(|a, b| a.0.cmp(&b.0));
-                to_hoist.dedup_by(|a, b| a.0 == b.0);
-
-                if !to_hoist.is_empty() {
-                    // Undeclare in all cases
-                    for (name, _) in &to_hoist {
-                        Self::undeclare(default, name);
-                        for (_, case_stmts) in cases.iter_mut() {
-                            Self::undeclare(case_stmts, name);
-                        }
-                    }
-                    Some(to_hoist)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
-
-        // If we have variables to hoist, create a sequence with declarations first
-        if let Some(vars) = hoisted {
-            let switch_stmt = std::mem::replace(stmt, Statement::Break); // placeholder
-            let mut stmts = Vec::new();
-
-            // Add declarations for hoisted variables (no initializer)
-            for (name, _reg) in vars {
-                stmts.push(Statement::VarDecl { name: name.into(), type_hint: None });
-            }
-
-            stmts.push(switch_stmt);
-            *stmt = Statement::Sequence { stmts };
-        }
-    }
-}
-
-/// Restore string concatenation. They are translated to calls to \_\_add__ at compilation.
-/// ```haxe
-/// __add__("hello ", "world")
-/// ```
-/// becomes :
-/// ```haxe
-/// "hello " + "world"
-/// ```
-pub(crate) struct StringConcat;
-
-impl AstVisitor for StringConcat {
-    fn visit_expr(&mut self, code: &Bytecode, expr: &mut Expr) {
-        let args = match expr {
-            Expr::Call(call) => match call.fun {
-                Expr::FunRef(fun) => {
-                    if fun.name(code) == "__add__" && call.args.len() == 2 {
-                        Some((call.args[0].clone(), call.args[1].clone()))
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            },
-            _ => None,
-        };
-
-        if let Some((arg0, arg1)) = args {
-            *expr = add(arg0, arg1);
-        }
-    }
-}
-
-/// Simplify `__alloc__(itos/ftos/dtos(x, ref), len)` to just the conversion call.
-/// The fmt.rs CallHandling will then transform itos/ftos/dtos to Std.string(x).
-pub(crate) struct Itos;
-
-impl AstVisitor for Itos {
-    fn visit_expr(&mut self, code: &Bytecode, expr: &mut Expr) {
-        let replacement = match expr {
-            Expr::Call(call) => match &call.fun {
-                Expr::FunRef(fun) if fun.name(code) == "__alloc__" => match &call.args.get(0) {
-                    Some(Expr::Call(inner_call)) => match &inner_call.fun {
-                        Expr::FunRef(inner_fun) => {
-                            let name = inner_fun.name(code);
-                            if name == "itos" || name == "ftos" || name == "dtos" {
-                                // Keep the conversion call, strip __alloc__ wrapper
-                                Some(Expr::Call(inner_call.clone()))
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None,
-                    },
-                    _ => None,
-                },
-                _ => None,
-            },
-            _ => None,
-        };
-
-        if let Some(new_expr) = replacement {
-            *expr = new_expr;
-        }
-    }
-}
+// NOTE: Unused visitor-based transforms (IfExpressions, BoundsCheckSimplify,
+// SwitchExpressions, StringConcat visitor, Itos) were removed. The functionality
+// is either handled in structurer.rs or fmt.rs, or was not needed.
 
 /// Reconstruct array literals from alloc_bytes + SetMem + allocI32 patterns.
 ///
@@ -902,40 +473,14 @@ fn recurse_array_literals(code: &Bytecode, stmt: &mut Statement) {
     }
 }
 
-/// Restore inlined `trace` calls.
-pub(crate) struct Trace;
-
-impl AstVisitor for Trace {
-    fn visit_expr(&mut self, code: &Bytecode, expr: &mut Expr) {
-        let call = match expr {
-            Expr::Call(call) => match &call.fun {
-                Expr::Field(obj, field) => match obj.as_ref() {
-                    Expr::Variable(_, _) => {
-                        if field == "trace" {
-                            let trace = code.function_by_name(field).unwrap();
-                            Some(call_fun(trace.findex, vec![call.args[0].clone()]))
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                },
-                _ => None,
-            },
-            _ => None,
-        };
-        if let Some(call) = call {
-            *expr = call;
-        }
-    }
-}
+// NOTE: The old Trace visitor struct was removed. Trace collapsing is now done
+// by collapse_trace_calls() at the end of the file.
 
 // =============================================================================
 // SingleUseInline: Inline single-use variables into their use sites
 // =============================================================================
 
 use std::collections::HashMap as StdHashMap;
-use crate::ast::Call;
 
 /// Information about a variable definition
 #[derive(Debug, Clone)]
@@ -1954,6 +1499,14 @@ fn inline_constant_returns_pass(
                             continue;
                         }
 
+                        // CRITICAL: Don't inline self-modifying assignments like `i = i + 1`
+                        // Removing such statements would lose the side effect of updating the variable.
+                        // Check if the expression references the same variable being assigned.
+                        if count_uses_in_expr(assign, &var_name) > 0 {
+                            i += 1;
+                            continue;
+                        }
+
                         // Count uses in the next statement (including nested structures)
                         let uses_in_next = count_uses_in_stmt(&stmts[i + 1], &var_name);
 
@@ -2366,5 +1919,246 @@ fn apply_string_concat_expr(code: &Bytecode, expr: &mut Expr) {
                 *expr = add(arg0, arg1);
             }
         }
+    }
+}
+
+// =============================================================================
+// Trace: Collapse trace() call patterns into simple trace(message) calls
+// =============================================================================
+
+/// Collapse verbose trace patterns into simple `trace(message)` calls.
+///
+/// The decompiler outputs trace calls as:
+/// ```haxe
+/// var r1 = haxe.Log.trace;
+/// // nullcheck r1
+/// var r4:Dynamic = {};
+/// r4.fileName = "File.hx";
+/// r4.lineNumber = 10;
+/// r4.className = "MyClass";
+/// r4.methodName = "main";
+/// r1("message", r4);
+/// ```
+///
+/// This collapses to: `trace("message");`
+pub fn collapse_trace_calls(stmts: &mut Vec<Statement>) {
+    // Process nested statements first
+    for stmt in stmts.iter_mut() {
+        collapse_trace_in_stmt(stmt);
+    }
+
+    // Now scan for trace patterns at this level
+    let mut i = 0;
+    while i < stmts.len() {
+        if let Some((trace_stmt, consumed)) = try_collapse_trace_pattern(&stmts[i..]) {
+            // Remove the consumed statements and insert the collapsed one
+            for _ in 0..consumed {
+                stmts.remove(i);
+            }
+            stmts.insert(i, trace_stmt);
+        }
+        i += 1;
+    }
+}
+
+fn collapse_trace_in_stmt(stmt: &mut Statement) {
+    match stmt {
+        Statement::IfElse { if_, else_, .. } => {
+            collapse_trace_calls(if_);
+            collapse_trace_calls(else_);
+        }
+        Statement::IfElseChain { branches, else_ } => {
+            for (_, body) in branches.iter_mut() {
+                collapse_trace_calls(body);
+            }
+            collapse_trace_calls(else_);
+        }
+        Statement::While { stmts, .. } => {
+            collapse_trace_calls(stmts);
+        }
+        Statement::Switch { default, cases, .. } => {
+            collapse_trace_calls(default);
+            for (_, case_stmts) in cases.iter_mut() {
+                collapse_trace_calls(case_stmts);
+            }
+        }
+        Statement::TryCatch { try_stmts, catch_stmts, .. } => {
+            collapse_trace_calls(try_stmts);
+            collapse_trace_calls(catch_stmts);
+        }
+        Statement::Block { stmts } | Statement::Sequence { stmts } => {
+            collapse_trace_calls(stmts);
+        }
+        _ => {}
+    }
+}
+
+/// Try to match and collapse a trace pattern starting at the given slice.
+/// Returns Some((collapsed_statement, num_statements_consumed)) on success.
+fn try_collapse_trace_pattern(stmts: &[Statement]) -> Option<(Statement, usize)> {
+    // Need at least 7 statements for the minimal pattern:
+    // 1. var trace = haxe.Log.trace
+    // 2. nullcheck comment (optional, but let's require it for safety)
+    // 3. var posInfo:Dynamic = {}
+    // 4. posInfo.fileName = ...
+    // 5. posInfo.lineNumber = ...
+    // 6. posInfo.className = ...
+    // 7. posInfo.methodName = ...
+    // 8. trace(message, posInfo)
+    if stmts.len() < 7 {
+        return None;
+    }
+
+    // Step 1: Check for var trace = haxe.Log.trace (or haxe.$Log.trace)
+    let trace_var = match &stmts[0] {
+        Statement::Assign { variable: Expr::Variable(_, Some(name)), assign, .. } => {
+            if is_haxe_log_trace(assign) {
+                name.clone()
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+
+    // Step 2: Skip nullcheck comment if present
+    let mut idx = 1;
+    if let Statement::Comment(c) = &stmts[idx] {
+        if c.contains("nullcheck") {
+            idx += 1;
+        }
+    }
+
+    if idx >= stmts.len() {
+        return None;
+    }
+
+    // Step 3: Check for var posInfo:Dynamic = {}
+    let pos_var = match &stmts[idx] {
+        Statement::Assign {
+            variable: Expr::Variable(_, Some(name)),
+            assign: Expr::Anonymous(_, fields),
+            ..
+        } if fields.is_empty() => {
+            idx += 1;
+            name.clone()
+        }
+        _ => return None,
+    };
+
+    // Step 4-7: Check for the four field assignments (fileName, lineNumber, className, methodName)
+    // They might be in any order
+    let mut found_fields = std::collections::HashSet::new();
+    let required_fields = ["fileName", "lineNumber", "className", "methodName"];
+
+    while idx < stmts.len() && found_fields.len() < 4 {
+        if let Some(field_name) = is_pos_info_field_assign(&stmts[idx], &pos_var) {
+            if required_fields.contains(&field_name.as_str()) {
+                found_fields.insert(field_name);
+                idx += 1;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    // Must have all 4 fields
+    if found_fields.len() != 4 {
+        return None;
+    }
+
+    if idx >= stmts.len() {
+        return None;
+    }
+
+    // Step 8: Check for trace(message, posInfo) call
+    let message = match &stmts[idx] {
+        Statement::ExprStatement(Expr::Call(call)) => {
+            if is_trace_call(call, &trace_var, &pos_var) {
+                call.args.get(0).cloned()
+            } else {
+                return None;
+            }
+        }
+        // Also handle case where trace call result is assigned to void
+        Statement::Assign { assign: Expr::Call(call), .. } => {
+            if is_trace_call(call, &trace_var, &pos_var) {
+                call.args.get(0).cloned()
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+
+    let message = message?;
+    idx += 1;
+
+    // Create the collapsed trace call
+    let trace_call = Statement::ExprStatement(Expr::Call(Box::new(Call {
+        fun: Expr::Ident("trace".into()),
+        args: vec![message],
+    })));
+
+    Some((trace_call, idx))
+}
+
+/// Check if an expression is haxe.Log.trace or haxe.$Log.trace
+fn is_haxe_log_trace(expr: &Expr) -> bool {
+    match expr {
+        Expr::Field(obj, field) if field == "trace" => {
+            match obj.as_ref() {
+                Expr::Ident(name) => name == "haxe.Log" || name == "haxe.$Log",
+                Expr::Field(inner, inner_field) => {
+                    if inner_field == "Log" || inner_field == "$Log" {
+                        matches!(inner.as_ref(), Expr::Ident(n) if n == "haxe")
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Check if a statement is assigning to a posInfo field (fileName, lineNumber, etc.)
+/// Returns the field name if it matches.
+fn is_pos_info_field_assign(stmt: &Statement, pos_var: &Str) -> Option<String> {
+    match stmt {
+        Statement::Assign {
+            variable: Expr::Field(obj, field_name),
+            ..
+        } => {
+            if let Expr::Variable(_, Some(var_name)) = obj.as_ref() {
+                if var_name == pos_var {
+                    return Some(field_name.to_string());
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Check if a call is trace_var(message, pos_var)
+fn is_trace_call(call: &Call, trace_var: &Str, pos_var: &Str) -> bool {
+    // Check that the function is the trace variable
+    let is_trace_var = match &call.fun {
+        Expr::Variable(_, Some(name)) => name == trace_var,
+        _ => false,
+    };
+
+    if !is_trace_var || call.args.len() != 2 {
+        return false;
+    }
+
+    // Check that the second argument is the posInfo variable
+    match &call.args[1] {
+        Expr::Variable(_, Some(name)) => name == pos_var,
+        _ => false,
     }
 }

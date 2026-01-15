@@ -58,29 +58,34 @@ impl CfgAnalysis {
             }
         }
 
-        // Extract natural loops from back-edges
-        let mut loops = Vec::new();
+        // Group back edges by header and merge bodies
+        // Multiple back edges to the same header (e.g., continue and normal iteration)
+        // should form a single loop with a combined body
+        let mut header_to_back_sources: HashMap<NodeIndex, Vec<NodeIndex>> = HashMap::new();
         for (back_source, header) in &back_edges {
-            let body = compute_loop_body(cfg, &dominators, *header, *back_source);
-            let back_edge_sources = back_edges
-                .iter()
-                .filter(|(_, h)| h == header)
-                .map(|(s, _)| *s)
-                .collect();
+            header_to_back_sources.entry(*header).or_default().push(*back_source);
+        }
+
+        // Extract natural loops, merging bodies for multiple back edges to same header
+        let mut loops = Vec::new();
+        for (header, back_sources) in header_to_back_sources {
+            // Compute union of bodies from all back edges to this header
+            let mut body = HashSet::new();
+            for &back_source in &back_sources {
+                let partial_body = compute_loop_body(cfg, &dominators, header, back_source);
+                body.extend(partial_body);
+            }
+
             let exit_nodes = find_exit_nodes(cfg, &body);
 
             loops.push(NaturalLoop {
-                header: *header,
+                header,
                 body,
-                back_edge_sources,
+                back_edge_sources: back_sources,
                 exit_nodes,
                 depth: 0, // Will be computed below
             });
         }
-
-        // Deduplicate loops with the same header
-        loops.sort_by_key(|l| l.header.index());
-        loops.dedup_by_key(|l| l.header);
 
         // Compute nesting depths
         compute_nesting_depths(&mut loops);

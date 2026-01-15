@@ -243,6 +243,10 @@ pub fn decompile_code_with_closures(
     // Pass 11: Remove unused forward declarations
     post::remove_unused_var_decls(&mut stmts);
 
+    // Pass 12: Collapse verbose trace() patterns into simple trace(message) calls
+    // This runs after inlining so the pattern is simplified
+    post::collapse_trace_calls(&mut stmts);
+
     // Clean up: remove this function from the "currently decompiling" set
     DECOMPILING_FUNCTIONS.with(|set| {
         set.borrow_mut().remove(&findex);
@@ -370,6 +374,11 @@ pub fn decompile_class_with_closures(
     for fun in obj.bindings.values() {
         // Skip native functions - can't decompile them
         if let Some(func) = fun.as_fn(code) {
+            // Skip internal HashLink functions that access private fields
+            let name = func.name(code);
+            if name.starts_with("__") && !name.starts_with("__constructor__") {
+                continue;
+            }
             methods.push(Method {
                 fun: *fun,
                 static_: false,
@@ -383,6 +392,11 @@ pub fn decompile_class_with_closures(
         for fun in ty.bindings.values() {
             // Skip native functions - can't decompile them
             if let Some(func) = fun.as_fn(code) {
+                // Skip internal HashLink functions that access private fields
+                let name = func.name(code);
+                if name.starts_with("__") && !name.starts_with("__constructor__") {
+                    continue;
+                }
                 methods.push(Method {
                     fun: *fun,
                     static_: true,
@@ -396,6 +410,12 @@ pub fn decompile_class_with_closures(
     for proto in &obj.protos {
         // Skip native functions - can't decompile them
         if let Some(func) = proto.findex.as_fn(code) {
+            // Skip internal HashLink functions that access private fields
+            // These are auto-generated and can't be recompiled correctly
+            let name = func.name(code);
+            if name.starts_with("__") && !name.starts_with("__constructor__") {
+                continue;
+            }
             methods.push(Method {
                 fun: proto.findex,
                 static_: false,

@@ -8,6 +8,7 @@
 //! This is a simplified implementation focused on correctness over optimization.
 
 use petgraph::graph::NodeIndex;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use hlbc::opcodes::Opcode;
@@ -25,6 +26,25 @@ use crate::ssa::UseDefInfo;
 
 use crate::closure_analysis::ClosureAnalysis;
 use crate::exception_analysis::{ExceptionAnalysis, TryRegion};
+
+/// Tracks memory dependencies for SSA inline expressions.
+/// Used to determine when an inline expression must be invalidated
+/// because its source memory has been modified.
+#[derive(Clone, Debug)]
+enum MemoryDep {
+    /// No memory dependency - constants, arithmetic results.
+    /// These are always safe to inline.
+    None,
+    /// Depends on reading a specific field of an object.
+    /// Invalidated when SetField writes to the same (obj_reg, field_idx).
+    Field { obj: Reg, field: usize },
+    /// Depends on reading a specific global variable.
+    /// Invalidated when SetGlobal writes to the same global.
+    Global { global: hlbc::types::RefGlobal },
+    /// Conservative dependency - could read any memory.
+    /// Invalidated by any memory write or call.
+    AnyMemory,
+}
 
 /// A detected string switch case
 #[derive(Debug, Clone)]
@@ -113,10 +133,15 @@ pub struct Structurer<'a> {
     string_switches: Vec<StringSwitchRegion>,
     /// Recursion depth counter to prevent stack overflow
     recursion_depth: u32,
-    /// Expressions available for inlining (SSA var -> defining expression)
+    /// Current loop header (if any) - used to distinguish continue from switch fall-through
+    current_loop_header: Option<NodeIndex>,
+    /// Expressions available for inlining (SSA var -> (expression, memory dependency))
     /// Single-use, pure expressions are stored here instead of emitting a statement.
     /// When the variable is referenced, the stored expression is inlined at the use site.
-    inline_exprs: HashMap<SsaVar, Expr>,
+    /// The memory dependency tracks what memory the expression reads, allowing smart
+    /// invalidation when conflicting writes occur.
+    /// Uses RefCell for interior mutability so we can remove entries when inlined.
+    inline_exprs: RefCell<HashMap<SsaVar, (Expr, MemoryDep)>>,
 }
 
 impl<'a> Structurer<'a> {
@@ -188,7 +213,8 @@ impl<'a> Structurer<'a> {
             current_ssa_uses: Vec::new(),
             string_switches: Self::detect_string_switches(code, func),
             recursion_depth: 0,
-            inline_exprs: HashMap::new(),
+            current_loop_header: None,
+            inline_exprs: RefCell::new(HashMap::new()),
         }
     }
 
@@ -555,6 +581,13 @@ impl<'a> Structurer<'a> {
             _ => false,
         };
 
+        // Clear array_bytes_source mapping when a register is reassigned.
+        // This is important because registers can be reused (e.g., alloc_bytes reuses a reg
+        // that previously held array.bytes from a different array).
+        if let Expr::Variable(reg, _) = &variable {
+            self.array_bytes_source.remove(reg);
+        }
+
         Statement::Assign {
             declaration: is_declaration,
             variable,
@@ -715,6 +748,42 @@ impl<'a> Structurer<'a> {
         match succs.len() {
             0 => stmts, // Terminal
             1 => {
+                // Check if this is a `continue` statement:
+                // If the only successor is the loop header AND we're actually inside a loop
+                // (current_loop_header matches), and this block produced no statements
+                // (just a JAlways), emit Continue.
+                let is_in_loop = self.current_loop_header.is_some()
+                    && Some(succs[0]) == self.current_loop_header;
+                if is_in_loop && Some(succs[0]) == stop_at && stmts.is_empty() {
+                    // This block only contains a jump back to the loop header
+                    // Check if the block really only has a JAlways (not other ops)
+                    let block = &self.cfg.graph[start];
+                    let is_pure_jump = block.start == block.end
+                        && matches!(self.func.ops.get(block.start), Some(Opcode::JAlways { .. } | Opcode::Label));
+                    if is_pure_jump || block.end == block.start {
+                        stmts.push(Statement::Continue);
+                        return stmts;
+                    }
+                }
+
+                // Check if this is a `break` statement:
+                // If we're inside a loop and the successor is outside the loop body,
+                // and this block is just a JAlways, emit Break.
+                if let Some(header) = self.current_loop_header {
+                    if let Some(loop_info) = self.analysis.loops.iter().find(|l| l.header == header) {
+                        if !loop_info.body.contains(&succs[0]) && stmts.is_empty() {
+                            // The successor is outside the loop - this is a break
+                            let block = &self.cfg.graph[start];
+                            let is_pure_jump = block.start == block.end
+                                && matches!(self.func.ops.get(block.start), Some(Opcode::JAlways { .. } | Opcode::Label));
+                            if is_pure_jump || block.end == block.start {
+                                stmts.push(Statement::Break);
+                                return stmts;
+                            }
+                        }
+                    }
+                }
+
                 stmts.extend(self.structure_from(succs[0], stop_at));
                 stmts
             }
@@ -824,13 +893,15 @@ impl<'a> Structurer<'a> {
                     self.processed.remove(&node);
                 }
             }
-            // Mark exit nodes as processed to prevent them from being structured
-            // as part of the loop body - they'll be handled after the loop
-            for &exit_node in &loop_info.exit_nodes {
-                self.processed.insert(exit_node);
-            }
+            // NOTE: We no longer mark exit targets as processed here.
+            // Instead, we rely on break detection in structure_from to handle
+            // blocks whose successor is outside the loop.
+            // This allows break blocks to be properly structured and emit Break statements.
             self.scope_depth += 1;
+            let old_loop_header = self.current_loop_header;
+            self.current_loop_header = Some(header);
             let body_stmts = self.structure_from(body_node, Some(header));
+            self.current_loop_header = old_loop_header;
             self.scope_depth -= 1;
             self.processed = old_processed;
             for &node in &loop_info.body {
@@ -901,9 +972,7 @@ impl<'a> Structurer<'a> {
                 continue;
             }
 
-            if let Some(stmt) = self.opcode_to_statement(op_idx) {
-                stmts.push(stmt);
-            }
+            stmts.extend(self.opcode_to_statements(op_idx));
             op_idx += 1;
         }
         stmts
@@ -988,9 +1057,7 @@ impl<'a> Structurer<'a> {
                 continue;
             }
 
-            if let Some(stmt) = self.opcode_to_statement(op_idx) {
-                stmts.push(stmt);
-            }
+            stmts.extend(self.opcode_to_statements(op_idx));
             op_idx += 1;
         }
         stmts
@@ -1118,6 +1185,28 @@ impl<'a> Structurer<'a> {
                 } else {
                     (
                         Expr::Op(Operation::Not(Box::new(cond_expr))),
+                        target,
+                        self.cfg.block_for_op(block.end + 1),
+                    )
+                }
+            }
+            Opcode::JNotLt { a, b, offset } => {
+                // JNotLt: jump if NOT (a < b), i.e., jump if a >= b
+                let target = self.compute_target(block.end, *offset);
+                let a_expr = self.reg_to_expr_in_block(*a, header);
+                let b_expr = self.reg_to_expr_in_block(*b, header);
+
+                if target.map_or(false, |t| !loop_info.body.contains(&t)) {
+                    // Jump exits loop when a >= b, so continue while a < b
+                    (
+                        Expr::Op(Operation::Lt(Box::new(a_expr), Box::new(b_expr))),
+                        self.cfg.block_for_op(block.end + 1),
+                        target,
+                    )
+                } else {
+                    // Jump stays in loop when a >= b
+                    (
+                        Expr::Op(Operation::Gte(Box::new(a_expr), Box::new(b_expr))),
                         target,
                         self.cfg.block_for_op(block.end + 1),
                     )
@@ -1336,6 +1425,10 @@ impl<'a> Structurer<'a> {
                 }
                 // Try ternary condensation: both branches return directly
                 if let Some(ternary) = self.try_condense_ternary_return(&cond, &then_stmts, &else_stmts) {
+                    vec![ternary]
+                }
+                // Try ternary assignment: both branches assign to same variable
+                else if let Some(ternary) = self.try_condense_ternary_assign(&cond, &then_stmts, &else_stmts) {
                     vec![ternary]
                 } else {
                     vec![Statement::IfElse {
@@ -1810,6 +1903,62 @@ impl<'a> Structurer<'a> {
         None
     }
 
+    /// Try to condense if/else assignment pattern into ternary assignment.
+    /// Pattern: if (cond) { x = a; } else { x = b; } → x = cond ? a : b
+    fn try_condense_ternary_assign(
+        &self,
+        cond: &Expr,
+        then_stmts: &[Statement],
+        else_stmts: &[Statement],
+    ) -> Option<Statement> {
+        // Both branches must have exactly one statement
+        if then_stmts.len() != 1 || else_stmts.len() != 1 {
+            return None;
+        }
+
+        // Both must be assignments
+        let (if_decl, if_var, if_assign) = match &then_stmts[0] {
+            Statement::Assign { declaration, variable, assign, .. } => {
+                (declaration, variable, assign)
+            }
+            _ => return None,
+        };
+
+        let (else_decl, else_var, else_assign) = match &else_stmts[0] {
+            Statement::Assign { declaration, variable, assign, .. } => {
+                (declaration, variable, assign)
+            }
+            _ => return None,
+        };
+
+        // Both must assign to the same register
+        let (if_reg, if_name) = match if_var {
+            Expr::Variable(reg, name) => (reg, name),
+            _ => return None,
+        };
+
+        let else_reg = match else_var {
+            Expr::Variable(reg, _) => reg,
+            _ => return None,
+        };
+
+        if if_reg != else_reg {
+            return None;
+        }
+
+        // Create ternary assignment: x = cond ? a : b
+        // Use declaration from first branch (the one that declares the variable)
+        Some(Statement::Assign {
+            declaration: *if_decl || *else_decl,
+            variable: Expr::Variable(*if_reg, if_name.clone()),
+            assign: Expr::IfElse {
+                cond: Box::new(cond.clone()),
+                if_: vec![Statement::ExprStatement(if_assign.clone())],
+                else_: vec![Statement::ExprStatement(else_assign.clone())],
+            },
+        })
+    }
+
     /// Check if branches form a phi pattern where:
     /// - Both branches assign to the same register
     /// - The merge block immediately returns that register
@@ -2197,9 +2346,7 @@ impl<'a> Structurer<'a> {
             }
 
             // Emit statement for this opcode
-            if let Some(stmt) = self.opcode_to_statement(op_idx) {
-                stmts.push(stmt);
-            }
+            stmts.extend(self.opcode_to_statements(op_idx));
             op_idx += 1;
         }
 
@@ -2248,9 +2395,16 @@ impl<'a> Structurer<'a> {
         }
     }
 
-    /// Convert opcode to statement
-    fn opcode_to_statement(&mut self, op_idx: usize) -> Option<Statement> {
+    /// Convert opcode to statements.
+    /// May return multiple statements if inline expressions need to be materialized
+    /// due to memory conflicts.
+    fn opcode_to_statements(&mut self, op_idx: usize) -> Vec<Statement> {
         let op = &self.func.ops[op_idx];
+
+        // Invalidate any pending inline expressions that conflict with this opcode
+        // (e.g., if this opcode writes to a field that a pending inline reads from)
+        // These must be emitted as statements since we suppressed their definitions.
+        let mut stmts = self.invalidate_conflicting_inlines(op);
 
         // Set SSA context for this opcode - enables SSA-versioned naming
         if let Some((ssa_dst, ssa_uses)) = self.ssa.get_instr_for_op(op_idx) {
@@ -2261,7 +2415,7 @@ impl<'a> Structurer<'a> {
             self.current_ssa_uses.clear();
         }
 
-        match op {
+        let stmt = match op {
             Opcode::Label | Opcode::Nop => None,
             // Control flow opcodes - handled by structuring, not statement generation
             Opcode::JTrue { .. } | Opcode::JFalse { .. } | Opcode::JNull { .. }
@@ -2276,10 +2430,14 @@ impl<'a> Structurer<'a> {
             // Throw should be emitted (e.g., in try body)
             Opcode::Throw { exc } => Some(Statement::Throw(self.reg_to_expr(*exc))),
 
+            // Assert is used for runtime type checking - throws "assert" if reached
+            // It's typically preceded by a conditional jump that skips it when the check passes
+            Opcode::Assert => Some(Statement::Comment("assert".into())),
+
             Opcode::Mov { dst, src } => {
                 // Suppress self-assignments (b = b) that arise from default parameter handling
                 if dst == src {
-                    return None;
+                    return stmts;
                 }
                 // If the destination held an iterator and we're assigning from a non-iterator,
                 // switch to raw register names to avoid type conflicts
@@ -2295,11 +2453,12 @@ impl<'a> Structurer<'a> {
                     // Hoist to function level so it's available outside the loop
                     self.hoisted_vars.insert(raw_name.clone());
                     self.declared_vars.insert(raw_name);
-                    return Some(Statement::Assign {
+                    stmts.push(Statement::Assign {
                         declaration: false, // Declaration is hoisted to function level
                         variable: var,
                         assign: expr,
                     });
+                    return stmts;
                 }
                 let expr = self.reg_to_expr(*src);
                 // Use try_inline_or_assign for potential inlining of moves
@@ -2318,11 +2477,12 @@ impl<'a> Structurer<'a> {
                     // Hoist to function level so it's available outside the loop
                     self.hoisted_vars.insert(raw_name.clone());
                     self.declared_vars.insert(raw_name);
-                    return Some(Statement::Assign {
+                    stmts.push(Statement::Assign {
                         declaration: false, // Declaration is hoisted to function level
                         variable: var,
                         assign: val,
                     });
+                    return stmts;
                 }
                 let val = Expr::Constant(Constant::Int(*ptr));
                 self.try_inline_or_assign(*dst, val)
@@ -2403,7 +2563,8 @@ impl<'a> Structurer<'a> {
                 // for the subsequent JNotNull check)
                 if self.is_interface_cache_field(*obj, *field) {
                     let var = self.reg_to_expr_dst(*dst);
-                    return Some(self.make_assign(var, Expr::Constant(Constant::Null)));
+                    stmts.push(self.make_assign(var, Expr::Constant(Constant::Null)));
+                    return stmts;
                 }
 
                 let field_name = self.get_field_name(*obj, *field);
@@ -2415,7 +2576,7 @@ impl<'a> Structurer<'a> {
                     // Track: bytes register came from this array register
                     self.array_bytes_source.insert(*dst, *obj);
                     // Don't emit any statement - the access will be reconstructed later
-                    return None;
+                    return stmts;
                 }
 
                 // Check if this is a .array access on ArrayObj/ArrayDyn
@@ -2423,7 +2584,7 @@ impl<'a> Structurer<'a> {
                 if field_name == "array" && self.is_array_type(*obj) {
                     // Track: dst register is same as obj (the array itself)
                     self.array_bytes_source.insert(*dst, *obj);
-                    return None;
+                    return stmts;
                 }
 
                 let obj_expr = self.reg_to_expr(*obj);
@@ -2445,7 +2606,7 @@ impl<'a> Structurer<'a> {
                     if let Some(Opcode::New { dst: new_dst }) = self.func.ops.get(op_idx - 1) {
                         if *new_dst == *arg0 {
                             // This is a constructor call following New - skip it
-                            return None;
+                            return stmts;
                         }
                     }
                 }
@@ -2454,7 +2615,8 @@ impl<'a> Structurer<'a> {
                 if *arg0 == Reg(0) && self.is_super_method_call(*fun) {
                     if let Some(method_name) = self.get_function_name(*fun) {
                         let call = Call::new_super_method(method_name, vec![]);
-                        return Some(self.make_call_stmt(*dst, call));
+                        stmts.push(self.make_call_stmt(*dst, call));
+                        return stmts;
                     }
                 }
 
@@ -2480,7 +2642,8 @@ impl<'a> Structurer<'a> {
                                             // This is an array wrapper - just pass through the array
                                             let var = self.reg_to_expr_dst(*dst);
                                             let arr = self.reg_to_expr(*arg0);
-                                            return Some(self.make_assign(var, arr));
+                                            stmts.push(self.make_assign(var, arr));
+                                            return stmts;
                                         }
                                     }
                                 }
@@ -2502,7 +2665,8 @@ impl<'a> Structurer<'a> {
                 // This native allocates a raw array that gets filled by SetArray ops
                 if name.as_ref() == "alloc_array" {
                     let var = self.reg_to_expr_dst(*dst);
-                    return Some(self.make_assign(var, Expr::ArrayLiteral(vec![])));
+                    stmts.push(self.make_assign(var, Expr::ArrayLiteral(vec![])));
+                    return stmts;
                 }
 
                 // Skip itos/ftos/dtos - these are internal string conversion functions
@@ -2516,7 +2680,7 @@ impl<'a> Structurer<'a> {
                         let original_expr = self.reg_to_expr(*arg0);
                         self.string_conversion_source.insert(target_reg, original_expr);
                     }
-                    return None;
+                    return stmts;
                 }
 
                 // Handle __alloc__ - create Std.string(original_value) if we tracked the source
@@ -2530,7 +2694,8 @@ impl<'a> Structurer<'a> {
                         );
                         let call = Call::new(std_string, vec![original_expr]);
                         let var = self.reg_to_expr_dst(*dst);
-                        return Some(self.make_assign(var, Expr::Call(Box::new(call))));
+                        stmts.push(self.make_assign(var, Expr::Call(Box::new(call))));
+                        return stmts;
                     }
                 }
 
@@ -2570,7 +2735,8 @@ impl<'a> Structurer<'a> {
                         // This is super(args...) - skip first arg (this)
                         let super_args: Vec<_> = args[1..].iter().map(|r| self.reg_to_expr(*r)).collect();
                         let call = Call::new_super(super_args);
-                        return Some(self.make_call_stmt(*dst, call));
+                        stmts.push(self.make_call_stmt(*dst, call));
+                        return stmts;
                     }
                 }
 
@@ -2584,7 +2750,8 @@ impl<'a> Structurer<'a> {
 
             Opcode::CallMethod { dst, field, args } => {
                 if args.is_empty() {
-                    return Some(Statement::Comment("callmethod with no args".into()));
+                    stmts.push(Statement::Comment("callmethod with no args".into()));
+                    return stmts;
                 }
                 let obj = self.reg_to_expr(args[0]);
                 // For CallMethod, 'field' is a proto array index (NOT a pindex or field index)
@@ -2657,7 +2824,7 @@ impl<'a> Structurer<'a> {
                 // Check if this is an interface cache field (empty name)
                 // These are internal HashLink fields - suppress them
                 if self.is_interface_cache_field(*obj, *field) {
-                    return None;
+                    return stmts;
                 }
 
                 let obj_expr = self.reg_to_expr(*obj);
@@ -2797,7 +2964,7 @@ impl<'a> Structurer<'a> {
                         };
                         self.shifted_indices.insert(*dst, (index_expr, shift));
                         // Don't emit the shift statement - it will be absorbed by array access
-                        return None;
+                        return stmts;
                     }
                 }
                 let var = self.reg_to_expr_dst(*dst);
@@ -2992,7 +3159,7 @@ impl<'a> Structurer<'a> {
                 if let (Expr::Ident(dst_name) | Expr::Variable(_, Some(dst_name)),
                         Expr::Ident(src_name) | Expr::Variable(_, Some(src_name))) = (&var, &expr) {
                     if dst_name == src_name {
-                        return None;
+                        return stmts;
                     }
                 }
                 Some(self.make_assign(var, expr))
@@ -3032,7 +3199,8 @@ impl<'a> Structurer<'a> {
                 // In these cases, emit a function reference instead of trying to inline
                 if *fun == self.func.findex || crate::is_currently_decompiling(fun.0) {
                     let expr = Expr::FunRef(*fun);
-                    return Some(self.make_assign(var, expr));
+                    stmts.push(self.make_assign(var, expr));
+                    return stmts;
                 }
 
                 // StaticClosure has no captured variables, just inline the function body
@@ -3044,7 +3212,8 @@ impl<'a> Structurer<'a> {
                         self.closure_analysis,
                     );
                     let expr = Expr::Closure(*fun, inner_stmts);
-                    return Some(self.make_assign(var, expr));
+                    stmts.push(self.make_assign(var, expr));
+                    return stmts;
                 }
 
                 // Function not found - this shouldn't happen with valid bytecode
@@ -3057,7 +3226,8 @@ impl<'a> Structurer<'a> {
                 // Check for self-referencing closure or mutual recursion
                 if *fun == self.func.findex || crate::is_currently_decompiling(fun.0) {
                     let expr = Expr::FunRef(*fun);
-                    return Some(self.make_assign(var, expr));
+                    stmts.push(self.make_assign(var, expr));
+                    return stmts;
                 }
 
                 // Check if this is a detected closure that we should inline
@@ -3074,7 +3244,8 @@ impl<'a> Structurer<'a> {
 
                         // Create a lambda expression with the decompiled body
                         let expr = Expr::Closure(*fun, inner_stmts);
-                        return Some(self.make_assign(var, expr));
+                        stmts.push(self.make_assign(var, expr));
+                        return stmts;
                     }
                 }
 
@@ -3146,7 +3317,8 @@ impl<'a> Structurer<'a> {
                         // Emit assignment using the captured variable name directly
                         let var = self.reg_to_expr_dst(*dst);
                         let expr = Expr::Ident(captured_name);
-                        return Some(self.make_assign(var, expr));
+                        stmts.push(self.make_assign(var, expr));
+                        return stmts;
                     }
                 }
                 // Normal enum field access - use Type.enumParameters(value)[index]
@@ -3173,7 +3345,12 @@ impl<'a> Structurer<'a> {
             }
 
             _ => panic!("Unhandled opcode: {:?}", op),
+        };
+
+        if let Some(s) = stmt {
+            stmts.push(s);
         }
+        stmts
     }
 
     fn get_global_name(&self, global: hlbc::types::RefGlobal) -> Str {
@@ -3467,8 +3644,13 @@ impl<'a> Structurer<'a> {
 
     /// Check if an SSA variable can be inlined and return its stored expression.
     /// Returns None if the variable shouldn't be inlined (multi-use, impure, has debug name, etc.)
+    /// IMPORTANT: Removes the expression from inline_exprs after returning it, since once
+    /// inlined, it should not be invalidated or emitted as a separate statement.
     fn try_get_inline_expr(&self, var: SsaVar) -> Option<Expr> {
-        self.inline_exprs.get(&var).cloned()
+        let result = self.inline_exprs.borrow_mut().remove(&var).map(|(expr, _)| expr);
+        if result.is_some() {
+        }
+        result
     }
 
     /// Check if a variable should be inlined based on use-def info and debug names.
@@ -3496,21 +3678,177 @@ impl<'a> Structurer<'a> {
 
     /// Store an expression for potential inlining, or emit as assignment.
     /// If the current SSA destination variable can be inlined:
-    ///   - Stores the expression and returns None (no statement emitted)
+    ///   - Stores the expression with its memory dependency and returns None
     /// Otherwise:
     ///   - Returns Some(assignment statement)
     fn try_inline_or_assign(&mut self, dst: Reg, expr: Expr) -> Option<Statement> {
         // Check if we have an SSA destination that can be inlined
         if let Some(ssa_var) = self.current_ssa_dst {
             if ssa_var.reg == dst && self.can_inline_var(ssa_var) {
+                // Compute memory dependency for this expression based on source opcode
+                let mem_dep = self.compute_memory_dep();
                 // Store for inlining - don't emit statement
-                self.inline_exprs.insert(ssa_var, expr);
+                self.inline_exprs.borrow_mut().insert(ssa_var, (expr, mem_dep));
                 return None;
             }
         }
         // Not inlinable - emit assignment statement
         let var = self.reg_to_expr_dst(dst);
         Some(self.make_assign(var, expr))
+    }
+
+    /// Compute memory dependency for the current opcode's result.
+    /// This determines what memory the expression reads from, which is used
+    /// to invalidate the inline when conflicting writes occur.
+    fn compute_memory_dep(&self) -> MemoryDep {
+        let op = &self.func.ops[self.current_op];
+        match op {
+            // Field access depends on the specific field of the object
+            Opcode::Field { obj, field, .. } => MemoryDep::Field { obj: *obj, field: field.0 },
+            // Global access depends on the specific global
+            Opcode::GetGlobal { global, .. } => MemoryDep::Global { global: *global },
+            // Constants, moves, arithmetic - no memory dependency
+            Opcode::Mov { .. }
+            | Opcode::Int { .. }
+            | Opcode::Float { .. }
+            | Opcode::Bool { .. }
+            | Opcode::String { .. }
+            | Opcode::Null { .. }
+            | Opcode::Bytes { .. }
+            | Opcode::Add { .. }
+            | Opcode::Sub { .. }
+            | Opcode::Mul { .. }
+            | Opcode::SDiv { .. }
+            | Opcode::UDiv { .. }
+            | Opcode::SMod { .. }
+            | Opcode::UMod { .. }
+            | Opcode::Shl { .. }
+            | Opcode::SShr { .. }
+            | Opcode::UShr { .. }
+            | Opcode::And { .. }
+            | Opcode::Or { .. }
+            | Opcode::Xor { .. }
+            | Opcode::Neg { .. }
+            | Opcode::Not { .. }
+            | Opcode::Incr { .. }
+            | Opcode::Decr { .. }
+            | Opcode::ToInt { .. }
+            | Opcode::ToSFloat { .. }
+            | Opcode::ToUFloat { .. }
+            | Opcode::SafeCast { .. }
+            | Opcode::UnsafeCast { .. }
+            | Opcode::ToDyn { .. }
+            | Opcode::GetType { .. }
+            | Opcode::Type { .. }
+            | Opcode::Ref { .. }
+            | Opcode::EnumIndex { .. }
+            | Opcode::GetTID { .. } => MemoryDep::None,
+            // Calls can read any memory - conservative
+            Opcode::Call0 { .. }
+            | Opcode::Call1 { .. }
+            | Opcode::Call2 { .. }
+            | Opcode::Call3 { .. }
+            | Opcode::Call4 { .. }
+            | Opcode::CallN { .. }
+            | Opcode::CallMethod { .. }
+            | Opcode::CallThis { .. }
+            | Opcode::CallClosure { .. }
+            | Opcode::GetArray { .. }
+            | Opcode::GetMem { .. }
+            | Opcode::ArraySize { .. }
+            | Opcode::Unref { .. }
+            | Opcode::EnumAlloc { .. }
+            | Opcode::New { .. }
+            | Opcode::MakeEnum { .. }
+            | Opcode::DynGet { .. }
+            | Opcode::ToVirtual { .. }
+            | Opcode::NullCheck { .. } => MemoryDep::AnyMemory,
+            // Other opcodes - conservative default
+            _ => MemoryDep::AnyMemory,
+        }
+    }
+
+    /// Invalidate pending inline expressions that conflict with the given opcode.
+    /// Called before processing each opcode to ensure we don't inline expressions
+    /// whose source memory has been modified.
+    ///
+    /// Returns statements for any invalidated expressions (they need to be emitted
+    /// since we originally suppressed their definition statements).
+    fn invalidate_conflicting_inlines(&mut self, op: &Opcode) -> Vec<Statement> {
+        let conflicts_with: Box<dyn Fn(&MemoryDep) -> bool> = match op {
+            // SetField invalidates any pending inline that reads the same field
+            Opcode::SetField { obj, field, .. } => {
+                let obj = *obj;
+                let field_idx = field.0;
+                Box::new(move |dep: &MemoryDep| {
+                    matches!(dep, MemoryDep::Field { obj: dep_obj, field: dep_field }
+                             if *dep_obj == obj && *dep_field == field_idx)
+                })
+            }
+            // SetGlobal invalidates any pending inline that reads the same global
+            Opcode::SetGlobal { global, .. } => {
+                let global = *global;
+                Box::new(move |dep: &MemoryDep| {
+                    matches!(dep, MemoryDep::Global { global: dep_global }
+                             if *dep_global == global)
+                })
+            }
+            // Calls can modify any memory - invalidate Field, Global, and AnyMemory deps
+            Opcode::Call0 { .. }
+            | Opcode::Call1 { .. }
+            | Opcode::Call2 { .. }
+            | Opcode::Call3 { .. }
+            | Opcode::Call4 { .. }
+            | Opcode::CallN { .. }
+            | Opcode::CallMethod { .. }
+            | Opcode::CallThis { .. }
+            | Opcode::CallClosure { .. } => {
+                Box::new(|dep: &MemoryDep| !matches!(dep, MemoryDep::None))
+            }
+            // SetArray/SetMem could modify anything accessed via pointers
+            Opcode::SetArray { .. } | Opcode::SetMem { .. } | Opcode::Setref { .. } => {
+                Box::new(|dep: &MemoryDep| !matches!(dep, MemoryDep::None))
+            }
+            // Other opcodes don't modify memory - no invalidation needed
+            _ => return Vec::new(),
+        };
+
+        // Find all conflicting entries and emit them as statements
+        let mut stmts = Vec::new();
+        let mut to_remove = Vec::new();
+
+        // Borrow for reading to find conflicts
+        {
+            let inline_exprs = self.inline_exprs.borrow();
+            for (ssa_var, (expr, dep)) in inline_exprs.iter() {
+                if conflicts_with(dep) {
+                    // Create assignment statement for the invalidated expression
+                    let var_name: Str = ssa_var.name().into();
+                    let var_expr = Expr::Variable(ssa_var.reg, Some(var_name.clone()));
+                    // Ensure variable is declared
+                    if !self.declared_vars.contains(&var_name) {
+                        self.declared_vars.insert(var_name.clone());
+                        self.hoisted_vars.insert(var_name);
+                    }
+                    stmts.push(Statement::Assign {
+                        declaration: false,
+                        variable: var_expr,
+                        assign: expr.clone(),
+                    });
+                    to_remove.push(*ssa_var);
+                }
+            }
+        }
+
+        // Remove invalidated entries (separate borrow)
+        {
+            let mut inline_exprs = self.inline_exprs.borrow_mut();
+            for var in to_remove {
+                inline_exprs.remove(&var);
+            }
+        }
+
+        stmts
     }
 
     /// Get debug name for a register, optionally for source context.
@@ -3787,15 +4125,20 @@ impl<'a> Structurer<'a> {
         // Track register values from intermediate opcodes
         let mut reg_values: HashMap<Reg, Expr> = HashMap::new();
 
-        for idx in (new_op_idx + 1)..=search_end.min(new_op_idx + 10) {
-            // Search a bit further for constructor args
+        for idx in (new_op_idx + 1)..=search_end.min(new_op_idx + 20) {
+            // Search further for constructor args (complex expressions may need many ops)
             if idx >= self.func.ops.len() {
                 break;
             }
 
             let op = &self.func.ops[idx];
 
-            // Track constant/global assignments
+            // Helper to get expression for a register - used during tracking
+            let get_val = |reg: Reg, regs: &HashMap<Reg, Expr>| -> Expr {
+                regs.get(&reg).cloned().unwrap_or_else(|| self.reg_to_expr(reg))
+            };
+
+            // Track constant/global/computed assignments
             match op {
                 Opcode::String { dst, ptr } => {
                     reg_values.insert(*dst, Expr::Constant(Constant::String(*ptr)));
@@ -3811,6 +4154,61 @@ impl<'a> Structurer<'a> {
                 }
                 Opcode::Null { dst } => {
                     reg_values.insert(*dst, Expr::Constant(Constant::Null));
+                }
+                // Track field access
+                Opcode::Field { dst, obj, field } => {
+                    let obj_expr = get_val(*obj, &reg_values);
+                    let field_name = self.get_field_name(*obj, *field);
+                    reg_values.insert(*dst, Expr::Field(Box::new(obj_expr), field_name));
+                }
+                // Track arithmetic operations
+                Opcode::Add { dst, a, b } => {
+                    let a_expr = get_val(*a, &reg_values);
+                    let b_expr = get_val(*b, &reg_values);
+                    reg_values.insert(*dst, Expr::Op(Operation::Add(Box::new(a_expr), Box::new(b_expr))));
+                }
+                Opcode::Sub { dst, a, b } => {
+                    let a_expr = get_val(*a, &reg_values);
+                    let b_expr = get_val(*b, &reg_values);
+                    reg_values.insert(*dst, Expr::Op(Operation::Sub(Box::new(a_expr), Box::new(b_expr))));
+                }
+                Opcode::Mul { dst, a, b } => {
+                    let a_expr = get_val(*a, &reg_values);
+                    let b_expr = get_val(*b, &reg_values);
+                    reg_values.insert(*dst, Expr::Op(Operation::Mul(Box::new(a_expr), Box::new(b_expr))));
+                }
+                Opcode::SDiv { dst, a, b } | Opcode::UDiv { dst, a, b } => {
+                    let a_expr = get_val(*a, &reg_values);
+                    let b_expr = get_val(*b, &reg_values);
+                    reg_values.insert(*dst, Expr::Op(Operation::Div(Box::new(a_expr), Box::new(b_expr))));
+                }
+                Opcode::Neg { dst, src } => {
+                    let src_expr = get_val(*src, &reg_values);
+                    reg_values.insert(*dst, Expr::Op(Operation::Neg(Box::new(src_expr))));
+                }
+                // Track moves
+                Opcode::Mov { dst, src } => {
+                    let src_expr = get_val(*src, &reg_values);
+                    reg_values.insert(*dst, src_expr);
+                }
+                // Track casts
+                Opcode::ToSFloat { dst, src } | Opcode::ToUFloat { dst, src } => {
+                    let src_expr = get_val(*src, &reg_values);
+                    reg_values.insert(*dst, Expr::Cast(Box::new(src_expr), "Float".into()));
+                }
+                Opcode::ToInt { dst, src } => {
+                    let src_expr = get_val(*src, &reg_values);
+                    let call = Expr::Call(Box::new(crate::ast::Call {
+                        fun: Expr::Field(Box::new(Expr::Ident("Std".into())), "int".into()),
+                        args: vec![src_expr],
+                    }));
+                    reg_values.insert(*dst, call);
+                }
+                // Track function calls (for things like Math.cos, Math.sin)
+                Opcode::Call1 { dst, fun, arg0 } => {
+                    let arg = get_val(*arg0, &reg_values);
+                    let call = Expr::Call(Box::new(crate::ast::Call::new_fun(*fun, vec![arg])));
+                    reg_values.insert(*dst, call);
                 }
                 Opcode::GetGlobal { dst, global } => {
                     reg_values.insert(*dst, self.global_to_expr(*global));
@@ -3979,7 +4377,8 @@ impl<'a> Structurer<'a> {
 
                     // Found the SSA variable for this register at block end
                     // Now find its definition to see if it's a constant
-                    if let Some(def_op_idx) = self.ssa.find_def(*ssa_var) {
+                    let def = self.ssa.find_def(*ssa_var);
+                    if let Some(def_op_idx) = def {
                         match &self.func.ops[def_op_idx] {
                             Opcode::Int { ptr, .. } => {
                                 return Expr::Constant(Constant::Int(*ptr));
@@ -4077,10 +4476,23 @@ impl<'a> Structurer<'a> {
                             format!("r{}", reg.0).into()
                         }
                     } else {
-                        // For non-phi variables, use raw SSA-versioned name
-                        // This avoids picking up debug names from different branches
-                        // (e.g., bounds check failure path assigns "last" to default value)
-                        format!("r{}_{}", reg.0, ssa_var.version).into()
+                        // For non-phi variables, be careful about debug names.
+                        // Debug names from different branches can be misleading
+                        // (e.g., bounds check failure path assigns "last" to default value).
+                        //
+                        // EXCEPTION: Function parameters (version 0) are always safe since
+                        // they're defined at function entry before any branches.
+                        if ssa_var.version == 0 {
+                            // Check if this is a function parameter
+                            if let Some(debug_name) = self.get_debug_name_at(reg, at_op, true) {
+                                debug_name.into()
+                            } else {
+                                format!("r{}_{}", reg.0, ssa_var.version).into()
+                            }
+                        } else {
+                            // Non-parameter, non-phi: use raw SSA-versioned name
+                            format!("r{}_{}", reg.0, ssa_var.version).into()
+                        }
                     };
                     return Expr::Variable(reg, Some(name));
                 }

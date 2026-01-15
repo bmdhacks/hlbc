@@ -18,6 +18,7 @@ fn panic_unknown_expr(msg: &str) -> &'static str {
     panic!("Expr::Unknown encountered during display: {}", msg)
 }
 
+
 /// A formatter that produces clean Haxe-like output without index annotations.
 /// Unlike EnhancedFmt, this doesn't add @index suffixes to type names.
 #[derive(Copy, Clone, Default)]
@@ -282,9 +283,9 @@ impl Class {
                 " extends "{parent}
             }
             " {\n"
-            // Fields with indices - add 'public' for static fields (private by default in Haxe)
+            // Fields - bytecode doesn't preserve visibility, so make all public (private by default in Haxe)
             for (i, f) in self.fields.iter().enumerate() {
-                {new_opts} if f.static_ { "public static " } "var "{f.name}": "{to_haxe_type(&ctx[f.ty], ctx)}
+                {new_opts}if f.static_ { "public static " } else { "public " } "var "{f.name}": "{to_haxe_type(&ctx[f.ty], ctx)}
                 if let Some(init) = &f.initializer {
                     " = "{init.display_simple(ctx, &new_opts)}
                 }
@@ -856,13 +857,29 @@ impl Expr {
                                     if parent_name.starts_with('$') {
                                         {clean_name}"."{name}
                                     } else {
+                                        // Parent is not a static class type - try debug inference
+                                        if let Some(class_name) = infer_class_from_debug(code, func) {
+                                            {class_name}"."{name}
+                                        } else {
+                                            {name}
+                                        }
+                                    }
+                                } else {
+                                    // Parent ref doesn't resolve to Obj - try debug inference
+                                    if let Some(class_name) = infer_class_from_debug(code, func) {
+                                        {class_name}"."{name}
+                                    } else {
                                         {name}
                                     }
+                                }
+                            } else {
+                                // No parent - try to infer class from debug source file path
+                                // e.g., "haxe/Resource.hx" -> "haxe.Resource"
+                                if let Some(class_name) = infer_class_from_debug(code, func) {
+                                    {class_name}"."{name}
                                 } else {
                                     {name}
                                 }
-                            } else {
-                                {name}
                             }
                         }
                     }
@@ -1250,5 +1267,51 @@ impl Statement {
                 }
             }
         }
+    }
+}
+
+/// Try to infer the class name from the function's debug source file path.
+/// For standard library functions that don't have a parent type set,
+/// we can extract the class from paths like "haxe/Resource.hx" -> "haxe.Resource"
+fn infer_class_from_debug(code: &Bytecode, func: &hlbc::types::Function) -> Option<Str> {
+    // Get the debug info for this function
+    let debug = func.debug_info.as_ref()?;
+
+    // Look for the source file - debug info is (file_idx, line)
+    let (file_idx, _) = debug.iter().next()?;
+    let file_path = code.debug_files.as_ref()?.get(*file_idx as usize)?;
+
+    // Look for standard library paths like "haxe/Resource.hx" or
+    // paths containing "_std/haxe/" which is the HashLink-specific std lib
+    let path_str = file_path.as_ref();
+
+    // Try to find the class path starting from known patterns
+    // Pattern 1: "_std/haxe/Something.hx" -> "haxe.Something"
+    // Pattern 2: "haxe/Something.hx" -> "haxe.Something"
+    let class_part = if let Some(pos) = path_str.find("_std/") {
+        &path_str[pos + 5..]  // Skip "_std/"
+    } else if path_str.starts_with("haxe/") || path_str.contains("/haxe/") {
+        // Find the haxe/ part
+        if let Some(pos) = path_str.rfind("/haxe/") {
+            &path_str[pos + 1..]  // Skip the leading /
+        } else if path_str.starts_with("haxe/") {
+            path_str
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+
+    // Convert "haxe/Resource.hx" to "haxe.Resource"
+    let without_ext = class_part.strip_suffix(".hx")?;
+    let class_name = without_ext.replace('/', ".");
+
+    // Don't add class prefix for main class methods (would cause "BytesTest.main" for BytesTest)
+    // Only add for clearly standard library classes
+    if class_name.starts_with("haxe.") || class_name.starts_with("sys.") {
+        Some(class_name.into())
+    } else {
+        None
     }
 }
