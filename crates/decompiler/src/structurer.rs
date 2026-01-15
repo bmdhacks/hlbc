@@ -3511,9 +3511,17 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::Type { dst, ty } => {
-                let var = self.reg_to_expr_dst(*dst);
-                let val = Expr::Constant(Constant::TypeRef(*ty));
-                Some(self.make_assign(var, val))
+                // Check if this type is only used for array allocation (element type metadata)
+                // Pattern: Type reg = SomeType; Call2 alloc_array(reg, size)
+                if self.is_type_only_for_array_alloc(*dst, op_idx) {
+                    // Suppress - it's just array element type metadata, not a real value
+                    None
+                } else {
+                    // Emit as type reference (for reflection, switches, etc.)
+                    let var = self.reg_to_expr_dst(*dst);
+                    let val = Expr::Constant(Constant::TypeRef(*ty));
+                    Some(self.make_assign(var, val))
+                }
             }
 
             Opcode::DynGet { dst, obj, field } => {
@@ -3991,13 +3999,22 @@ impl<'a> Structurer<'a> {
 
     /// Check if an SSA variable can be inlined and return its stored expression.
     /// Returns None if the variable shouldn't be inlined (multi-use, impure, has debug name, etc.)
-    /// IMPORTANT: Removes the expression from inline_exprs after returning it, since once
-    /// inlined, it should not be invalidated or emitted as a separate statement.
+    /// IMPORTANT: For non-constants, removes the expression from inline_exprs after returning it,
+    /// since once inlined, it should not be invalidated or emitted as a separate statement.
+    /// For constants, clones instead of removing since constants can be used multiple times.
     fn try_get_inline_expr(&self, var: SsaVar) -> Option<Expr> {
-        let result = self.inline_exprs.borrow_mut().remove(&var).map(|(expr, _)| expr);
-        if result.is_some() {
+        // First check if it's a constant - constants can be used multiple times
+        {
+            let inline_exprs = self.inline_exprs.borrow();
+            if let Some((expr, _)) = inline_exprs.get(&var) {
+                if matches!(expr, Expr::Constant(_)) {
+                    return Some(expr.clone());
+                }
+            }
         }
-        result
+
+        // For non-constants, remove after retrieval (single use)
+        self.inline_exprs.borrow_mut().remove(&var).map(|(expr, _)| expr)
     }
 
     /// Check if a variable should be inlined based on use-def info and debug names.
@@ -4476,6 +4493,10 @@ impl<'a> Structurer<'a> {
         // Track register values from intermediate opcodes
         let mut reg_values: HashMap<Reg, Expr> = HashMap::new();
 
+        // Track intermediate New opcodes (for nested constructors like `new Point(new Point(1,2).x, ...)`)
+        // Maps register -> type reference from the New opcode
+        let mut pending_new: HashMap<Reg, RefType> = HashMap::new();
+
         for idx in (new_op_idx + 1)..=search_end {
             // Search within the same basic block for constructor call
             if idx >= self.func.ops.len() {
@@ -4555,50 +4576,144 @@ impl<'a> Structurer<'a> {
                     }));
                     reg_values.insert(*dst, call);
                 }
-                // Track function calls (for things like Math.cos, Math.sin)
+                // Track function calls (for things like Math.cos, Math.sin, computeX(), etc.)
+                Opcode::Call0 { dst, fun } => {
+                    let call = Expr::Call(Box::new(crate::ast::Call::new_fun(*fun, vec![])));
+                    reg_values.insert(*dst, call);
+                }
                 Opcode::Call1 { dst, fun, arg0 } => {
                     let arg = get_val(*arg0, &reg_values);
                     let call = Expr::Call(Box::new(crate::ast::Call::new_fun(*fun, vec![arg])));
                     reg_values.insert(*dst, call);
                 }
+                // Track Call2 but skip if it's the constructor call we're looking for
+                Opcode::Call2 { dst, fun, arg0, arg1 } if *arg0 != new_dst => {
+                    let a0 = get_val(*arg0, &reg_values);
+                    let a1 = get_val(*arg1, &reg_values);
+                    let call = Expr::Call(Box::new(crate::ast::Call::new_fun(*fun, vec![a0, a1])));
+                    reg_values.insert(*dst, call);
+                }
+                // Track Call3 but skip if it's the constructor call
+                Opcode::Call3 { dst, fun, arg0, arg1, arg2 } if *arg0 != new_dst => {
+                    let a0 = get_val(*arg0, &reg_values);
+                    let a1 = get_val(*arg1, &reg_values);
+                    let a2 = get_val(*arg2, &reg_values);
+                    let call = Expr::Call(Box::new(crate::ast::Call::new_fun(*fun, vec![a0, a1, a2])));
+                    reg_values.insert(*dst, call);
+                }
+                // Track Call4 but skip if it's the constructor call
+                Opcode::Call4 { dst, fun, arg0, arg1, arg2, arg3 } if *arg0 != new_dst => {
+                    let a0 = get_val(*arg0, &reg_values);
+                    let a1 = get_val(*arg1, &reg_values);
+                    let a2 = get_val(*arg2, &reg_values);
+                    let a3 = get_val(*arg3, &reg_values);
+                    let call = Expr::Call(Box::new(crate::ast::Call::new_fun(*fun, vec![a0, a1, a2, a3])));
+                    reg_values.insert(*dst, call);
+                }
+                // Track CallN but skip if it's the constructor call
+                Opcode::CallN { dst, fun, args } if args.first() != Some(&new_dst) => {
+                    let call_args: Vec<_> = args.iter().map(|r| get_val(*r, &reg_values)).collect();
+                    let call = Expr::Call(Box::new(crate::ast::Call::new_fun(*fun, call_args)));
+                    reg_values.insert(*dst, call);
+                }
                 Opcode::GetGlobal { dst, global } => {
                     reg_values.insert(*dst, self.global_to_expr(*global));
+                }
+                // Track intermediate New opcodes (for nested constructors)
+                Opcode::New { dst } if *dst != new_dst => {
+                    // Get type from the register's declared type
+                    let type_ref = self.func.regs.get(dst.0 as usize).copied().unwrap_or(RefType(0));
+                    pending_new.insert(*dst, type_ref);
                 }
                 _ => {}
             }
 
-            // Helper to get expression for a register
-            let get_arg_expr = |reg: Reg| -> Expr {
-                reg_values.get(&reg).cloned().unwrap_or_else(|| self.reg_to_expr(reg))
-            };
+            // Helper function to get expression for a register (not a closure to avoid borrow issues)
+            fn get_expr(reg: Reg, reg_values: &HashMap<Reg, Expr>, structurer: &Structurer) -> Expr {
+                reg_values.get(&reg).cloned().unwrap_or_else(|| structurer.reg_to_expr(reg))
+            }
 
+            // Check for intermediate __constructor__ calls (for nested constructors)
+            // These are constructor calls on registers OTHER than our target new_dst
+            match op {
+                Opcode::Call2 { fun, arg0, arg1, .. }
+                    if *arg0 != new_dst && self.is_constructor_function(*fun) => {
+                    // Build the complete constructor expression for this intermediate object
+                    if let Some(ty_ref) = pending_new.remove(arg0) {
+                        let args = vec![get_expr(*arg1, &reg_values, self)];
+                        let ctor = Expr::Constructor(ConstructorCall::new(ty_ref, args));
+                        reg_values.insert(*arg0, ctor);
+                    }
+                }
+                Opcode::Call3 { fun, arg0, arg1, arg2, .. }
+                    if *arg0 != new_dst && self.is_constructor_function(*fun) => {
+                    if let Some(ty_ref) = pending_new.remove(arg0) {
+                        let args = vec![
+                            get_expr(*arg1, &reg_values, self),
+                            get_expr(*arg2, &reg_values, self)
+                        ];
+                        let ctor = Expr::Constructor(ConstructorCall::new(ty_ref, args));
+                        reg_values.insert(*arg0, ctor);
+                    }
+                }
+                Opcode::Call4 { fun, arg0, arg1, arg2, arg3, .. }
+                    if *arg0 != new_dst && self.is_constructor_function(*fun) => {
+                    if let Some(ty_ref) = pending_new.remove(arg0) {
+                        let args = vec![
+                            get_expr(*arg1, &reg_values, self),
+                            get_expr(*arg2, &reg_values, self),
+                            get_expr(*arg3, &reg_values, self),
+                        ];
+                        let ctor = Expr::Constructor(ConstructorCall::new(ty_ref, args));
+                        reg_values.insert(*arg0, ctor);
+                    }
+                }
+                Opcode::CallN { fun, args, .. }
+                    if !args.is_empty() && args[0] != new_dst && self.is_constructor_function(*fun) => {
+                    if let Some(ty_ref) = pending_new.remove(&args[0]) {
+                        let ctor_args: Vec<_> = args[1..].iter()
+                            .map(|r| get_expr(*r, &reg_values, self))
+                            .collect();
+                        let ctor = Expr::Constructor(ConstructorCall::new(ty_ref, ctor_args));
+                        reg_values.insert(args[0], ctor);
+                    }
+                }
+                _ => {}
+            }
+
+            // Check for the target constructor call
             match op {
                 // Call2 __constructor__(obj, arg1)
                 Opcode::Call2 { fun, arg0, arg1, .. } if *arg0 == new_dst => {
                     if self.is_constructor_function(*fun) {
-                        return (vec![get_arg_expr(*arg1)], Some(idx));
+                        return (vec![get_expr(*arg1, &reg_values, self)], Some(idx));
                     }
                 }
                 // Call3 __constructor__(obj, arg1, arg2)
                 Opcode::Call3 { fun, arg0, arg1, arg2, .. } if *arg0 == new_dst => {
                     if self.is_constructor_function(*fun) {
-                        return (vec![get_arg_expr(*arg1), get_arg_expr(*arg2)], Some(idx));
+                        return (vec![
+                            get_expr(*arg1, &reg_values, self),
+                            get_expr(*arg2, &reg_values, self)
+                        ], Some(idx));
                     }
                 }
                 // Call4 __constructor__(obj, arg1, arg2, arg3)
                 Opcode::Call4 { fun, arg0, arg1, arg2, arg3, .. } if *arg0 == new_dst => {
                     if self.is_constructor_function(*fun) {
                         return (vec![
-                            get_arg_expr(*arg1),
-                            get_arg_expr(*arg2),
-                            get_arg_expr(*arg3),
+                            get_expr(*arg1, &reg_values, self),
+                            get_expr(*arg2, &reg_values, self),
+                            get_expr(*arg3, &reg_values, self),
                         ], Some(idx));
                     }
                 }
                 // CallN __constructor__(obj, args...)
                 Opcode::CallN { fun, args, .. } if !args.is_empty() && args[0] == new_dst => {
                     if self.is_constructor_function(*fun) {
-                        return (args[1..].iter().map(|r| get_arg_expr(*r)).collect(), Some(idx));
+                        return (args[1..].iter()
+                            .map(|r| get_expr(*r, &reg_values, self))
+                            .collect(), Some(idx));
                     }
                 }
                 _ => {}
@@ -4616,6 +4731,56 @@ impl<'a> Structurer<'a> {
         } else {
             false
         }
+    }
+
+    /// Check if a Type opcode's result is only used for array allocation (alloc_array/alloc_dynarray).
+    /// The pattern is:
+    ///   Type reg2 = SomeType
+    ///   Int reg3 = 0
+    ///   Call2 reg1 = alloc_array(reg2, reg3)
+    /// In this case, the type is just array element type metadata and should be suppressed.
+    fn is_type_only_for_array_alloc(&self, type_dst: Reg, type_op_idx: usize) -> bool {
+        use hlbc::types::FunPtr;
+
+        // Look ahead for uses of the type register
+        let search_limit = (type_op_idx + 10).min(self.func.ops.len());
+
+        for idx in (type_op_idx + 1)..search_limit {
+            let op = &self.func.ops[idx];
+
+            match op {
+                // The expected pattern: Call2 where first arg is the type register
+                Opcode::Call2 { fun, arg0, .. } if *arg0 == type_dst => {
+                    // Check if this is specifically the std library's alloc_array or alloc_dynarray
+                    // We need to verify it's a native function from "std" to avoid false positives
+                    // with user-defined functions that happen to have the same name
+                    if let FunPtr::Native(native) = self.code.get(*fun) {
+                        let lib = native.lib(self.code);
+                        let name = native.name(self.code);
+                        if lib == "std" && (name == "alloc_array" || name == "alloc_dynarray") {
+                            return true;
+                        }
+                    }
+                    // It's used for something else (not std alloc)
+                    return false;
+                }
+                // Any other use of the register means it's not just for array alloc
+                Opcode::Call1 { arg0, .. } if *arg0 == type_dst => return false,
+                Opcode::Call2 { arg1, .. } if *arg1 == type_dst => return false, // second arg
+                Opcode::Call3 { arg0, arg1, arg2, .. }
+                    if *arg0 == type_dst || *arg1 == type_dst || *arg2 == type_dst => return false,
+                Opcode::Mov { src, .. } if *src == type_dst => return false,
+                Opcode::SetField { src, .. } if *src == type_dst => return false,
+                Opcode::SetArray { src, .. } if *src == type_dst => return false,
+                // If the register is overwritten before being used, it's safe to suppress
+                Opcode::Type { dst, .. } if *dst == type_dst => return true,
+                Opcode::Mov { dst, .. } if *dst == type_dst => return true,
+                _ => {}
+            }
+        }
+
+        // If we didn't find any use within the search range, it's probably safe
+        false
     }
 
     /// Check if the current function being decompiled is a constructor
