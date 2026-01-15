@@ -206,6 +206,9 @@ pub fn decompile_code_with_closures(
     // Pass 6: Post-processing transformations
     post::reconstruct_array_literals(code, &mut stmts);
 
+    // Pass 6b: Restore string concatenation from __add__ calls
+    post::apply_string_concat(code, &mut stmts);
+
     // Pass 7: Iterative optimization loop
     // Multiple passes can enable each other (e.g., inverting empty ifs can expose early return patterns)
     // Note: condense_ternary_returns has been migrated to structurer.rs (try_condense_ternary_return)

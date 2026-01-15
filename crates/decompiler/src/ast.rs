@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use hlbc::fmt::EnhancedFmt;
-use hlbc::types::{RefEnumConstruct, RefField, RefFloat, RefFun, RefInt, RefString, RefType, Reg};
+use hlbc::types::{RefBytes, RefEnumConstruct, RefField, RefFloat, RefFun, RefInt, RefString, RefType, Reg};
 use hlbc::{Bytecode, Str};
 
 #[derive(Debug)]
@@ -40,6 +40,7 @@ pub enum Constant {
     Int(RefInt),
     Float(RefFloat),
     String(RefString),
+    Bytes(RefBytes),
     Bool(bool),
     Null,
     /// 'this' instance

@@ -2891,8 +2891,10 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::Bytes { dst, ptr } => {
-                // Bytes constants are stored separately - not yet supported
-                panic!("Opcode::Bytes not yet supported: dst={:?}, ptr={:?}", dst, ptr);
+                // Load bytes constant from the bytes pool
+                let var = self.reg_to_expr_dst(*dst);
+                let expr = Expr::Constant(Constant::Bytes(*ptr));
+                Some(self.make_assign(var, expr))
             }
 
             Opcode::GetMem { dst, bytes, index } => {
@@ -3045,10 +3047,8 @@ impl<'a> Structurer<'a> {
                     return Some(self.make_assign(var, expr));
                 }
 
-                // Fallback: placeholder body if function not found
-                let comment = Statement::Comment(format!("// TODO: inline closure body from fun@{}", fun.0));
-                let expr = Expr::Closure(*fun, vec![comment]);
-                Some(self.make_assign(var, expr))
+                // Function not found - this shouldn't happen with valid bytecode
+                panic!("Failed to resolve closure function fun@{} - invalid bytecode?", fun.0);
             }
 
             Opcode::InstanceClosure { dst, fun, obj } => {
@@ -3172,7 +3172,7 @@ impl<'a> Structurer<'a> {
                 Some(self.make_assign(var, expr))
             }
 
-            _ => Some(Statement::Comment(format!("// unhandled: {:?}", op))),
+            _ => panic!("Unhandled opcode: {:?}", op),
         }
     }
 

@@ -63,8 +63,15 @@ run_test() {
 
     echo -n "Testing $name... "
 
+    # Check for resource file (convention: TestName.resource -> embedded as "testdata")
+    local resource_args=""
+    local resource_file="$SRC_DIR/${name}.resource"
+    if [ -f "$resource_file" ]; then
+        resource_args="-resource $resource_file@testdata"
+    fi
+
     # Step 1: Compile original
-    if ! $HAXE -cp "$SRC_DIR" --main "$name" -hl "$hl_file" --debug 2>/dev/null; then
+    if ! $HAXE -cp "$SRC_DIR" --main "$name" -hl "$hl_file" --debug $resource_args 2>/dev/null; then
         echo -e "${YELLOW}SKIP${NC} (compile failed)"
         ((SKIPPED++))
         return

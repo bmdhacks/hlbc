@@ -374,6 +374,22 @@ impl Constant {
                 }
                 Ok(())
             }
+            Bytes(c) => {
+                // Format bytes constant as hex string
+                if let Some((data, offsets)) = &code.bytes {
+                    let start = offsets.get(c.0).copied().unwrap_or(0);
+                    let end = offsets.get(c.0 + 1).copied().unwrap_or(data.len());
+                    let bytes = &data[start..end];
+                    let hex: std::string::String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+                    write!(f, "haxe.io.Bytes.ofHex(\"{}\")", hex)?;
+                } else {
+                    write!(f, "haxe.io.Bytes.ofHex(\"\")")?;
+                }
+                if show_indices {
+                    write!(f, " /* bytes@{} */", c.0)?;
+                }
+                Ok(())
+            }
             Bool(c) => Display::fmt(&c, f),
             Null => f.write_str("null"),
             This => f.write_str("this"),
@@ -524,6 +540,19 @@ impl<'a> Display for SimpleExprDisplay<'a> {
                 Constant::Int(r) => write!(f, "{}", self.code[*r]),
                 Constant::Float(r) => write!(f, "{}", self.code[*r]),
                 Constant::String(r) => write!(f, "\"{}\"", self.code[*r]),
+                Constant::Bytes(r) => {
+                    // Format bytes constant as hex string
+                    if let Some((data, offsets)) = &self.code.bytes {
+                        let start = offsets.get(r.0).copied().unwrap_or(0);
+                        let end = offsets.get(r.0 + 1).copied().unwrap_or(data.len());
+                        let bytes = &data[start..end];
+                        // Format as haxe.io.Bytes.ofHex("...")
+                        let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+                        write!(f, "haxe.io.Bytes.ofHex(\"{}\")", hex)
+                    } else {
+                        write!(f, "haxe.io.Bytes.ofHex(\"\")")
+                    }
+                }
                 Constant::Bool(b) => write!(f, "{}", if *b { "true" } else { "false" }),
                 Constant::Null => write!(f, "null"),
                 Constant::This => write!(f, "this"),

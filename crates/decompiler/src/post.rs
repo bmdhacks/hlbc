@@ -2227,3 +2227,144 @@ pub fn invert_empty_ifs(stmts: &mut Vec<Statement>) -> bool {
 
     changed
 }
+
+// =============================================================================
+// StringConcat: Restore `+` operator from `__add__` calls
+// =============================================================================
+
+/// Transform `__add__(a, b)` calls into `a + b` expressions.
+/// Haxe compiles string concatenation to `__add__` at bytecode level.
+pub fn apply_string_concat(code: &Bytecode, stmts: &mut Vec<Statement>) {
+    for stmt in stmts.iter_mut() {
+        apply_string_concat_stmt(code, stmt);
+    }
+}
+
+fn apply_string_concat_stmt(code: &Bytecode, stmt: &mut Statement) {
+    match stmt {
+        Statement::Assign { assign, variable, .. } => {
+            apply_string_concat_expr(code, assign);
+            apply_string_concat_expr(code, variable);
+        }
+        Statement::ExprStatement(e) => {
+            apply_string_concat_expr(code, e);
+        }
+        Statement::Return(Some(e)) => {
+            apply_string_concat_expr(code, e);
+        }
+        Statement::IfElse { cond, if_, else_ } => {
+            apply_string_concat_expr(code, cond);
+            apply_string_concat(code, if_);
+            apply_string_concat(code, else_);
+        }
+        Statement::IfElseChain { branches, else_ } => {
+            for (cond, body) in branches.iter_mut() {
+                apply_string_concat_expr(code, cond);
+                apply_string_concat(code, body);
+            }
+            apply_string_concat(code, else_);
+        }
+        Statement::While { cond, stmts } => {
+            apply_string_concat_expr(code, cond);
+            apply_string_concat(code, stmts);
+        }
+        Statement::Switch { arg, default, cases, .. } => {
+            apply_string_concat_expr(code, arg);
+            apply_string_concat(code, default);
+            for (_, case_stmts) in cases.iter_mut() {
+                apply_string_concat(code, case_stmts);
+            }
+        }
+        Statement::TryCatch { try_stmts, catch_stmts, .. } => {
+            apply_string_concat(code, try_stmts);
+            apply_string_concat(code, catch_stmts);
+        }
+        Statement::Throw(e) => {
+            apply_string_concat_expr(code, e);
+        }
+        Statement::Block { stmts } | Statement::Sequence { stmts } => {
+            apply_string_concat(code, stmts);
+        }
+        Statement::Return(None) | Statement::Break | Statement::Continue
+        | Statement::Comment(_) | Statement::VarDecl { .. } => {}
+    }
+}
+
+fn apply_string_concat_expr(code: &Bytecode, expr: &mut Expr) {
+    // First, recurse into sub-expressions
+    match expr {
+        Expr::Call(call) => {
+            apply_string_concat_expr(code, &mut call.fun);
+            for arg in &mut call.args {
+                apply_string_concat_expr(code, arg);
+            }
+        }
+        Expr::Field(obj, _) => {
+            apply_string_concat_expr(code, obj);
+        }
+        Expr::Array(arr, idx) => {
+            apply_string_concat_expr(code, arr);
+            apply_string_concat_expr(code, idx);
+        }
+        Expr::Constructor(ConstructorCall { args, .. }) => {
+            for arg in args {
+                apply_string_concat_expr(code, arg);
+            }
+        }
+        Expr::Anonymous(_, fields) => {
+            for (_, field_expr) in fields {
+                apply_string_concat_expr(code, field_expr);
+            }
+        }
+        Expr::Closure(_, stmts) => {
+            apply_string_concat(code, stmts);
+        }
+        Expr::Op(op) => {
+            match op {
+                Operation::Add(a, b) | Operation::Sub(a, b) | Operation::Mul(a, b)
+                | Operation::Div(a, b) | Operation::Mod(a, b) | Operation::And(a, b)
+                | Operation::Or(a, b) | Operation::Xor(a, b) | Operation::Shl(a, b)
+                | Operation::Shr(a, b) | Operation::Eq(a, b)
+                | Operation::NotEq(a, b) | Operation::Gt(a, b) | Operation::Gte(a, b)
+                | Operation::Lt(a, b) | Operation::Lte(a, b) => {
+                    apply_string_concat_expr(code, a.as_mut());
+                    apply_string_concat_expr(code, b.as_mut());
+                }
+                Operation::Neg(e) | Operation::Not(e) | Operation::Incr(e) | Operation::Decr(e) => {
+                    apply_string_concat_expr(code, e.as_mut());
+                }
+            }
+        }
+        Expr::Cast(inner, _) => {
+            apply_string_concat_expr(code, inner);
+        }
+        Expr::ArrayLiteral(elems) => {
+            for elem in elems {
+                apply_string_concat_expr(code, elem);
+            }
+        }
+        Expr::EnumConstr(_, _, args) => {
+            for arg in args {
+                apply_string_concat_expr(code, arg);
+            }
+        }
+        Expr::IfElse { cond, if_, else_ } => {
+            apply_string_concat_expr(code, cond.as_mut());
+            apply_string_concat(code, if_);
+            apply_string_concat(code, else_);
+        }
+        Expr::Constant(_) | Expr::Variable(_, _) | Expr::Ident(_)
+        | Expr::FunRef(_) | Expr::Unknown(_) => {}
+    }
+
+    // Now check if this is an __add__ call
+    if let Expr::Call(call) = expr {
+        if let Expr::FunRef(fun) = &call.fun {
+            if fun.name(code) == "__add__" && call.args.len() == 2 {
+                let arg0 = call.args[0].clone();
+                let arg1 = call.args[1].clone();
+                *expr = add(arg0, arg1);
+            }
+        }
+    }
+}
