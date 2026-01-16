@@ -11,7 +11,7 @@ class Item {
         return value;
     }
     public function process():Void {
-        trace("processing " + value);
+        Sys.println("processing " + value);
     }
 }
 
@@ -54,12 +54,12 @@ class ObjectArrayLoop {
         for (obj in arr) {
             total += obj.value;
         }
-        trace("local total=" + total);  // 6
+        Sys.println("local total=" + total);  // 6
 
         // Test with instance field array
         var loop = new ObjectArrayLoop();
         var sum = loop.sumValues();
-        trace("instance sum=" + sum);  // 60
+        Sys.println("instance sum=" + sum);  // 60
 
         loop.processAll();
     }

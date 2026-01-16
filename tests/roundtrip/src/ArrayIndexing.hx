@@ -38,21 +38,21 @@ class ArrayIndexing {
 
 		// Test swap
 		swap(a, 0, 4);
-		trace("swap a[0]=" + a[0]); // 5
-		trace("swap a[4]=" + a[4]); // 1
+		Sys.println("swap a[0]=" + a[0]); // 5
+		Sys.println("swap a[4]=" + a[4]); // 1
 
 		// Test reverse
 		var b = [10, 20, 30, 40];
 		reverse(b);
-		trace("reverse b[0]=" + b[0]); // 40
-		trace("reverse b[3]=" + b[3]); // 10
+		Sys.println("reverse b[0]=" + b[0]); // 40
+		Sys.println("reverse b[3]=" + b[3]); // 10
 
 		// Test sum
 		var c = [1, 2, 3, 4, 5];
-		trace("sum=" + sum(c)); // 15
+		Sys.println("sum=" + sum(c)); // 15
 
 		// Test setAll
 		setAll(c, 7);
-		trace("setAll c[2]=" + c[2]); // 7
+		Sys.println("setAll c[2]=" + c[2]); // 7
 	}
 }

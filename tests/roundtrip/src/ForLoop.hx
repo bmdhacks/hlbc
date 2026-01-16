@@ -5,7 +5,7 @@ class ForLoop {
         for (i in 0...5) {
             sum += i;
         }
-        trace("sum=" + sum);  // 0+1+2+3+4 = 10
+        Sys.println("sum=" + sum);  // 0+1+2+3+4 = 10
 
         // For loop over array
         var arr = [10, 20, 30];
@@ -13,7 +13,7 @@ class ForLoop {
         for (x in arr) {
             total += x;
         }
-        trace("total=" + total);  // 60
+        Sys.println("total=" + total);  // 60
 
         // Nested for loops
         var product = 0;
@@ -22,6 +22,6 @@ class ForLoop {
                 product += i * j;
             }
         }
-        trace("product=" + product);  // 3
+        Sys.println("product=" + product);  // 3
     }
 }

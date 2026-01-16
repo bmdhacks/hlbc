@@ -25,12 +25,12 @@ class StaticInline {
     }
 
     public static function main() {
-        trace("compute(3)=" + compute(3));
-        trace("adjusted(1.5)=" + adjusted(1.5));
-        trace("named(foo)=" + named("foo"));
+        Sys.println("compute(3)=" + compute(3));
+        Sys.println("adjusted(1.5)=" + adjusted(1.5));
+        Sys.println("named(foo)=" + named("foo"));
 
         // Direct use of inline constants
-        trace("ENABLED=" + ENABLED);
-        trace("MULTIPLIER=" + MULTIPLIER);
+        Sys.println("ENABLED=" + ENABLED);
+        Sys.println("MULTIPLIER=" + MULTIPLIER);
     }
 }

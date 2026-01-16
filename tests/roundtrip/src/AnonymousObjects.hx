@@ -12,7 +12,7 @@ class AnonymousObjects {
 	static function main() {
 		var p1 = getPoint();
 		var p2 = {x: 13, y: 24};
-		trace("p1=" + p1.x + "," + p1.y);
-		trace("dist=" + distance(p1, p2));
+		Sys.println("p1=" + p1.x + "," + p1.y);
+		Sys.println("dist=" + distance(p1, p2));
 	}
 }

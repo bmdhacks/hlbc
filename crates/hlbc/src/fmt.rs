@@ -375,10 +375,21 @@ impl BytecodeFmt for EnhancedFmt {
         proto_idx: RefField,
         parent: &Type,
     ) -> Result {
-        // For CallMethod, proto_idx is a direct array index into the proto[] array
-        if let Some(obj) = parent.get_type_obj() {
-            if let Some(proto) = obj.protos.get(proto_idx.0) {
-                return self.fmt_refstring(f, ctx, proto.name);
+        // CallMethod's field parameter is a pindex (vtable index), not array index.
+        // Search for matching pindex and walk inheritance chain via super_.
+        let mut current_type = Some(parent);
+        while let Some(ty) = current_type {
+            if let Some(obj) = ty.get_type_obj() {
+                // Search this type's protos for matching pindex
+                for proto in &obj.protos {
+                    if proto.pindex >= 0 && proto.pindex as usize == proto_idx.0 {
+                        return self.fmt_refstring(f, ctx, proto.name);
+                    }
+                }
+                // Not found, try parent class
+                current_type = obj.super_.map(|r| &ctx[r]);
+            } else {
+                break;
             }
         }
         // For Virtual types, use field lookup (virtual method calls use field indices)

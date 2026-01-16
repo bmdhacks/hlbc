@@ -7,10 +7,10 @@ class Arithmetic {
         var prod = a * b;
         var quot = a / b;
         var mod = a % b;
-        trace("sum=" + sum);
-        trace("diff=" + diff);
-        trace("prod=" + prod);
-        trace("quot=" + quot);
-        trace("mod=" + mod);
+        Sys.println("sum=" + sum);
+        Sys.println("diff=" + diff);
+        Sys.println("prod=" + prod);
+        Sys.println("quot=" + quot);
+        Sys.println("mod=" + mod);
     }
 }

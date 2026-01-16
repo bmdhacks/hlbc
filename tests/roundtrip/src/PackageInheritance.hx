@@ -18,7 +18,7 @@ class PackageInheritance extends BaseClass {
 
     public static function main() {
         var obj = new PackageInheritance(42, "extras");
-        trace(obj.describe());
-        trace("value=" + obj.getValue());
+        Sys.println(obj.describe());
+        Sys.println("value=" + obj.getValue());
     }
 }

@@ -33,21 +33,21 @@ class TernaryOps {
     }
 
     static function main() {
-        trace("sign(-5)=" + sign(-5));
-        trace("sign(0)=" + sign(0));
-        trace("sign(3)=" + sign(3));
+        Sys.println("sign(-5)=" + sign(-5));
+        Sys.println("sign(0)=" + sign(0));
+        Sys.println("sign(3)=" + sign(3));
 
-        trace("abs(-7)=" + abs(-7));
-        trace("abs(4)=" + abs(4));
+        Sys.println("abs(-7)=" + abs(-7));
+        Sys.println("abs(4)=" + abs(4));
 
-        trace("max(3,8)=" + max(3, 8));
-        trace("min(3,8)=" + min(3, 8));
+        Sys.println("max(3,8)=" + max(3, 8));
+        Sys.println("min(3,8)=" + min(3, 8));
 
-        trace("clamp(5,0,10)=" + clamp(5, 0, 10));
-        trace("clamp(-3,0,10)=" + clamp(-3, 0, 10));
-        trace("clamp(15,0,10)=" + clamp(15, 0, 10));
+        Sys.println("clamp(5,0,10)=" + clamp(5, 0, 10));
+        Sys.println("clamp(-3,0,10)=" + clamp(-3, 0, 10));
+        Sys.println("clamp(15,0,10)=" + clamp(15, 0, 10));
 
-        trace("describe(-1)=" + describe(-1));
-        trace("boolToInt(true)=" + boolToInt(true));
+        Sys.println("describe(-1)=" + describe(-1));
+        Sys.println("boolToInt(true)=" + boolToInt(true));
     }
 }

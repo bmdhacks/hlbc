@@ -5,29 +5,29 @@ class OperatorPrecedence {
 		var b = 3.0;
 		var c = 4.0;
 		var result1 = 1 / (a * b - c);
-		trace("div=" + result1);
+		Sys.println("div=" + result1);
 
 		// Bitwise AND with comparison (found in h2d/Bitmap.hx:19)
 		var flags = 17;
 		var hasBit = (flags & 16) != 0;
-		trace("bit=" + hasBit);
+		Sys.println("bit=" + hasBit);
 
 		// Shift and mask (found in h3d/Engine.hx:659)
 		var color = 0xFF8040;
 		var r = (color >> 16) & 255;
 		var g = (color >> 8) & 255;
 		var b = color & 255;
-		trace("rgb=" + r + "," + g + "," + b);
+		Sys.println("rgb=" + r + "," + g + "," + b);
 
 		// Compound precedence
 		var x = 5;
 		var y = 3;
 		var z = 2;
 		var compound = x + y * z;
-		trace("compound=" + compound);
+		Sys.println("compound=" + compound);
 
 		// Nested parentheses
 		var nested = (x + y) * (z + 1);
-		trace("nested=" + nested);
+		Sys.println("nested=" + nested);
 	}
 }

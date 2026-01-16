@@ -45,8 +45,8 @@ class WhileContinue {
 	}
 
 	static function main() {
-		trace("skipEvens=" + skipEvens());
-		trace("breakEarly=" + breakEarly());
-		trace("nestedContinue=" + nestedContinue());
+		Sys.println("skipEvens=" + skipEvens());
+		Sys.println("breakEarly=" + breakEarly());
+		Sys.println("nestedContinue=" + nestedContinue());
 	}
 }

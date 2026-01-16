@@ -29,7 +29,7 @@ class InterfaceTest {
 
 	static function main() {
 		var doc = new Document("Hello World");
-		trace("print=" + acceptPrintable(doc));
-		trace("count=" + doc.count());
+		Sys.println("print=" + acceptPrintable(doc));
+		Sys.println("count=" + doc.count());
 	}
 }

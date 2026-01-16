@@ -18,18 +18,18 @@ class Closure {
     static function main() {
         // Inline lambda
         var double = function(x:Int):Int { return x * 2; };
-        trace("double(5)=" + double(5));
-        trace("doubled twice=" + applyTwice(double, 3));
+        Sys.println("double(5)=" + double(5));
+        Sys.println("doubled twice=" + applyTwice(double, 3));
 
         // Closure capturing variable
         var add5 = makeAdder(5);
-        trace("add5(10)=" + add5(10));
+        Sys.println("add5(10)=" + add5(10));
 
         var add10 = makeAdder(10);
-        trace("add10(7)=" + add10(7));
+        Sys.println("add10(7)=" + add10(7));
 
         // Another closure
         var mult3 = makeMultiplier(3);
-        trace("mult3(4)=" + mult3(4));
+        Sys.println("mult3(4)=" + mult3(4));
     }
 }

@@ -9,7 +9,7 @@ class Switch {
             case 3: "three";
             default: "other";
         };
-        trace("result=" + result);
+        Sys.println("result=" + result);
 
         // Switch with combined cases
         var y = 5;
@@ -18,7 +18,7 @@ class Switch {
             case 3, 4, 5: "medium";
             default: "large";
         };
-        trace("category=" + category);
+        Sys.println("category=" + category);
 
         // Nested switch
         var a = 1;
@@ -32,6 +32,6 @@ class Switch {
             };
             default: "a=other";
         };
-        trace("nested=" + nested);
+        Sys.println("nested=" + nested);
     }
 }

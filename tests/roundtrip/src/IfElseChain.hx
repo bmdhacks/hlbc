@@ -18,7 +18,7 @@ class IfElseChain {
             result = "other";
         }
 
-        trace("result=" + result);
+        Sys.println("result=" + result);
     }
 
     // Prevent constant folding by using a function

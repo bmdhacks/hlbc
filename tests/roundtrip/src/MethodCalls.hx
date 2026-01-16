@@ -45,13 +45,13 @@ class MethodCalls {
 
         // Direct method calls
         helper.increment();
-        trace("after inc: " + helper.format("(", ")"));
+        Sys.println("after inc: " + helper.format("(", ")"));
 
         helper.add(10);
-        trace("after add: " + helper.format("(", ")"));
+        Sys.println("after add: " + helper.format("(", ")"));
 
         // Method calls through function
         var result = process(helper);
-        trace("processed: " + result);
+        Sys.println("processed: " + result);
     }
 }

@@ -12,13 +12,13 @@ class IntMapTest {
         for (key in map.keys()) {
             total += key;
         }
-        trace("keys total=" + total);  // 1+2+3 = 6
+        Sys.println("keys total=" + total);  // 1+2+3 = 6
 
         // Also iterate over values
         var values = "";
         for (val in map) {
             values += val + ",";
         }
-        trace("values=" + values);
+        Sys.println("values=" + values);
     }
 }

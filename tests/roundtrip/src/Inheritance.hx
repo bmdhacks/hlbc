@@ -26,9 +26,9 @@ class Derived extends Base {
 class Inheritance {
 	static function main() {
 		var b = new Base("Base");
-		trace(b.greet());
+		Sys.println(b.greet());
 
 		var d = new Derived("Test", "!");
-		trace(d.greet());
+		Sys.println(d.greet());
 	}
 }

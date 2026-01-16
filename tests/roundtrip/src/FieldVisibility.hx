@@ -43,17 +43,17 @@ class FieldVisibility {
 	static function main() {
 		var obj = new FieldVisibility();
 
-		trace("public=" + obj.getPublic());
-		trace("private=" + obj.getPrivate());
-		trace("default=" + obj.getDefault());
+		Sys.println("public=" + obj.getPublic());
+		Sys.println("private=" + obj.getPrivate());
+		Sys.println("default=" + obj.getDefault());
 
 		obj.setAll(100);
-		trace("after setAll public=" + obj.getPublic());
-		trace("after setAll private=" + obj.getPrivate());
-		trace("after setAll default=" + obj.getDefault());
+		Sys.println("after setAll public=" + obj.getPublic());
+		Sys.println("after setAll private=" + obj.getPrivate());
+		Sys.println("after setAll default=" + obj.getDefault());
 
-		trace("staticPublic=" + getStaticPublic());
-		trace("staticPrivate=" + getStaticPrivate());
-		trace("staticDefault=" + staticDefault);
+		Sys.println("staticPublic=" + getStaticPublic());
+		Sys.println("staticPrivate=" + getStaticPrivate());
+		Sys.println("staticDefault=" + staticDefault);
 	}
 }

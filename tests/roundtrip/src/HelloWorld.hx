@@ -1,5 +1,5 @@
 class HelloWorld {
     public static function main() {
-        trace("Hello, World!");
+        Sys.println("Hello, World!");
     }
 }

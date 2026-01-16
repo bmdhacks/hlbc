@@ -17,8 +17,8 @@ class ArrayOperations {
 		// Pop
 		var popped = arr.pop();
 
-		trace("first=" + first + " last=" + last + " popped=" + popped);
-		trace("remaining=" + arr.length);
+		Sys.println("first=" + first + " last=" + last + " popped=" + popped);
+		Sys.println("remaining=" + arr.length);
 
 		// Sum via index
 		var sum = 0;
@@ -27,6 +27,6 @@ class ArrayOperations {
 			sum += arr[i];
 			i++;
 		}
-		trace("sum=" + sum);
+		Sys.println("sum=" + sum);
 	}
 }

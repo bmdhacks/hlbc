@@ -26,11 +26,11 @@ class EnumTest {
     }
 
     static function main() {
-        trace("color1=" + colorName(Color.Red));
-        trace("color2=" + colorName(Color.Green));
-        trace("color3=" + colorName(Color.Blue));
+        Sys.println("color1=" + colorName(Color.Red));
+        Sys.println("color2=" + colorName(Color.Green));
+        Sys.println("color3=" + colorName(Color.Blue));
 
-        trace("none=" + optionValue(Option.None));
-        trace("some=" + optionValue(Option.Some(42)));
+        Sys.println("none=" + optionValue(Option.None));
+        Sys.println("some=" + optionValue(Option.Some(42)));
     }
 }

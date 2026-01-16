@@ -11,7 +11,7 @@ class NestedClass {
 
     public static function main() {
         var nc = new NestedClass();
-        trace("Value: " + nc.getValue());
+        Sys.println("Value: " + nc.getValue());
     }
 }
 

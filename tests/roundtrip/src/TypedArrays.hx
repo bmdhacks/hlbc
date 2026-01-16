@@ -46,16 +46,16 @@ class TypedArrays {
 
     static function main() {
         var ints:Array<Int> = [1, 2, 3, 4, 5];
-        trace("sum=" + sumInts(ints));
+        Sys.println("sum=" + sumInts(ints));
 
         var strs:Array<String> = ["hello", "world", "test"];
-        trace("joined=" + joinStrings(strs, ", "));
+        Sys.println("joined=" + joinStrings(strs, ", "));
 
         var range = makeRange(0, 5);
-        trace("range len=" + range.length);
+        Sys.println("range len=" + range.length);
 
         var mixed:Array<Int> = [-2, -1, 0, 1, 2, 3];
         var pos = filterPositive(mixed);
-        trace("positive count=" + pos.length);
+        Sys.println("positive count=" + pos.length);
     }
 }

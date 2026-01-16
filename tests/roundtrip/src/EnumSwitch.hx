@@ -38,16 +38,16 @@ class EnumSwitch {
 	}
 
 	static function main() {
-		trace("Red=" + colorName(Red));
-		trace("Green=" + colorName(Green));
-		trace("Blue=" + colorName(Blue));
-		trace("Custom=" + colorName(Custom(128, 64, 32)));
+		Sys.println("Red=" + colorName(Red));
+		Sys.println("Green=" + colorName(Green));
+		Sys.println("Blue=" + colorName(Blue));
+		Sys.println("Custom=" + colorName(Custom(128, 64, 32)));
 
-		trace("isWarm Red=" + isWarm(Red));
-		trace("isWarm Blue=" + isWarm(Blue));
-		trace("isWarm Custom=" + isWarm(Custom(255, 0, 0)));
+		Sys.println("isWarm Red=" + isWarm(Red));
+		Sys.println("isWarm Blue=" + isWarm(Blue));
+		Sys.println("isWarm Custom=" + isWarm(Custom(255, 0, 0)));
 
 		var rgb = toRgb(Green);
-		trace("toRgb Green=" + rgb[0] + "," + rgb[1] + "," + rgb[2]);
+		Sys.println("toRgb Green=" + rgb[0] + "," + rgb[1] + "," + rgb[2]);
 	}
 }

@@ -4629,33 +4629,30 @@ impl<'a> Structurer<'a> {
         format!("__field_{}", field.0).into()
     }
 
-    /// Get method name from a proto array index.
-    /// For CallMethod, 'field' is a direct index into the proto[] array.
+    /// Get method name from a pindex (vtable index).
+    /// For CallMethod, 'field' is a pindex, not a direct array index into protos.
     fn get_proto_name(&self, obj_reg: Reg, proto_idx: hlbc::types::RefField) -> Str {
         let reg_idx = obj_reg.0 as usize;
         if reg_idx < self.func.regs.len() {
             let type_ref = self.func.regs[reg_idx];
+
+            // For Obj types, use TypeRef::method() to resolve by pindex with inheritance
+            if let Some(proto) = type_ref.method(proto_idx.0, self.code) {
+                if let Some(name) = self.code.strings.get(proto.name.0) {
+                    return name.clone();
+                }
+            }
+
+            // For Virtual types, proto_idx is an index into fields (not pindex)
             if let Some(ty) = self.code.types.get(type_ref.0) {
-                match ty {
-                    hlbc::types::Type::Obj(obj) => {
-                        // Direct array index into protos
-                        if let Some(proto) = obj.protos.get(proto_idx.0) {
-                            if let Some(name) = self.code.strings.get(proto.name.0) {
+                if let hlbc::types::Type::Virtual { fields } = ty {
+                    if let Some(f) = fields.get(proto_idx.0) {
+                        if let Some(name) = self.code.strings.get(f.name.0) {
+                            if !name.is_empty() {
                                 return name.clone();
                             }
                         }
                     }
-                    hlbc::types::Type::Virtual { fields } => {
-                        // For Virtual types, proto_idx is an index into fields
-                        if let Some(f) = fields.get(proto_idx.0) {
-                            if let Some(name) = self.code.strings.get(f.name.0) {
-                                if !name.is_empty() {
-                                    return name.clone();
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
                 }
             }
         }

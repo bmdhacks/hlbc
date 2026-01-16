@@ -4,7 +4,7 @@ class SimpleArithmetic {
         var b = 3;
         var sum = a + b;
         var diff = a - b;
-        trace(sum);
-        trace(diff);
+        Sys.println(sum);
+        Sys.println(diff);
     }
 }

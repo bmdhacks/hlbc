@@ -19,11 +19,11 @@ class SimpleClass {
 
     static function main() {
         var obj = new SimpleClass(10);
-        trace("initial=" + obj.getValue());
+        Sys.println("initial=" + obj.getValue());
 
         obj.setValue(25);
-        trace("after set=" + obj.getValue());
+        Sys.println("after set=" + obj.getValue());
 
-        trace("doubled=" + obj.doubleValue());
+        Sys.println("doubled=" + obj.doubleValue());
     }
 }

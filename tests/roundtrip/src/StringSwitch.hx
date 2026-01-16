@@ -4,10 +4,10 @@ class StringSwitch {
         var result2 = describe("banana");
         var result3 = describe("cherry");
         var result4 = describe("unknown");
-        trace('apple=' + result1);
-        trace('banana=' + result2);
-        trace('cherry=' + result3);
-        trace('unknown=' + result4);
+        Sys.println('apple=' + result1);
+        Sys.println('banana=' + result2);
+        Sys.println('cherry=' + result3);
+        Sys.println('unknown=' + result4);
     }
 
     public static function describe(fruit:String):String {

@@ -27,6 +27,6 @@ class PropertyAccess {
 		obj.value = 5;
 		var v = obj.value;
 		var v2 = obj.value;
-		trace("value=" + v + " reads=" + obj.readCount);
+		Sys.println("value=" + v + " reads=" + obj.readCount);
 	}
 }

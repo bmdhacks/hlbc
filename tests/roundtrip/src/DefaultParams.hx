@@ -11,12 +11,12 @@ class DefaultParams {
 	}
 
 	static function main() {
-		trace(greet());
-		trace(greet("Alice"));
-		trace(greet("Bob", true));
+		Sys.println(greet());
+		Sys.println(greet("Alice"));
+		Sys.println(greet("Bob", true));
 
-		trace("calc1=" + calculate(1));
-		trace("calc2=" + calculate(1, 2));
-		trace("calc3=" + calculate(1, 2, 3));
+		Sys.println("calc1=" + calculate(1));
+		Sys.println("calc2=" + calculate(1, 2));
+		Sys.println("calc3=" + calculate(1, 2, 3));
 	}
 }

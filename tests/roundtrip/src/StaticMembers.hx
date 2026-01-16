@@ -23,8 +23,8 @@ class StaticMembers {
 		var a = new Counter();
 		var b = new Counter();
 		var c = new Counter();
-		trace("instances=" + Counter.instanceCount);
-		trace("total=" + Counter.getTotal());
-		trace("ids=" + a.getId() + "," + b.getId() + "," + c.getId());
+		Sys.println("instances=" + Counter.instanceCount);
+		Sys.println("total=" + Counter.getTotal());
+		Sys.println("ids=" + a.getId() + "," + b.getId() + "," + c.getId());
 	}
 }

@@ -6,11 +6,11 @@ class Loop {
             sum = sum + i;
             i = i + 1;
         }
-        trace("sum=" + sum);
+        Sys.println("sum=" + sum);
 
         var count = 0;
         while (count < 3) {
-            trace("count=" + count);
+            Sys.println("count=" + count);
             count = count + 1;
         }
     }

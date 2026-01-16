@@ -47,20 +47,20 @@ class ConstructorArgs {
 		var b = new Vec2(3.0, 4.0);
 
 		var sum = add(a, b);
-		trace("add=" + sum.toString());
+		Sys.println("add=" + sum.toString());
 
 		var scaled = scale(a, 2.0);
-		trace("scale=" + scaled.toString());
+		Sys.println("scale=" + scaled.toString());
 
-		trace("dot=" + dot(a, b));
+		Sys.println("dot=" + dot(a, b));
 
 		var perp = perpendicular(a);
-		trace("perp=" + perp.toString());
+		Sys.println("perp=" + perp.toString());
 
 		var mid = lerp(a, b, 0.5);
-		trace("lerp=" + mid.toString());
+		Sys.println("lerp=" + mid.toString());
 
 		var unit = fromAngle(0.0);
-		trace("fromAngle x=" + unit.x);
+		Sys.println("fromAngle x=" + unit.x);
 	}
 }
