@@ -100,9 +100,10 @@ pub struct Structurer<'a> {
     needs_dynamic_type: HashSet<Str>,
     /// Hoisted vars -> their types (for type hints in declarations)
     hoisted_var_types: HashMap<Str, RefType>,
-    /// Array bytes tracking: maps bytes register -> array register
+    /// Array bytes tracking: maps bytes register -> array expression
     /// Used to reconstruct arr[i] from bytes[shifted_i] pattern
-    array_bytes_source: HashMap<Reg, Reg>,
+    /// We store the Expr (not Reg) to capture the correct SSA version at field access time
+    array_bytes_source: HashMap<Reg, Expr>,
     /// Shifted index tracking: maps shifted reg -> (original index expression, shift amount)
     /// Used to reverse index * 4 back to original index for array access
     /// We store the Expr (not Reg) to capture the correct SSA version at shift time
@@ -2750,10 +2751,32 @@ impl<'a> Structurer<'a> {
 
         let op = &self.func.ops[op_idx];
 
+        // Check if this is a call opcode - calls need special handling for inlining
+        let is_call = matches!(
+            op,
+            Opcode::Call0 { .. }
+            | Opcode::Call1 { .. }
+            | Opcode::Call2 { .. }
+            | Opcode::Call3 { .. }
+            | Opcode::Call4 { .. }
+            | Opcode::CallN { .. }
+            | Opcode::CallMethod { .. }
+            | Opcode::CallThis { .. }
+            | Opcode::CallClosure { .. }
+        );
+
         // Invalidate any pending inline expressions that conflict with this opcode
         // (e.g., if this opcode writes to a field that a pending inline reads from)
         // These must be emitted as statements since we suppressed their definitions.
-        let mut stmts = self.invalidate_conflicting_inlines(op);
+        //
+        // IMPORTANT: For calls, we defer invalidation until AFTER building arguments.
+        // This is because call arguments are evaluated BEFORE the call executes,
+        // so pending inlines used as arguments are safe to inline.
+        let mut stmts = if is_call {
+            Vec::new() // Defer invalidation for calls
+        } else {
+            self.invalidate_conflicting_inlines(op)
+        };
 
         // Set SSA context for this opcode - enables SSA-versioned naming
         if let Some((ssa_dst, ssa_uses)) = self.ssa.get_instr_for_op(op_idx) {
@@ -2931,8 +2954,10 @@ impl<'a> Structurer<'a> {
                 // Instead of emitting (which would fail in Haxe), track the source
                 // and reconstruct proper array access in GetMem/SetMem
                 if field_name == "bytes" && self.is_array_type(*obj) {
-                    // Track: bytes register came from this array register
-                    self.array_bytes_source.insert(*dst, *obj);
+                    // Track: bytes register came from this array expression
+                    // We store the Expr to capture the correct SSA version now
+                    let array_expr = self.reg_to_expr(*obj);
+                    self.array_bytes_source.insert(*dst, array_expr);
                     // Don't emit any statement - the access will be reconstructed later
                     return stmts;
                 }
@@ -2940,8 +2965,10 @@ impl<'a> Structurer<'a> {
                 // Check if this is a .array access on ArrayObj/ArrayDyn
                 // This is internal structure access - just pass through the array itself
                 if field_name == "array" && self.is_array_type(*obj) {
-                    // Track: dst register is same as obj (the array itself)
-                    self.array_bytes_source.insert(*dst, *obj);
+                    // Track: dst register maps to the array expression
+                    // We store the Expr to capture the correct SSA version now
+                    let array_expr = self.reg_to_expr(*obj);
+                    self.array_bytes_source.insert(*dst, array_expr);
                     return stmts;
                 }
 
@@ -3220,13 +3247,16 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::GetGlobal { dst, global } => {
-                let var = self.reg_to_expr_dst(*dst);
                 // Check if this is a string constant global
                 if let Some(string_ref) = self.get_global_string_value(*global) {
-                    Some(self.make_assign(var, Expr::Constant(Constant::String(string_ref))))
+                    let expr = Expr::Constant(Constant::String(string_ref));
+                    self.try_inline_or_assign(*dst, expr)
                 } else {
                     let global_name = self.get_global_name(*global);
-                    Some(self.make_assign(var, Expr::Ident(global_name)))
+                    let expr = Expr::Ident(global_name);
+                    // Use try_inline_or_assign to allow inlining of global references
+                    // This is important for static method calls: haxe.Log.trace(...)
+                    self.try_inline_or_assign(*dst, expr)
                 }
             }
 
@@ -3268,9 +3298,9 @@ impl<'a> Structurer<'a> {
                 }
             }
 
-            Opcode::NullCheck { reg } => {
-                let _var = self.reg_to_expr(*reg);
-                Some(Statement::Comment(format!("nullcheck {}", self.reg_name(*reg))))
+            Opcode::NullCheck { .. } => {
+                // NullCheck is implicit in Haxe field access - skip emitting
+                None
             }
 
             Opcode::ToVirtual { dst, src } => {
@@ -3431,8 +3461,9 @@ impl<'a> Structurer<'a> {
             Opcode::GetArray { dst, array, index } => {
                 let var = self.reg_to_expr_dst(*dst);
                 // Check if array register came from .array field access (ArrayObj internal structure)
-                let arr = if let Some(source_reg) = self.array_bytes_source.get(array).copied() {
-                    self.reg_to_expr(source_reg)
+                // Use the stored expression which has the correct SSA version
+                let arr = if let Some(array_expr) = self.array_bytes_source.get(array).cloned() {
+                    array_expr
                 } else {
                     self.reg_to_expr(*array)
                 };
@@ -3443,8 +3474,9 @@ impl<'a> Structurer<'a> {
 
             Opcode::SetArray { array, index, src } => {
                 // Check if array register came from .array field access (ArrayObj internal structure)
-                let arr = if let Some(source_reg) = self.array_bytes_source.get(array).copied() {
-                    self.reg_to_expr(source_reg)
+                // Use the stored expression which has the correct SSA version
+                let arr = if let Some(array_expr) = self.array_bytes_source.get(array).cloned() {
+                    array_expr
                 } else {
                     self.reg_to_expr(*array)
                 };
@@ -3488,9 +3520,10 @@ impl<'a> Structurer<'a> {
                 let var = self.reg_to_expr_dst(*dst);
 
                 // Determine the target (array or bytes)
-                let target_expr = if let Some(array_reg) = self.array_bytes_source.get(bytes).copied() {
-                    // Bytes came from an array - use the array itself
-                    self.reg_to_expr(array_reg)
+                // Use the stored expression which has the correct SSA version
+                let target_expr = if let Some(array_expr) = self.array_bytes_source.get(bytes).cloned() {
+                    // Bytes came from an array - use the stored array expression
+                    array_expr
                 } else {
                     // Raw bytes access
                     self.reg_to_expr(*bytes)
@@ -3519,9 +3552,9 @@ impl<'a> Structurer<'a> {
                 let value_expr = self.reg_to_expr(*src);
 
                 // Determine the target (array or raw bytes)
-                if let Some(array_reg) = self.array_bytes_source.get(bytes).copied() {
+                // Use the stored expression which has the correct SSA version
+                if let Some(array_expr) = self.array_bytes_source.get(bytes).cloned() {
                     // Bytes came from an array - use array[index] = value syntax
-                    let array_expr = self.reg_to_expr(array_reg);
                     let target = Expr::Array(Box::new(array_expr), Box::new(index_expr));
                     Some(self.make_assign(target, value_expr))
                 } else {
@@ -3828,6 +3861,14 @@ impl<'a> Structurer<'a> {
         if let Some(s) = stmt {
             stmts.push(s);
         }
+
+        // For calls, run deferred invalidation AFTER building the call expression
+        // This allows inline expressions to be consumed as arguments before invalidation
+        if is_call {
+            let mut invalidated = self.invalidate_conflicting_inlines(op);
+            stmts.append(&mut invalidated);
+        }
+
         stmts
     }
 
@@ -4268,8 +4309,9 @@ impl<'a> Structurer<'a> {
             | Opcode::New { .. }
             | Opcode::MakeEnum { .. }
             | Opcode::DynGet { .. }
-            | Opcode::ToVirtual { .. }
-            | Opcode::NullCheck { .. } => MemoryDep::AnyMemory,
+            | Opcode::ToVirtual { .. } => MemoryDep::AnyMemory,
+            // NullCheck doesn't read/write memory, just throws on null
+            Opcode::NullCheck { .. } => MemoryDep::None,
             // Other opcodes - conservative default
             _ => MemoryDep::AnyMemory,
         }
@@ -4677,6 +4719,12 @@ impl<'a> Structurer<'a> {
                     let obj_expr = get_val(*obj, &reg_values);
                     let field_name = self.get_field_name(*obj, *field);
                     reg_values.insert(*dst, Expr::Field(Box::new(obj_expr), field_name));
+                }
+                // Track this.field access
+                Opcode::GetThis { dst, field } => {
+                    let this = Expr::Variable(Reg(0), Some("this".into()));
+                    let field_name = self.get_field_name(Reg(0), *field);
+                    reg_values.insert(*dst, Expr::Field(Box::new(this), field_name));
                 }
                 // Track arithmetic operations
                 Opcode::Add { dst, a, b } => {

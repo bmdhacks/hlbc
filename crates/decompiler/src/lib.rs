@@ -261,9 +261,16 @@ pub fn decompile_code_with_closures(
 
 /// Decompile a function out of context, returning a Method.
 pub fn decompile_function(code: &Bytecode, f: &Function) -> Method {
+    // Detect if this is an instance method by checking if the first parameter
+    // is an object type (which would be `this`)
+    let is_instance_method = f.ty(code).args.first()
+        .and_then(|arg| code.types.get(arg.0))
+        .map(|ty| matches!(ty, hlbc::types::Type::Obj(_) | hlbc::types::Type::Struct(_)))
+        .unwrap_or(false);
+
     Method {
         fun: f.findex,
-        static_: true,
+        static_: !is_instance_method,
         dynamic: false,
         override_: false,
         statements: decompile_code(code, f),
@@ -276,9 +283,16 @@ pub fn decompile_function_with_closures(
     f: &Function,
     closure_analysis: Option<&ClosureAnalysis>,
 ) -> Method {
+    // Detect if this is an instance method by checking if the first parameter
+    // is an object type (which would be `this`)
+    let is_instance_method = f.ty(code).args.first()
+        .and_then(|arg| code.types.get(arg.0))
+        .map(|ty| matches!(ty, hlbc::types::Type::Obj(_) | hlbc::types::Type::Struct(_)))
+        .unwrap_or(false);
+
     Method {
         fun: f.findex,
-        static_: true,
+        static_: !is_instance_method,
         dynamic: false,
         override_: false,
         statements: decompile_code_with_closures(code, f, closure_analysis),

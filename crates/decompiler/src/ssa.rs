@@ -797,7 +797,8 @@ fn get_use_regs(op: &Opcode) -> Vec<Reg> {
         Switch { reg, .. } => vec![*reg],
         Ret { ret } => vec![*ret],
         Throw { exc } | Rethrow { exc } | EndTrap { exc } => vec![*exc],
-        NullCheck { reg } => vec![*reg],
+        // NullCheck is implicit in Haxe - don't count as a use for inlining purposes
+        NullCheck { .. } => vec![],
         Prefetch { value, .. } => vec![*value],
 
         // Misc

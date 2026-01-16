@@ -390,14 +390,60 @@ fn fix_nested_type_name(name: &str) -> Option<String> {
     None
 }
 
+/// Check if a HashLink type is a private nested type that shouldn't be used
+/// in explicit type annotations (rely on type inference instead).
+///
+/// In HashLink bytecode, private nested types are indicated by underscore prefix:
+/// - `hxsl._ShaderList.ShaderIterator` - ShaderIterator is private in ShaderList.hx
+/// - `hxsl._Linker.AllocatedVar` - AllocatedVar is private in Linker.hx
+///
+/// This checks the RAW type name from bytecode (before fix_nested_type_name processing).
+pub fn is_private_nested_type(ty: &Type, ctx: &Bytecode) -> bool {
+    match ty {
+        Type::Obj(obj) | Type::Struct(obj) => {
+            let name = ctx.get(obj.name);
+            // Check for "._" pattern indicating private nested type
+            name.contains("._")
+        }
+        Type::Enum { name, .. } => {
+            let name = ctx.get(*name);
+            name.contains("._")
+        }
+        _ => false,
+    }
+}
+
 /// Simplify a type name when used within a specific class context.
 /// E.g., within "hxsl.Splitter", "hxsl.Splitter.VarProps" becomes "VarProps".
+/// Also handles module-private classes: within "hxsl._Linker.AllocatedVar",
+/// any type like "hxsl.Linker.OtherPrivateClass" becomes "OtherPrivateClass".
 pub fn simplify_type_in_context(type_name: &str, current_class: Option<&str>) -> String {
     if let Some(class_name) = current_class {
-        // If type starts with "CurrentClass.", strip it
-        let prefix = format!("{}.", class_name);
+        // Normalize current_class the same way we normalize type names
+        // (fix underscore-prefixed module containers like hxsl._Linker → hxsl.Linker)
+        let normalized_class = fix_nested_type_name(class_name)
+            .unwrap_or_else(|| class_name.to_string());
+
+        // If type starts with "CurrentClass.", strip it (nested type case)
+        let prefix = format!("{}.", normalized_class);
         if type_name.starts_with(&prefix) {
             return type_name[prefix.len()..].to_string();
+        }
+
+        // For module-private classes: extract the module prefix from current class
+        // E.g., "hxsl.Linker.AllocatedVar" → module prefix is "hxsl.Linker."
+        // Then simplify any type from the same module to just its simple name.
+        if let Some(last_dot) = normalized_class.rfind('.') {
+            let module_prefix = format!("{}.", &normalized_class[..last_dot]);
+            if type_name.starts_with(&module_prefix) {
+                // Extract just the simple type name (after the module prefix)
+                let remainder = &type_name[module_prefix.len()..];
+                // Only simplify if remainder is a simple name (no more dots)
+                // This ensures we don't over-simplify nested types from other modules
+                if !remainder.contains('.') {
+                    return remainder.to_string();
+                }
+            }
         }
     }
     type_name.to_string()
@@ -484,6 +530,12 @@ pub fn to_haxe_type<'a>(ty: &Type, ctx: &'a Bytecode) -> Str {
                     }
                     if KNOWN_TWO_PARAM_GENERICS.iter().any(|g| name_str.as_ref() == *g) {
                         return Str::from(format!("{}<Dynamic, Dynamic>", name_str));
+                    }
+                    // Handle $ prefix for class type holders (e.g., "haxe.$Log" -> "Class<haxe.Log>")
+                    // The $ indicates this is the class object itself, not an instance
+                    if name_str.contains(".$") {
+                        let class_name = name_str.replace(".$", ".");
+                        return Str::from(format!("Class<{}>", class_name));
                     }
                     name_str
                 }
@@ -706,6 +758,21 @@ impl Method {
         let is_constructor = name == "__constructor__";
         // For constructors and instance methods, skip the first param (this)
         let skip_params = if self.static_ && !is_constructor { 0 } else { 1 };
+
+        // Compute return type, but skip annotation for private nested types
+        // (they can't be referenced explicitly - rely on type inference)
+        let ret_type_str = if !fun.ty(ctx).ret.is_void() && !is_constructor {
+            let ret_ty = fun.ret(ctx);
+            // Check raw type for private nested indicator (._) before formatting
+            if is_private_nested_type(ret_ty, ctx) {
+                None // Skip annotation for private nested types
+            } else {
+                Some(to_haxe_type_in_context(ret_ty, ctx, current_class))
+            }
+        } else {
+            None
+        };
+
         fmtools::fmt! { move
             // Function header comment with index
             if opts.show_fun_indices {
@@ -730,7 +797,7 @@ impl Method {
                         format!("{}: {}", arg_name, type_str)
                     }
                 }))}
-            ")" if !fun.ty(ctx).ret.is_void() && !is_constructor { ": "{to_haxe_type_in_context(fun.ret(ctx), ctx, current_class)} } " {"
+            ")" if let Some(ref ret_type) = ret_type_str { ": "{ret_type} } " {"
 
             if self.statements.is_empty() {
                 "}"
