@@ -3232,8 +3232,8 @@ impl<'a> Structurer<'a> {
 
             Opcode::CallThis { dst, field, args } => {
                 let this = Expr::Variable(Reg(0), Some("this".into()));
-                let field_name = self.get_field_name(Reg(0), *field);
-                let method = Expr::Field(Box::new(this), field_name);
+                let method_name = self.get_proto_name(Reg(0), *field);
+                let method = Expr::Field(Box::new(this), method_name);
                 let arg_exprs: Vec<_> = args.iter().map(|r| self.reg_to_expr(*r)).collect();
                 let call = Call { fun: method, args: arg_exprs };
                 Some(self.make_call_stmt(*dst, call))
@@ -3288,10 +3288,16 @@ impl<'a> Structurer<'a> {
                     Some(self.make_assign(var, Expr::Anonymous(type_ref, HashMap::new())))
                 } else {
                     // Look ahead for __constructor__ call to get constructor arguments
-                    let (ctor_args, ctor_op_idx) = self.find_constructor_args(*dst, op_idx);
-                    // Suppress the constructor call opcode since we're inlining it into `new Type(...)`
+                    let (ctor_args, ctor_op_idx, consumed_ops) = self.find_constructor_args(*dst, op_idx);
+                    // Only suppress opcodes if we actually found a constructor call
+                    // Otherwise, consumed_ops may contain unrelated ops that shouldn't be suppressed
                     if let Some(idx) = ctor_op_idx {
+                        // Suppress the constructor call opcode
                         self.suppressed_ops.insert(idx);
+                        // Suppress opcodes that contributed to constructor arguments (e.g., Float, Ref)
+                        for consumed_idx in consumed_ops {
+                            self.suppressed_ops.insert(consumed_idx);
+                        }
                     }
                     let ctor = ConstructorCall::new(type_ref, ctor_args);
                     Some(self.make_assign(var, Expr::Constructor(ctor)))
@@ -4667,7 +4673,7 @@ impl<'a> Structurer<'a> {
     ///   Call2 __constructor__(reg0, reg1)
     /// We need to combine these into: new Type("Hello World")
     /// Returns (constructor_args, constructor_call_opcode_index)
-    fn find_constructor_args(&self, new_dst: Reg, new_op_idx: usize) -> (Vec<Expr>, Option<usize>) {
+    fn find_constructor_args(&self, new_dst: Reg, new_op_idx: usize) -> (Vec<Expr>, Option<usize>, Vec<usize>) {
         // Search forward within the same basic block for a constructor call
         let block = self.cfg.op_to_block.get(&new_op_idx);
         let search_end = block
@@ -4680,6 +4686,9 @@ impl<'a> Structurer<'a> {
         // Track intermediate New opcodes (for nested constructors like `new Point(new Point(1,2).x, ...)`)
         // Maps register -> type reference from the New opcode
         let mut pending_new: HashMap<Reg, RefType> = HashMap::new();
+
+        // Track which opcodes contribute to constructor arguments (to suppress them)
+        let mut consumed_ops: Vec<usize> = Vec::new();
 
         for idx in (new_op_idx + 1)..=search_end {
             // Search within the same basic block for constructor call
@@ -4695,68 +4704,89 @@ impl<'a> Structurer<'a> {
             };
 
             // Track constant/global/computed assignments
+            // Also mark opcodes as consumed so they can be suppressed
             match op {
                 Opcode::String { dst, ptr } => {
                     reg_values.insert(*dst, Expr::Constant(Constant::String(*ptr)));
+                    consumed_ops.push(idx);
                 }
                 Opcode::Int { dst, ptr } => {
                     reg_values.insert(*dst, Expr::Constant(Constant::Int(*ptr)));
+                    consumed_ops.push(idx);
                 }
                 Opcode::Float { dst, ptr } => {
                     reg_values.insert(*dst, Expr::Constant(Constant::Float(*ptr)));
+                    consumed_ops.push(idx);
                 }
                 Opcode::Bool { dst, value } => {
                     reg_values.insert(*dst, Expr::Constant(Constant::Bool(*value)));
+                    consumed_ops.push(idx);
                 }
                 Opcode::Null { dst } => {
                     reg_values.insert(*dst, Expr::Constant(Constant::Null));
+                    consumed_ops.push(idx);
                 }
                 // Track field access
                 Opcode::Field { dst, obj, field } => {
                     let obj_expr = get_val(*obj, &reg_values);
                     let field_name = self.get_field_name(*obj, *field);
                     reg_values.insert(*dst, Expr::Field(Box::new(obj_expr), field_name));
+                    consumed_ops.push(idx);
                 }
                 // Track this.field access
                 Opcode::GetThis { dst, field } => {
                     let this = Expr::Variable(Reg(0), Some("this".into()));
                     let field_name = self.get_field_name(Reg(0), *field);
                     reg_values.insert(*dst, Expr::Field(Box::new(this), field_name));
+                    consumed_ops.push(idx);
                 }
                 // Track arithmetic operations
                 Opcode::Add { dst, a, b } => {
                     let a_expr = get_val(*a, &reg_values);
                     let b_expr = get_val(*b, &reg_values);
                     reg_values.insert(*dst, Expr::Op(Operation::Add(Box::new(a_expr), Box::new(b_expr))));
+                    consumed_ops.push(idx);
                 }
                 Opcode::Sub { dst, a, b } => {
                     let a_expr = get_val(*a, &reg_values);
                     let b_expr = get_val(*b, &reg_values);
                     reg_values.insert(*dst, Expr::Op(Operation::Sub(Box::new(a_expr), Box::new(b_expr))));
+                    consumed_ops.push(idx);
                 }
                 Opcode::Mul { dst, a, b } => {
                     let a_expr = get_val(*a, &reg_values);
                     let b_expr = get_val(*b, &reg_values);
                     reg_values.insert(*dst, Expr::Op(Operation::Mul(Box::new(a_expr), Box::new(b_expr))));
+                    consumed_ops.push(idx);
                 }
                 Opcode::SDiv { dst, a, b } | Opcode::UDiv { dst, a, b } => {
                     let a_expr = get_val(*a, &reg_values);
                     let b_expr = get_val(*b, &reg_values);
                     reg_values.insert(*dst, Expr::Op(Operation::Div(Box::new(a_expr), Box::new(b_expr))));
+                    consumed_ops.push(idx);
                 }
                 Opcode::Neg { dst, src } => {
                     let src_expr = get_val(*src, &reg_values);
                     reg_values.insert(*dst, Expr::Op(Operation::Neg(Box::new(src_expr))));
+                    consumed_ops.push(idx);
                 }
                 // Track moves
                 Opcode::Mov { dst, src } => {
                     let src_expr = get_val(*src, &reg_values);
                     reg_values.insert(*dst, src_expr);
+                    consumed_ops.push(idx);
+                }
+                // Track refs - pass through the underlying value
+                Opcode::Ref { dst, src } => {
+                    let src_expr = get_val(*src, &reg_values);
+                    reg_values.insert(*dst, src_expr);
+                    consumed_ops.push(idx);
                 }
                 // Track casts
                 Opcode::ToSFloat { dst, src } | Opcode::ToUFloat { dst, src } => {
                     let src_expr = get_val(*src, &reg_values);
                     reg_values.insert(*dst, Expr::Cast(Box::new(src_expr), "Float".into()));
+                    consumed_ops.push(idx);
                 }
                 Opcode::ToInt { dst, src } => {
                     let src_expr = get_val(*src, &reg_values);
@@ -4765,16 +4795,22 @@ impl<'a> Structurer<'a> {
                         args: vec![src_expr],
                     }));
                     reg_values.insert(*dst, call);
+                    consumed_ops.push(idx);
                 }
                 // Track function calls (for things like Math.cos, Math.sin, computeX(), etc.)
+                // NOTE: We track calls into reg_values for value propagation, but do NOT
+                // add them to consumed_ops because calls have side effects and must still
+                // emit their statements. The constructor arg will reference the result variable.
                 Opcode::Call0 { dst, fun } => {
                     let call = Expr::Call(Box::new(crate::ast::Call::new_fun(*fun, vec![])));
                     reg_values.insert(*dst, call);
+                    // Don't suppress - calls have side effects
                 }
                 Opcode::Call1 { dst, fun, arg0 } => {
                     let arg = get_val(*arg0, &reg_values);
                     let call = Expr::Call(Box::new(crate::ast::Call::new_fun(*fun, vec![arg])));
                     reg_values.insert(*dst, call);
+                    // Don't suppress - calls have side effects
                 }
                 // Track Call2 but skip if it's the constructor call we're looking for
                 Opcode::Call2 { dst, fun, arg0, arg1 } if *arg0 != new_dst => {
@@ -4782,6 +4818,7 @@ impl<'a> Structurer<'a> {
                     let a1 = get_val(*arg1, &reg_values);
                     let call = Expr::Call(Box::new(crate::ast::Call::new_fun(*fun, vec![a0, a1])));
                     reg_values.insert(*dst, call);
+                    // Don't suppress - calls have side effects
                 }
                 // Track Call3 but skip if it's the constructor call
                 Opcode::Call3 { dst, fun, arg0, arg1, arg2 } if *arg0 != new_dst => {
@@ -4790,6 +4827,7 @@ impl<'a> Structurer<'a> {
                     let a2 = get_val(*arg2, &reg_values);
                     let call = Expr::Call(Box::new(crate::ast::Call::new_fun(*fun, vec![a0, a1, a2])));
                     reg_values.insert(*dst, call);
+                    // Don't suppress - calls have side effects
                 }
                 // Track Call4 but skip if it's the constructor call
                 Opcode::Call4 { dst, fun, arg0, arg1, arg2, arg3 } if *arg0 != new_dst => {
@@ -4799,21 +4837,27 @@ impl<'a> Structurer<'a> {
                     let a3 = get_val(*arg3, &reg_values);
                     let call = Expr::Call(Box::new(crate::ast::Call::new_fun(*fun, vec![a0, a1, a2, a3])));
                     reg_values.insert(*dst, call);
+                    // Don't suppress - calls have side effects
                 }
                 // Track CallN but skip if it's the constructor call
                 Opcode::CallN { dst, fun, args } if args.first() != Some(&new_dst) => {
                     let call_args: Vec<_> = args.iter().map(|r| get_val(*r, &reg_values)).collect();
                     let call = Expr::Call(Box::new(crate::ast::Call::new_fun(*fun, call_args)));
                     reg_values.insert(*dst, call);
+                    // Don't suppress - calls have side effects
                 }
+                // GetGlobal is pure (just reads a global) - safe to suppress
                 Opcode::GetGlobal { dst, global } => {
                     reg_values.insert(*dst, self.global_to_expr(*global));
+                    consumed_ops.push(idx);
                 }
                 // Track intermediate New opcodes (for nested constructors)
+                // New itself is not suppressed - it needs the constructor call tracking
                 Opcode::New { dst } if *dst != new_dst => {
                     // Get type from the register's declared type
                     let type_ref = self.func.regs.get(dst.0 as usize).copied().unwrap_or(RefType(0));
                     pending_new.insert(*dst, type_ref);
+                    // Don't suppress - nested New needs its own constructor handling
                 }
                 _ => {}
             }
@@ -4876,7 +4920,7 @@ impl<'a> Structurer<'a> {
                 // Call2 __constructor__(obj, arg1)
                 Opcode::Call2 { fun, arg0, arg1, .. } if *arg0 == new_dst => {
                     if self.is_constructor_function(*fun) {
-                        return (vec![get_expr(*arg1, &reg_values, self)], Some(idx));
+                        return (vec![get_expr(*arg1, &reg_values, self)], Some(idx), consumed_ops);
                     }
                 }
                 // Call3 __constructor__(obj, arg1, arg2)
@@ -4885,7 +4929,7 @@ impl<'a> Structurer<'a> {
                         return (vec![
                             get_expr(*arg1, &reg_values, self),
                             get_expr(*arg2, &reg_values, self)
-                        ], Some(idx));
+                        ], Some(idx), consumed_ops);
                     }
                 }
                 // Call4 __constructor__(obj, arg1, arg2, arg3)
@@ -4895,7 +4939,7 @@ impl<'a> Structurer<'a> {
                             get_expr(*arg1, &reg_values, self),
                             get_expr(*arg2, &reg_values, self),
                             get_expr(*arg3, &reg_values, self),
-                        ], Some(idx));
+                        ], Some(idx), consumed_ops);
                     }
                 }
                 // CallN __constructor__(obj, args...)
@@ -4903,13 +4947,13 @@ impl<'a> Structurer<'a> {
                     if self.is_constructor_function(*fun) {
                         return (args[1..].iter()
                             .map(|r| get_expr(*r, &reg_values, self))
-                            .collect(), Some(idx));
+                            .collect(), Some(idx), consumed_ops);
                     }
                 }
                 _ => {}
             }
         }
-        (vec![], None) // No constructor call found
+        (vec![], None, consumed_ops) // No constructor call found
     }
 
     /// Check if a function is a __constructor__

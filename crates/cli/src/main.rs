@@ -259,7 +259,6 @@ fn main() -> anyhow::Result<()> {
         println!("Decompilation complete! ({:.2}s)", decompile_time.as_secs_f64());
         println!("  Types: {}", index.types.len());
         println!("  Functions: {}", index.functions.len());
-        println!("  Globals: {}", index.globals.len());
         println!("\nOutput written to: {}", output_dir.display());
         println!("Index file: {}/_index.json", output_dir.display());
 

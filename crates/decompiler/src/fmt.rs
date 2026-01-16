@@ -9,6 +9,40 @@ use hlbc::{Bytecode, Resolve};
 use crate::ast::{Class, ClassField, Confidence, Constant, ConstructorCall, Expr, Method, Operation, Statement};
 use crate::type_mappings::expand_module_path;
 
+/// Top-level standard library classes (from haxe/std/*.hx).
+/// These should always be prefixed with "std." to avoid ambiguity with user types.
+const STDLIB_CLASSES: &[&str] = &[
+    "Any",
+    "Array",
+    "Class",
+    "Date",
+    "DateTools",
+    "Enum",
+    "EnumValue",
+    "EReg",
+    "IntIterator",
+    "Lambda",
+    "List",
+    "Map",
+    "Math",
+    "Reflect",
+    "Std",
+    "StdTypes",
+    "String",
+    "StringBuf",
+    "StringTools",
+    "Sys",
+    "Type",
+    "UInt",
+    "UnicodeString",
+    "Xml",
+];
+
+/// Check if a class name is a standard library class that needs "std." prefix.
+fn needs_std_prefix(class_name: &str) -> bool {
+    STDLIB_CLASSES.contains(&class_name)
+}
+
 /// Escape a string for output as a Haxe string literal.
 /// Handles quotes, backslashes, and control characters.
 fn escape_string(s: &str) -> String {
@@ -537,6 +571,10 @@ pub fn to_haxe_type<'a>(ty: &Type, ctx: &'a Bytecode) -> Str {
                         let class_name = name_str.replace(".$", ".");
                         return Str::from(format!("Class<{}>", class_name));
                     }
+                    // Add std. prefix for stdlib classes to avoid shadowing by user types
+                    if !name_str.contains('.') && needs_std_prefix(name_str.as_ref()) {
+                        return Str::from(format!("std.{}", name_str));
+                    }
                     name_str
                 }
             }
@@ -550,7 +588,12 @@ pub fn to_haxe_type<'a>(ty: &Type, ctx: &'a Bytecode) -> Str {
             if first_char.map(|c| c.is_lowercase() || c == '_').unwrap_or(false) {
                 Str::from_static("Dynamic")
             } else {
-                name_str
+                // Add std. prefix for stdlib classes to avoid shadowing by user types
+                if !name_str.contains('.') && needs_std_prefix(name_str.as_ref()) {
+                    Str::from(format!("std.{}", name_str))
+                } else {
+                    name_str
+                }
             }
         }
         Enum { name, .. } => {
@@ -562,6 +605,10 @@ pub fn to_haxe_type<'a>(ty: &Type, ctx: &'a Bytecode) -> Str {
             // Expand shortened module paths (e.g., haxe.macro.Binop → haxe.macro.Expr.Binop)
             if let Some(expanded) = expand_module_path(name_str.as_ref()) {
                 return Str::from(expanded);
+            }
+            // Add std. prefix for stdlib classes to avoid shadowing by user types
+            if !name_str.contains('.') && needs_std_prefix(name_str.as_ref()) {
+                return Str::from(format!("std.{}", name_str));
             }
             name_str
         }
@@ -1338,11 +1385,21 @@ impl Expr {
                                         let clean_name = parent_name.strip_prefix('$').unwrap_or(&parent_name);
                                         // Check if this is a static method (parent is a static class type)
                                         if parent_name.starts_with('$') {
-                                            {clean_name}"."{name}
+                                            // Add std. prefix for stdlib classes to avoid shadowing
+                                            if needs_std_prefix(clean_name) {
+                                                "std."{clean_name}"."{name}
+                                            } else {
+                                                {clean_name}"."{name}
+                                            }
                                         } else {
                                             // Parent is not a static class type - try debug inference
                                             if let Some(class_name) = infer_class_from_debug(code, func) {
-                                                {class_name}"."{name}
+                                                // Add std. prefix for stdlib classes
+                                                if needs_std_prefix(&class_name) {
+                                                    "std."{class_name}"."{name}
+                                                } else {
+                                                    {class_name}"."{name}
+                                                }
                                             } else {
                                                 {name}
                                             }
@@ -1351,7 +1408,12 @@ impl Expr {
                                 } else {
                                     // Parent ref doesn't resolve to Obj - try debug inference
                                     if let Some(class_name) = infer_class_from_debug(code, func) {
-                                        {class_name}"."{name}
+                                        // Add std. prefix for stdlib classes
+                                        if needs_std_prefix(&class_name) {
+                                            "std."{class_name}"."{name}
+                                        } else {
+                                            {class_name}"."{name}
+                                        }
                                     } else {
                                         {name}
                                     }
@@ -1360,7 +1422,12 @@ impl Expr {
                                 // No parent - try to infer class from debug source file path
                                 // e.g., "haxe/Resource.hx" -> "haxe.Resource"
                                 if let Some(class_name) = infer_class_from_debug(code, func) {
-                                    {class_name}"."{name}
+                                    // Add std. prefix for stdlib classes
+                                    if needs_std_prefix(&class_name) {
+                                        "std."{class_name}"."{name}
+                                    } else {
+                                        {class_name}"."{name}
+                                    }
                                 } else {
                                     {name}
                                 }
