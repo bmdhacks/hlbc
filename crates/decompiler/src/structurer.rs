@@ -717,6 +717,15 @@ impl<'a> Structurer<'a> {
         }
     }
 
+    /// Get the fully qualified class name of this function's containing class, if any.
+    fn get_current_class_name(&self) -> Option<Str> {
+        self.func.parent.map(|parent_ref| {
+            self.code[parent_ref].get_type_obj()
+                .map(|obj| obj.name(self.code))
+                .unwrap_or_else(|| Str::from(""))
+        })
+    }
+
     /// Structure the entire function into statements
     pub fn structure(&mut self) -> Vec<Statement> {
         // Pre-process: detect patterns that should be suppressed
@@ -734,6 +743,8 @@ impl<'a> Structurer<'a> {
 
         // Prepend hoisted variable declarations (for vars first assigned inside scopes)
         let mut result = Vec::new();
+        let current_class = self.get_current_class_name();
+        let current_class_str = current_class.as_ref().map(|s| s.as_ref());
         for name in &self.hoisted_vars {
             // Add type hint based on:
             // 1. :Dynamic for vars that will hold empty anonymous objects
@@ -743,7 +754,8 @@ impl<'a> Structurer<'a> {
                 Some("Dynamic".into())
             } else if let Some(type_ref) = self.hoisted_var_types.get(name) {
                 let ty = &self.code.types[type_ref.0];
-                let type_str = crate::fmt::to_haxe_type(ty, self.code);
+                // Use context-aware type formatting to simplify nested types
+                let type_str = crate::fmt::to_haxe_type_in_context(ty, self.code, current_class_str);
                 // Don't emit Void type hints - use Dynamic instead
                 // (Void variables are not valid in Haxe)
                 // Also use Dynamic for haxe.Exception since catch blocks

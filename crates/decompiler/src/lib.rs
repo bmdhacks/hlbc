@@ -49,6 +49,8 @@ pub mod closure_analysis;
 pub mod exception_analysis;
 /// Generic type parameter inference
 pub mod generic_inference;
+/// Type path expansions for shortened bytecode type names
+pub mod type_mappings;
 
 // Re-export ClosureAnalysis for convenience
 pub use closure_analysis::ClosureAnalysis;

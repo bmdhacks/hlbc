@@ -7,6 +7,7 @@ use hlbc::Str;
 use hlbc::{Bytecode, Resolve};
 
 use crate::ast::{Class, ClassField, Confidence, Constant, ConstructorCall, Expr, Method, Operation, Statement};
+use crate::type_mappings::expand_module_path;
 
 /// Escape a string for output as a Haxe string literal.
 /// Handles quotes, backslashes, and control characters.
@@ -96,7 +97,14 @@ impl BytecodeFmt for HaxeFmt {
                     "hl.types.ArrayBytes_Float" | "hl.types.ArrayBytes_Single" => write!(f, "Array<Float>"),
                     "hl.types.ArrayObj" => write!(f, "Array<Dynamic>"),
                     "hl.types.ArrayDyn" => write!(f, "Array<Dynamic>"),
-                    _ => write!(f, "{}", name_str),
+                    _ => {
+                        // Fix nested type names with underscore-prefixed module containers
+                        if let Some(fixed) = fix_nested_type_name(name_str.as_ref()) {
+                            write!(f, "{}", fixed)
+                        } else {
+                            write!(f, "{}", name_str)
+                        }
+                    }
                 }
             }
             Type::Ref(reftype) => {
@@ -115,14 +123,28 @@ impl BytecodeFmt for HaxeFmt {
                     write!(f, "{}", name_str)
                 }
             }
-            Type::Enum { name, .. } => write!(f, "{}", ctx.get(*name)),
+            Type::Enum { name, .. } => {
+                let name_str = ctx.get(*name);
+                if let Some(fixed) = fix_nested_type_name(name_str.as_ref()) {
+                    write!(f, "{}", fixed)
+                } else {
+                    write!(f, "{}", name_str)
+                }
+            }
             Type::Null(reftype) => {
                 write!(f, "Null<")?;
                 self.fmt_reftype(f, ctx, *reftype)?;
                 write!(f, ">")
             }
             Type::Method(fun) => self.fmt_typefun(f, ctx, fun),
-            Type::Struct(TypeObj { name, .. }) => write!(f, "{}", ctx.get(*name)),
+            Type::Struct(TypeObj { name, .. }) => {
+                let name_str = ctx.get(*name);
+                if let Some(fixed) = fix_nested_type_name(name_str.as_ref()) {
+                    write!(f, "{}", fixed)
+                } else {
+                    write!(f, "{}", name_str)
+                }
+            }
             Type::Packed(reftype) => self.fmt_reftype(f, ctx, *reftype),
             // Simple types
             Type::Void => write!(f, "Void"),
@@ -340,6 +362,57 @@ fn demangle_type_param(param: &str) -> String {
     }
 }
 
+/// Fix nested type names with underscore-prefixed module containers.
+/// E.g., "hxsl._Splitter.VarProps" → "hxsl.Splitter.VarProps"
+/// In Haxe bytecode, nested types are stored under a module type named `_ClassName`,
+/// but in Haxe source you reference them as `ClassName.NestedType`.
+fn fix_nested_type_name(name: &str) -> Option<String> {
+    // Look for "._" pattern indicating a nested type container
+    if let Some(pos) = name.find("._") {
+        // Find the end of the underscore-prefixed segment
+        let after_underscore = pos + 2; // skip "._"
+        if let Some(dot_pos) = name[after_underscore..].find('.') {
+            // We have "pkg._Container.NestedType"
+            // Transform to "pkg.Container.NestedType"
+            let prefix = &name[..pos + 1]; // "pkg."
+            let container = &name[after_underscore..after_underscore + dot_pos]; // "Container"
+            let rest = &name[after_underscore + dot_pos..]; // ".NestedType"
+            return Some(format!("{}{}{}", prefix, container, rest));
+        }
+    }
+    // Also handle top-level underscore prefix: "_Splitter.VarProps" → "Splitter.VarProps"
+    if name.starts_with('_') && name.contains('.') {
+        let dot_pos = name.find('.').unwrap();
+        let container = &name[1..dot_pos]; // Skip leading underscore
+        let rest = &name[dot_pos..];
+        return Some(format!("{}{}", container, rest));
+    }
+    None
+}
+
+/// Simplify a type name when used within a specific class context.
+/// E.g., within "hxsl.Splitter", "hxsl.Splitter.VarProps" becomes "VarProps".
+pub fn simplify_type_in_context(type_name: &str, current_class: Option<&str>) -> String {
+    if let Some(class_name) = current_class {
+        // If type starts with "CurrentClass.", strip it
+        let prefix = format!("{}.", class_name);
+        if type_name.starts_with(&prefix) {
+            return type_name[prefix.len()..].to_string();
+        }
+    }
+    type_name.to_string()
+}
+
+/// Convert a HashLink type to Haxe string, simplifying nested types when within a class context.
+pub fn to_haxe_type_in_context<'a>(ty: &Type, ctx: &'a Bytecode, current_class: Option<&str>) -> Str {
+    let base = to_haxe_type(ty, ctx);
+    if current_class.is_some() {
+        Str::from(simplify_type_in_context(&base, current_class))
+    } else {
+        base
+    }
+}
+
 /// Convert a HashLink type to its Haxe equivalent string representation.
 /// Maps internal HL types to Haxe types (e.g., hl.types.ArrayDyn → Array<Dynamic>)
 pub fn to_haxe_type<'a>(ty: &Type, ctx: &'a Bytecode) -> Str {
@@ -392,6 +465,15 @@ pub fn to_haxe_type<'a>(ty: &Type, ctx: &'a Bytecode) -> Str {
                 "hl.types.ArrayObj" => Str::from_static("Array<Dynamic>"),
                 "hl.types.ArrayDyn" => Str::from_static("Array<Dynamic>"),
                 _ => {
+                    // Fix nested type names with underscore-prefixed module containers
+                    // E.g., "hxsl._Splitter.VarProps" → "hxsl.Splitter.VarProps"
+                    if let Some(fixed) = fix_nested_type_name(name_str.as_ref()) {
+                        return Str::from(fixed);
+                    }
+                    // Expand shortened module paths (e.g., haxe.macro.Binop → haxe.macro.Expr.Binop)
+                    if let Some(expanded) = expand_module_path(name_str.as_ref()) {
+                        return Str::from(expanded);
+                    }
                     // Try to demangle monomorphized generic types (e.g., List_Int → List<Int>)
                     if let Some(demangled) = demangle_generic_name(name_str.as_ref()) {
                         return Str::from(demangled);
@@ -419,7 +501,18 @@ pub fn to_haxe_type<'a>(ty: &Type, ctx: &'a Bytecode) -> Str {
                 name_str
             }
         }
-        Enum { name, .. } => ctx.get(*name),
+        Enum { name, .. } => {
+            let name_str = ctx.get(*name);
+            // Fix nested type names with underscore-prefixed module containers
+            if let Some(fixed) = fix_nested_type_name(name_str.as_ref()) {
+                return Str::from(fixed);
+            }
+            // Expand shortened module paths (e.g., haxe.macro.Binop → haxe.macro.Expr.Binop)
+            if let Some(expanded) = expand_module_path(name_str.as_ref()) {
+                return Str::from(expanded);
+            }
+            name_str
+        }
         Ref(inner) => {
             // hl.Ref<T> is used internally for nullable parameters
             // At Haxe source level, this is Null<T>
@@ -445,8 +538,10 @@ pub struct FieldTypeFormat {
 
 /// Format a field's type, using inferred generic parameters if available.
 /// Returns the type string and an optional comment about the inference.
-pub fn format_field_type(field: &ClassField, ctx: &Bytecode) -> FieldTypeFormat {
+/// If `current_class` is provided, type names starting with that class will be simplified.
+pub fn format_field_type(field: &ClassField, ctx: &Bytecode, current_class: Option<&str>) -> FieldTypeFormat {
     let base_type = to_haxe_type(&ctx[field.ty], ctx);
+    let base_type = simplify_type_in_context(&base_type, current_class);
 
     // If we have inferred generics and this is a known generic type, use them
     if let Some(ref inference) = field.inferred_generics {
@@ -551,8 +646,10 @@ impl Class {
         });
 
         // Precompute field type info (for inference comments)
+        // Pass the current class name so nested types can be simplified
+        let class_name = &self.name;
         let field_types: Vec<FieldTypeFormat> = self.fields.iter()
-            .map(|f| format_field_type(f, ctx))
+            .map(|f| format_field_type(f, ctx, Some(class_name.as_str())))
             .collect();
 
         fmtools::fmt! { move
@@ -588,7 +685,7 @@ impl Class {
             }
             for m in &self.methods {
                 "\n"
-                {m.display(ctx, &new_opts)}
+                {m.display_in_class(ctx, &new_opts, Some(class_name.as_str()))}
             }
             {opts}"}"
         }
@@ -597,6 +694,10 @@ impl Class {
 
 impl Method {
     pub fn display<'a>(&'a self, ctx: &'a Bytecode, opts: &'a FormatOptions) -> impl Display + 'a {
+        self.display_in_class(ctx, opts, None)
+    }
+
+    pub fn display_in_class<'a>(&'a self, ctx: &'a Bytecode, opts: &'a FormatOptions, current_class: Option<&'a str>) -> impl Display + 'a {
         let new_opts = opts.inc_nesting();
         let fun = self.fun.as_fn(ctx).unwrap();
         let fun_idx = self.fun.0;
@@ -620,11 +721,16 @@ impl Method {
                 .map(move |(i, arg)| {
                     // arg_name expects index relative to user params (excluding this)
                     let name_idx = i - skip_params;
-                    fmtools::fmt! {move
-                        {fun.arg_name(ctx, name_idx).unwrap_or(Str::from("_"))}": "{to_haxe_type(&ctx[*arg], ctx)}
+                    let arg_name = fun.arg_name(ctx, name_idx).unwrap_or(Str::from("_"));
+                    let type_str = to_haxe_type_in_context(&ctx[*arg], ctx, current_class);
+                    // Omit ": Dynamic" since that's the default in Haxe
+                    if type_str == "Dynamic" {
+                        arg_name.to_string()
+                    } else {
+                        format!("{}: {}", arg_name, type_str)
                     }
                 }))}
-            ")" if !fun.ty(ctx).ret.is_void() && !is_constructor { ": "{to_haxe_type(fun.ret(ctx), ctx)} } " {"
+            ")" if !fun.ty(ctx).ret.is_void() && !is_constructor { ": "{to_haxe_type_in_context(fun.ret(ctx), ctx, current_class)} } " {"
 
             if self.statements.is_empty() {
                 "}"
@@ -1042,7 +1148,31 @@ impl Expr {
                 }
                 Expr::Constant(c) => {|f| c.fmt_with_opts(f, code, indent.show_string_indices)?;},
                 Expr::Constructor(ConstructorCall { ty, args }) => {
-                    "new "{ty.display::<HaxeFmt>(code)}"("{fmtools::join(", ", args.iter().map(|e| disp!(e)))}")"
+                    // Get the type name
+                    let type_name = to_haxe_type(&code[*ty], code);
+
+                    // Simplify if this is a nested type of the current class
+                    // e.g., "NestedClass.Inner" -> "Inner" when inside NestedClass
+                    let simplified_name = if let Some(parent_ref) = f.parent {
+                        if let Some(parent_obj) = code[parent_ref].get_type_obj() {
+                            let parent_name = parent_obj.name(code);
+                            // Strip $ prefix from static type holders (e.g., "$NestedClass" -> "NestedClass")
+                            let parent_name = parent_name.strip_prefix('$').unwrap_or(&parent_name);
+                            let prefix = format!("{}.", parent_name);
+                            if type_name.starts_with(&prefix) {
+                                // Strip "ParentClass." prefix for nested types
+                                type_name[prefix.len()..].to_string()
+                            } else {
+                                type_name.to_string()
+                            }
+                        } else {
+                            type_name.to_string()
+                        }
+                    } else {
+                        type_name.to_string()
+                    };
+
+                    "new "{simplified_name}"("{fmtools::join(", ", args.iter().map(|e| disp!(e)))}")"
                 }
                 Expr::Closure(f, stmts) => {
                     if let Some(fun) = f.as_fn(code) {
@@ -1086,9 +1216,11 @@ impl Expr {
                 Expr::EnumConstr(ty, constr, args) => {
                     // Emit EnumName.ConstructorName(args) syntax
                     if let Type::Enum { name, constructs, .. } = &code[*ty] {
-                        let enum_name = code.strings.get(name.0)
+                        let raw_enum_name = code.strings.get(name.0)
                             .map(|s| s.as_ref())
                             .unwrap_or("Enum");
+                        // Expand shortened module paths (e.g., haxe.macro.Binop → haxe.macro.Expr.Binop)
+                        let enum_name = expand_module_path(raw_enum_name).unwrap_or(raw_enum_name);
                         if let Some(c) = constructs.get(constr.0) {
                             let construct_name = c.name(code);
                             if args.is_empty() {

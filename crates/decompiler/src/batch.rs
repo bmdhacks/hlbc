@@ -159,11 +159,18 @@ impl<'a> BatchDecompiler<'a> {
         // Create output directory
         fs::create_dir_all(output_dir)?;
 
-        // Collect types to decompile
+        // Build map of nested types (parent_name -> vec of nested types)
+        let nested_type_map = build_nested_type_map(self.code);
+
+        // Collect types to decompile, excluding nested types (they'll be included in their parent)
         let types_to_decompile: Vec<_> = self.code.types.iter().enumerate()
             .filter_map(|(type_idx, ty)| {
                 ty.get_type_obj().and_then(|obj| {
                     let name = obj.name(self.code).to_string();
+                    // Skip nested types - they will be included in their parent class
+                    if parse_nested_type(&name).is_some() {
+                        return None;
+                    }
                     if self.batch_opts.should_include(&name) {
                         Some((type_idx, obj, name))
                     } else {
@@ -197,7 +204,61 @@ impl<'a> BatchDecompiler<'a> {
                 let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
                     let class = decompile_class_with_closures(self.code, *obj, static_inits, Some(closure_analysis));
                     let display = class.display_with_index(self.code, &self.opts, Some(*type_idx));
-                    display.to_string()
+                    let mut content = display.to_string();
+
+                    // Insert any nested types BEFORE the main class (Haxe module-private style)
+                    if let Some(nested_types) = nested_type_map.get(name) {
+                        // Collect all nested class content
+                        let mut nested_content_all = String::new();
+
+                        for (nested_name, nested_idx, nested_obj) in nested_types {
+                            // Skip $-prefixed types (static type holders)
+                            if nested_name.starts_with('$') {
+                                continue;
+                            }
+
+                            // Decompile nested type
+                            let nested_class = decompile_class_with_closures(
+                                self.code, *nested_obj, static_inits, Some(closure_analysis)
+                            );
+                            let nested_display = nested_class.display_with_index(
+                                self.code, &self.opts, Some(*nested_idx)
+                            );
+                            let nested_content = nested_display.to_string();
+
+                            // Strip package declaration from nested class
+                            // (it will have "package _ClassName;" which is invalid)
+                            let nested_content = if let Some(class_start) = nested_content.find("class ") {
+                                &nested_content[class_start..]
+                            } else {
+                                &nested_content
+                            };
+
+                            // Add "private" modifier for module-private class
+                            let nested_content = format!("private {}", nested_content);
+
+                            nested_content_all.push_str(&nested_content);
+                            nested_content_all.push_str("\n");
+                        }
+
+                        // Insert nested classes BEFORE the main class declaration
+                        // Find where the main class starts (after package/imports)
+                        if !nested_content_all.is_empty() {
+                            if let Some(class_pos) = content.find("\nclass ").or_else(|| content.find("class ")) {
+                                // Adjust position to be at start of line
+                                let insert_pos = if content[..class_pos].ends_with('\n') {
+                                    class_pos
+                                } else if let Some(newline_pos) = content[..class_pos].rfind('\n') {
+                                    newline_pos + 1
+                                } else {
+                                    class_pos
+                                };
+                                content.insert_str(insert_pos, &nested_content_all);
+                            }
+                        }
+                    }
+
+                    content
                 }));
 
                 let content = match result {
@@ -487,6 +548,65 @@ fn type_name_to_path(name: &str) -> String {
     // Handle nested types with $ separator
     let clean_name = name.replace('$', "_");
     clean_name.replace('.', "/") + ".hx"
+}
+
+/// Check if a type name represents a nested type (e.g., "_Parent.Nested" or "pkg._Parent.Nested").
+/// Returns Some((parent_name, nested_name)) if it's a nested type, None otherwise.
+fn parse_nested_type(name: &str) -> Option<(String, String)> {
+    // Pattern: something._Parent.Nested or _Parent.Nested
+    // The underscore-prefixed segment is the module container for nested types
+
+    // Find "._" pattern indicating a nested type container
+    if let Some(pos) = name.find("._") {
+        // Find the end of the underscore-prefixed segment
+        let after_underscore = pos + 2; // skip "._"
+        if let Some(dot_pos) = name[after_underscore..].find('.') {
+            // We have "pkg._Container.NestedType"
+            let prefix = &name[..pos]; // "pkg"
+            let container = &name[after_underscore..after_underscore + dot_pos]; // "Container"
+            let nested = &name[after_underscore + dot_pos + 1..]; // "NestedType"
+
+            // Parent is "pkg.Container", nested is "NestedType"
+            let parent = if prefix.is_empty() {
+                container.to_string()
+            } else {
+                format!("{}.{}", prefix, container)
+            };
+            return Some((parent, nested.to_string()));
+        }
+    }
+
+    // Also handle top-level underscore prefix: "_Parent.Nested"
+    if name.starts_with('_') {
+        if let Some(dot_pos) = name.find('.') {
+            let container = &name[1..dot_pos]; // Skip leading underscore
+            let nested = &name[dot_pos + 1..];
+            return Some((container.to_string(), nested.to_string()));
+        }
+    }
+
+    None
+}
+
+/// Build a map from parent type names to their nested types.
+/// Returns a HashMap where keys are parent type names and values are lists of (nested_name, type_index, TypeObj).
+fn build_nested_type_map<'a>(
+    code: &'a Bytecode,
+) -> HashMap<String, Vec<(String, usize, &'a hlbc::types::TypeObj)>> {
+    let mut map: HashMap<String, Vec<_>> = HashMap::new();
+
+    for (type_idx, ty) in code.types.iter().enumerate() {
+        if let Some(obj) = ty.get_type_obj() {
+            let name = obj.name(code).to_string();
+            if let Some((parent_name, nested_name)) = parse_nested_type(&name) {
+                map.entry(parent_name)
+                    .or_default()
+                    .push((nested_name, type_idx, obj));
+            }
+        }
+    }
+
+    map
 }
 
 #[cfg(test)]
