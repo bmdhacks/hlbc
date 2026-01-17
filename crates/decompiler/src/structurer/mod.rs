@@ -1036,17 +1036,7 @@ impl<'a> Structurer<'a> {
                 return (stmts, self.get_unprocessed_continuation(final_merge, stop_at));
             }
 
-            // Compute effective stop point. If merge == then_target, we can't use
-            // merge as the stop because structure_branch would skip the target entirely.
-            // In that case, use the target's successor as the stop point.
-            let effective_stop = if merge == then_target {
-                then_target.and_then(|t| {
-                    let succs = self.cfg.successors(t);
-                    if succs.len() == 1 { Some(succs[0]) } else { None }
-                }).or(stop_at)
-            } else {
-                merge.or(stop_at)
-            };
+            let effective_stop = merge.or(stop_at);
             let then_stmts = self.structure_branch(then_target, effective_stop);
             chain.push((preamble, condition, then_stmts));
 
@@ -1057,16 +1047,7 @@ impl<'a> Structurer<'a> {
                 }
             }
 
-            // Also handle merge == else_target case
-            let else_effective_stop = if merge == else_target {
-                else_target.and_then(|t| {
-                    let succs = self.cfg.successors(t);
-                    if succs.len() == 1 { Some(succs[0]) } else { None }
-                }).or(stop_at)
-            } else {
-                effective_stop
-            };
-            let else_stmts = self.structure_branch(else_target, else_effective_stop);
+            let else_stmts = self.structure_branch(else_target, effective_stop);
             let stmts = self.build_conditional_result(chain, else_stmts, has_preambles);
             return (stmts, self.get_unprocessed_continuation(final_merge, stop_at));
         }
@@ -1321,20 +1302,20 @@ impl<'a> Structurer<'a> {
 
         if a_terminates && !b_succs.contains(&a) {
             // Branch 'a' terminates, branch 'b' doesn't flow into 'a'
-            // The merge point is b's successor (where control continues after b)
-            // If b has a single successor, that's the merge. Otherwise, no merge.
+            // If b is a simple block with one successor, that successor is the true
+            // continuation point. Otherwise, b itself is the continuation (for if-chains
+            // where b is another conditional block).
             if b_succs.len() == 1 {
                 return b_succs.into_iter().next();
             }
-            return None;
+            return Some(b);
         }
         if b_terminates && !a_succs.contains(&b) {
             // Branch 'b' terminates, branch 'a' doesn't flow into 'b'
-            // The merge point is a's successor (where control continues after a)
             if a_succs.len() == 1 {
                 return a_succs.into_iter().next();
             }
-            return None;
+            return Some(a);
         }
 
         None
