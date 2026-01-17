@@ -2,261 +2,17 @@ use hlbc::{Bytecode, Str};
 
 use crate::ast::{add, not, Constant, ConstructorCall, Expr, Operation, Statement, Call};
 
-pub(crate) trait AstVisitor {
-    fn visit_stmt(&mut self, _code: &Bytecode, _stmt: &mut Statement) {}
-    fn visit_expr(&mut self, _code: &Bytecode, _expr: &mut Expr) {}
-}
-
-/// Visit everything depth-first
-#[allow(dead_code)]
-pub(crate) fn visit(
-    code: &Bytecode,
-    stmts: &mut [Statement],
-    visitors: &mut [Box<dyn AstVisitor>],
-) {
-    // Recurse
-    macro_rules! rec {
-        ($stmts:expr) => {
-            visit(code, $stmts, visitors)
-        };
-    }
-    // Visit an expression
-    macro_rules! v {
-        ($e:expr) => {
-            visit_expr(code, $e, visitors)
-        };
-    }
-    for stmt in stmts {
-        // No _ pattern, wouldn't want this match to de-sync when adding new items
-        match stmt {
-            Statement::Assign {
-                assign, variable, ..
-            } => {
-                v!(assign);
-                v!(variable);
-            }
-            Statement::ExprStatement(e) => {
-                v!(e);
-            }
-            Statement::Return(opt) => {
-                if let Some(e) = opt {
-                    v!(e);
-                }
-            }
-            Statement::IfElse { cond, if_, else_ } => {
-                v!(cond);
-                rec!(if_);
-                rec!(else_);
-            }
-            Statement::IfElseChain { branches, else_ } => {
-                for (cond, body) in branches {
-                    v!(cond);
-                    rec!(body);
-                }
-                rec!(else_);
-            }
-            Statement::Switch {
-                arg,
-                default,
-                cases,
-                ..
-            } => {
-                v!(arg);
-                rec!(default);
-                cases.iter_mut().for_each(|(_, case)| rec!(case));
-            }
-            Statement::While { cond, stmts } => {
-                v!(cond);
-                rec!(stmts);
-            }
-            Statement::Break => {}
-            Statement::Continue => {}
-            Statement::Throw(e) => {
-                v!(e);
-            }
-            Statement::TryCatch { try_stmts, catch_stmts, .. } => {
-                rec!(try_stmts);
-                rec!(catch_stmts);
-            }
-            Statement::Comment(_) => {}
-            Statement::Block { stmts } => {
-                rec!(stmts);
-            }
-            Statement::Sequence { stmts } => {
-                rec!(stmts);
-            }
-            Statement::VarDecl { .. } => {}
-        }
-        for visitor in visitors.iter_mut() {
-            visitor.visit_stmt(code, stmt);
-        }
-    }
-}
-
-/// Visit expressions by depth-first recursion into [Expr].
-#[allow(dead_code)]
-pub(crate) fn visit_expr(code: &Bytecode, expr: &mut Expr, visitors: &mut [Box<dyn AstVisitor>]) {
-    // Recurse
-    macro_rules! rec {
-        ($e:expr) => {
-            visit_expr(code, $e, visitors)
-        };
-    }
-    // Visit statements
-    macro_rules! v {
-        ($stmts:expr) => {
-            visit(code, $stmts, visitors)
-        };
-    }
-    // No _ pattern, wouldn't want this match to de-sync when adding new items
-    match expr {
-        Expr::Anonymous(_, fields) => {
-            for e in fields.values_mut() {
-                rec!(e);
-            }
-        }
-        Expr::Array(arr, index) => {
-            rec!(arr);
-            rec!(index);
-        }
-        Expr::ArrayLiteral(elems) => {
-            for e in elems.iter_mut() {
-                rec!(e);
-            }
-        }
-        Expr::Call(call) => {
-            rec!(&mut call.fun);
-            for arg in call.args.iter_mut() {
-                rec!(arg);
-            }
-        }
-        Expr::Constant(_) => {}
-        Expr::Constructor(ConstructorCall { args, .. }) => {
-            for arg in args {
-                rec!(arg);
-            }
-        }
-        // /!\ No recurse in closure, as closure decompilation is already recursive.
-        Expr::Closure(_, _) => {}
-        Expr::EnumConstr(_, _, args) => {
-            for arg in args {
-                rec!(arg);
-            }
-        }
-        Expr::Field(obj, _) => {
-            rec!(obj);
-        }
-        Expr::FunRef(_) => {}
-        Expr::IfElse { cond, if_, else_ } => {
-            rec!(cond);
-            v!(if_);
-            v!(else_);
-        }
-        Expr::Op(op) => match op {
-            Operation::Add(e1, e2) => {
-                rec!(e1);
-                rec!(e2);
-            }
-            Operation::Sub(e1, e2) => {
-                rec!(e1);
-                rec!(e2);
-            }
-            Operation::Mul(e1, e2) => {
-                rec!(e1);
-                rec!(e2);
-            }
-            Operation::Div(e1, e2) => {
-                rec!(e1);
-                rec!(e2);
-            }
-            Operation::Mod(e1, e2) => {
-                rec!(e1);
-                rec!(e2);
-            }
-            Operation::Shl(e1, e2) => {
-                rec!(e1);
-                rec!(e2);
-            }
-            Operation::Shr(e1, e2) => {
-                rec!(e1);
-                rec!(e2);
-            }
-            Operation::And(e1, e2) => {
-                rec!(e1);
-                rec!(e2);
-            }
-            Operation::Or(e1, e2) => {
-                rec!(e1);
-                rec!(e2);
-            }
-            Operation::Xor(e1, e2) => {
-                rec!(e1);
-                rec!(e2);
-            }
-            Operation::Neg(e1) => {
-                rec!(e1);
-            }
-            Operation::Not(e1) => {
-                rec!(e1);
-            }
-            Operation::Incr(e1) => {
-                rec!(e1);
-            }
-            Operation::Decr(e1) => {
-                rec!(e1);
-            }
-            Operation::Eq(e1, e2) => {
-                rec!(e1);
-                rec!(e2);
-            }
-            Operation::NotEq(e1, e2) => {
-                rec!(e1);
-                rec!(e2);
-            }
-            Operation::Gt(e1, e2) => {
-                rec!(e1);
-                rec!(e2);
-            }
-            Operation::Gte(e1, e2) => {
-                rec!(e1);
-                rec!(e2);
-            }
-            Operation::Lt(e1, e2) => {
-                rec!(e1);
-                rec!(e2);
-            }
-            Operation::Lte(e1, e2) => {
-                rec!(e1);
-                rec!(e2);
-            }
-        },
-        Expr::Unknown(_) => {}
-        Expr::Variable(_, _) => {}
-        Expr::Ident(_) => {}
-        Expr::Cast(inner, _) | Expr::TypeAnnotated(inner, _) => {
-            rec!(inner);
-        }
-    }
-    for visitor in visitors.iter_mut() {
-        visitor.visit_expr(code, expr);
-    }
-}
-
-// NOTE: Unused visitor-based transforms (IfExpressions, BoundsCheckSimplify,
-// SwitchExpressions, StringConcat visitor, Itos) were removed. The functionality
-// is either handled in structurer.rs or fmt.rs, or was not needed.
-
 /// Reconstruct array literals from alloc_bytes + SetMem + allocI32 patterns.
 ///
 /// The pattern:
-/// ```
+/// ```text
 /// var bytes = alloc_bytes(N);
 /// bytes[offset] = value1;
 /// ...
 /// var arr = allocI32(bytes, count);
 /// ```
 /// becomes:
-/// ```
+/// ```text
 /// var arr = [value1, value2, ...];
 /// ```
 pub(crate) fn reconstruct_array_literals(code: &Bytecode, stmts: &mut Vec<Statement>) {
@@ -509,6 +265,7 @@ fn is_pure_expr(expr: &Expr) -> bool {
             Operation::Add(a, b) | Operation::Sub(a, b) | Operation::Mul(a, b) |
             Operation::Div(a, b) | Operation::Mod(a, b) | Operation::Shl(a, b) |
             Operation::Shr(a, b) | Operation::And(a, b) | Operation::Or(a, b) |
+            Operation::LogicalAnd(a, b) | Operation::LogicalOr(a, b) |
             Operation::Xor(a, b) | Operation::Eq(a, b) | Operation::NotEq(a, b) |
             Operation::Gt(a, b) | Operation::Gte(a, b) | Operation::Lt(a, b) |
             Operation::Lte(a, b) => is_pure_expr(a) && is_pure_expr(b),
@@ -548,6 +305,7 @@ fn count_uses_in_expr(expr: &Expr, var_name: &str) -> usize {
             Operation::Add(a, b) | Operation::Sub(a, b) | Operation::Mul(a, b) |
             Operation::Div(a, b) | Operation::Mod(a, b) | Operation::Shl(a, b) |
             Operation::Shr(a, b) | Operation::And(a, b) | Operation::Or(a, b) |
+            Operation::LogicalAnd(a, b) | Operation::LogicalOr(a, b) |
             Operation::Xor(a, b) | Operation::Eq(a, b) | Operation::NotEq(a, b) |
             Operation::Gt(a, b) | Operation::Gte(a, b) | Operation::Lt(a, b) |
             Operation::Lte(a, b) => count_uses_in_expr(a, var_name) + count_uses_in_expr(b, var_name),
@@ -696,6 +454,14 @@ fn replace_var_in_expr(expr: &Expr, var_name: &str, replacement: &Expr) -> Expr 
                     Box::new(replace_var_in_expr(b, var_name, replacement)),
                 ),
                 Operation::Or(a, b) => Operation::Or(
+                    Box::new(replace_var_in_expr(a, var_name, replacement)),
+                    Box::new(replace_var_in_expr(b, var_name, replacement)),
+                ),
+                Operation::LogicalAnd(a, b) => Operation::LogicalAnd(
+                    Box::new(replace_var_in_expr(a, var_name, replacement)),
+                    Box::new(replace_var_in_expr(b, var_name, replacement)),
+                ),
+                Operation::LogicalOr(a, b) => Operation::LogicalOr(
                     Box::new(replace_var_in_expr(a, var_name, replacement)),
                     Box::new(replace_var_in_expr(b, var_name, replacement)),
                 ),
@@ -883,17 +649,6 @@ fn is_reassigned_in_stmts(stmts: &[Statement], var_name: &str, skip_idx: usize) 
     false
 }
 
-/// Check if a variable is assigned to in a range of statements (from start_idx+1 to end)
-#[allow(dead_code)]
-fn is_reassigned_in_range(stmts: &[Statement], var_name: &str, start_idx: usize) -> bool {
-    for stmt in stmts.iter().skip(start_idx + 1) {
-        if is_reassigned_in_stmt(stmt, var_name) {
-            return true;
-        }
-    }
-    false
-}
-
 /// Get all variable names referenced in an expression
 fn get_var_refs_in_expr(expr: &Expr, vars: &mut Vec<String>) {
     match expr {
@@ -919,6 +674,7 @@ fn get_var_refs_in_expr(expr: &Expr, vars: &mut Vec<String>) {
             Operation::Add(a, b) | Operation::Sub(a, b) | Operation::Mul(a, b) |
             Operation::Div(a, b) | Operation::Mod(a, b) | Operation::Shl(a, b) |
             Operation::Shr(a, b) | Operation::And(a, b) | Operation::Or(a, b) |
+            Operation::LogicalAnd(a, b) | Operation::LogicalOr(a, b) |
             Operation::Xor(a, b) | Operation::Eq(a, b) | Operation::NotEq(a, b) |
             Operation::Gt(a, b) | Operation::Gte(a, b) | Operation::Lt(a, b) |
             Operation::Lte(a, b) => {
@@ -947,20 +703,6 @@ fn get_var_refs_in_expr(expr: &Expr, vars: &mut Vec<String>) {
         }
         _ => {}
     }
-}
-
-/// Check if any variable in an expression is reassigned in the range of statements after def_idx
-#[allow(dead_code)]
-fn expr_vars_reassigned_after(stmts: &[Statement], expr: &Expr, def_idx: usize) -> bool {
-    let mut vars = Vec::new();
-    get_var_refs_in_expr(expr, &mut vars);
-
-    for var_name in vars {
-        if is_reassigned_in_range(stmts, &var_name, def_idx) {
-            return true;
-        }
-    }
-    false
 }
 
 /// Check if a variable is assigned to in a statement
@@ -1388,6 +1130,7 @@ fn collect_used_vars_in_expr(expr: &Expr, used: &mut std::collections::HashSet<S
                 Operation::Add(l, r) | Operation::Sub(l, r) | Operation::Mul(l, r) |
                 Operation::Div(l, r) | Operation::Mod(l, r) | Operation::Shl(l, r) |
                 Operation::Shr(l, r) | Operation::And(l, r) | Operation::Or(l, r) |
+                Operation::LogicalAnd(l, r) | Operation::LogicalOr(l, r) |
                 Operation::Xor(l, r) | Operation::Eq(l, r) | Operation::NotEq(l, r) |
                 Operation::Gt(l, r) | Operation::Gte(l, r) | Operation::Lt(l, r) |
                 Operation::Lte(l, r) => {
@@ -1669,6 +1412,7 @@ fn collect_var_names_in_expr(expr: &Expr, used: &mut std::collections::HashSet<S
                 Operation::Add(l, r) | Operation::Sub(l, r) | Operation::Mul(l, r) |
                 Operation::Div(l, r) | Operation::Mod(l, r) | Operation::Shl(l, r) |
                 Operation::Shr(l, r) | Operation::And(l, r) | Operation::Or(l, r) |
+                Operation::LogicalAnd(l, r) | Operation::LogicalOr(l, r) |
                 Operation::Xor(l, r) | Operation::Eq(l, r) | Operation::NotEq(l, r) |
                 Operation::Gt(l, r) | Operation::Gte(l, r) | Operation::Lt(l, r) |
                 Operation::Lte(l, r) => {
@@ -1903,6 +1647,10 @@ fn apply_string_concat_stmt(code: &Bytecode, stmt: &mut Statement) {
         Statement::Block { stmts } | Statement::Sequence { stmts } => {
             apply_string_concat(code, stmts);
         }
+        Statement::ForIn { iterable, stmts, .. } => {
+            apply_string_concat_expr(code, iterable);
+            apply_string_concat(code, stmts);
+        }
         Statement::Return(None) | Statement::Break | Statement::Continue
         | Statement::Comment(_) | Statement::VarDecl { .. } => {}
     }
@@ -1941,7 +1689,8 @@ fn apply_string_concat_expr(code: &Bytecode, expr: &mut Expr) {
             match op {
                 Operation::Add(a, b) | Operation::Sub(a, b) | Operation::Mul(a, b)
                 | Operation::Div(a, b) | Operation::Mod(a, b) | Operation::And(a, b)
-                | Operation::Or(a, b) | Operation::Xor(a, b) | Operation::Shl(a, b)
+                | Operation::Or(a, b) | Operation::LogicalAnd(a, b) | Operation::LogicalOr(a, b)
+                | Operation::Xor(a, b) | Operation::Shl(a, b)
                 | Operation::Shr(a, b) | Operation::Eq(a, b)
                 | Operation::NotEq(a, b) | Operation::Gt(a, b) | Operation::Gte(a, b)
                 | Operation::Lt(a, b) | Operation::Lte(a, b) => {
@@ -1970,6 +1719,10 @@ fn apply_string_concat_expr(code: &Bytecode, expr: &mut Expr) {
             apply_string_concat_expr(code, cond.as_mut());
             apply_string_concat(code, if_);
             apply_string_concat(code, else_);
+        }
+        Expr::Range(start, end) => {
+            apply_string_concat_expr(code, start.as_mut());
+            apply_string_concat_expr(code, end.as_mut());
         }
         Expr::Constant(_) | Expr::Variable(_, _) | Expr::Ident(_)
         | Expr::FunRef(_) | Expr::Unknown(_) => {}
@@ -2244,5 +1997,588 @@ fn is_pos_info_field_assign(stmt: &Statement, pos_var: &Str) -> Option<String> {
             None
         }
         _ => None,
+    }
+}
+
+// =============================================================================
+// Boolean Simplification: Fold nested if statements into && and || expressions
+// =============================================================================
+
+/// Simplify nested if statements into boolean expressions.
+///
+/// Transforms:
+/// - `if (a) { if (b) { X } }` → `if (a && b) { X }`
+/// - `if (a) { X } else if (b) { X }` → `if (a || b) { X }` (when X is identical)
+///
+/// This produces cleaner, more idiomatic code that matches the original source.
+pub fn simplify_boolean_conditions(stmts: &mut Vec<Statement>) -> bool {
+    let mut changed = false;
+
+    for stmt in stmts.iter_mut() {
+        // Recurse into nested structures first
+        match stmt {
+            Statement::IfElse { if_, else_, .. } => {
+                if simplify_boolean_conditions(if_) {
+                    changed = true;
+                }
+                if simplify_boolean_conditions(else_) {
+                    changed = true;
+                }
+            }
+            Statement::IfElseChain { branches, else_ } => {
+                for (_, body) in branches.iter_mut() {
+                    if simplify_boolean_conditions(body) {
+                        changed = true;
+                    }
+                }
+                if simplify_boolean_conditions(else_) {
+                    changed = true;
+                }
+            }
+            Statement::While { stmts, .. } => {
+                if simplify_boolean_conditions(stmts) {
+                    changed = true;
+                }
+            }
+            Statement::Switch { default, cases, .. } => {
+                if simplify_boolean_conditions(default) {
+                    changed = true;
+                }
+                for (_, case_stmts) in cases.iter_mut() {
+                    if simplify_boolean_conditions(case_stmts) {
+                        changed = true;
+                    }
+                }
+            }
+            Statement::TryCatch { try_stmts, catch_stmts, .. } => {
+                if simplify_boolean_conditions(try_stmts) {
+                    changed = true;
+                }
+                if simplify_boolean_conditions(catch_stmts) {
+                    changed = true;
+                }
+            }
+            Statement::Block { stmts } | Statement::Sequence { stmts } => {
+                if simplify_boolean_conditions(stmts) {
+                    changed = true;
+                }
+            }
+            _ => {}
+        }
+
+        // Now try to simplify this statement itself
+        if let Statement::IfElse { cond, if_, else_ } = stmt {
+            // Pattern 1: if (a) { if (b) { X } } with empty else
+            // → if (a && b) { X }
+            if else_.is_empty() && if_.len() == 1 {
+                if let Statement::IfElse {
+                    cond: inner_cond,
+                    if_: inner_if,
+                    else_: inner_else,
+                } = &if_[0]
+                {
+                    if inner_else.is_empty() {
+                        // Fold: if (a) { if (b) { X } } → if (a && b) { X }
+                        let new_cond = Expr::Op(Operation::LogicalAnd(
+                            Box::new(cond.clone()),
+                            Box::new(inner_cond.clone()),
+                        ));
+                        *cond = new_cond;
+                        *if_ = inner_if.clone();
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Pattern 2: if (a) { X } else if (b) { X } → if (a || b) { X }
+    // This needs to compare statement bodies for equality, which is more complex
+    // Implement a simpler version: look for if-else chains with identical bodies
+    changed |= fold_or_chains(stmts);
+
+    changed
+}
+
+/// Fold if-else chains with identical bodies into || expressions.
+///
+/// Transforms:
+/// ```haxe
+/// if (a) {
+///     return x;
+/// } else if (b) {
+///     return x;
+/// }
+/// ```
+/// into:
+/// ```haxe
+/// if (a || b) {
+///     return x;
+/// }
+/// ```
+fn fold_or_chains(stmts: &mut Vec<Statement>) -> bool {
+    let mut changed = false;
+
+    for stmt in stmts.iter_mut() {
+        if let Statement::IfElse { cond, if_, else_ } = stmt {
+            // Check if else is a single if-else with identical body
+            if else_.len() == 1 {
+                if let Statement::IfElse {
+                    cond: else_cond,
+                    if_: else_if,
+                    else_: else_else,
+                } = &else_[0]
+                {
+                    // Check if bodies are identical
+                    if statements_equal(if_, else_if) {
+                        // Fold: if (a) { X } else if (b) { X } → if (a || b) { X }
+                        let new_cond = Expr::Op(Operation::LogicalOr(
+                            Box::new(cond.clone()),
+                            Box::new(else_cond.clone()),
+                        ));
+                        *cond = new_cond;
+                        // Keep the original if_ body, take the inner else as our else
+                        *else_ = else_else.clone();
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    changed
+}
+
+/// Check if two statement lists are structurally equal.
+///
+/// This is a conservative comparison - returns true only if statements
+/// are obviously identical. Used for boolean folding.
+fn statements_equal(a: &[Statement], b: &[Statement]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+
+    for (s1, s2) in a.iter().zip(b.iter()) {
+        if !statement_equal(s1, s2) {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Check if two statements are structurally equal.
+fn statement_equal(a: &Statement, b: &Statement) -> bool {
+    match (a, b) {
+        (Statement::Return(Some(e1)), Statement::Return(Some(e2))) => expr_equal(e1, e2),
+        (Statement::Return(None), Statement::Return(None)) => true,
+        (Statement::Break, Statement::Break) => true,
+        (Statement::Continue, Statement::Continue) => true,
+        (Statement::Throw(e1), Statement::Throw(e2)) => expr_equal(e1, e2),
+        (Statement::ExprStatement(e1), Statement::ExprStatement(e2)) => expr_equal(e1, e2),
+        (
+            Statement::Assign { declaration: d1, variable: v1, assign: a1 },
+            Statement::Assign { declaration: d2, variable: v2, assign: a2 },
+        ) => d1 == d2 && expr_equal(v1, v2) && expr_equal(a1, a2),
+        (
+            Statement::IfElse { cond: c1, if_: if1, else_: else1 },
+            Statement::IfElse { cond: c2, if_: if2, else_: else2 },
+        ) => expr_equal(c1, c2) && statements_equal(if1, if2) && statements_equal(else1, else2),
+        (
+            Statement::While { cond: c1, stmts: s1 },
+            Statement::While { cond: c2, stmts: s2 },
+        ) => expr_equal(c1, c2) && statements_equal(s1, s2),
+        // For other complex statements, be conservative and return false
+        _ => false,
+    }
+}
+
+/// Check if two expressions are structurally equal.
+fn expr_equal(a: &Expr, b: &Expr) -> bool {
+    match (a, b) {
+        (Expr::Constant(c1), Expr::Constant(c2)) => constant_equal(c1, c2),
+        (Expr::Variable(r1, n1), Expr::Variable(r2, n2)) => r1 == r2 && n1 == n2,
+        (Expr::Ident(i1), Expr::Ident(i2)) => i1 == i2,
+        (Expr::Field(o1, f1), Expr::Field(o2, f2)) => f1 == f2 && expr_equal(o1, o2),
+        (Expr::Array(a1, i1), Expr::Array(a2, i2)) => expr_equal(a1, a2) && expr_equal(i1, i2),
+        (Expr::Call(c1), Expr::Call(c2)) => {
+            expr_equal(&c1.fun, &c2.fun)
+                && c1.args.len() == c2.args.len()
+                && c1.args.iter().zip(c2.args.iter()).all(|(x, y)| expr_equal(x, y))
+        }
+        (Expr::Op(o1), Expr::Op(o2)) => op_equal(o1, o2),
+        (Expr::FunRef(f1), Expr::FunRef(f2)) => f1 == f2,
+        // For other expressions, be conservative
+        _ => false,
+    }
+}
+
+/// Check if two constants are equal.
+fn constant_equal(a: &Constant, b: &Constant) -> bool {
+    match (a, b) {
+        (Constant::Null, Constant::Null) => true,
+        (Constant::This, Constant::This) => true,
+        (Constant::Bool(b1), Constant::Bool(b2)) => b1 == b2,
+        (Constant::Int(i1), Constant::Int(i2)) => i1 == i2,
+        (Constant::InlineInt(i1), Constant::InlineInt(i2)) => i1 == i2,
+        (Constant::Float(f1), Constant::Float(f2)) => f1 == f2,
+        (Constant::String(s1), Constant::String(s2)) => s1 == s2,
+        (Constant::TypeRef(t1), Constant::TypeRef(t2)) => t1 == t2,
+        _ => false,
+    }
+}
+
+/// Check if two operations are equal.
+fn op_equal(a: &Operation, b: &Operation) -> bool {
+    match (a, b) {
+        (Operation::Add(l1, r1), Operation::Add(l2, r2)) => expr_equal(l1, l2) && expr_equal(r1, r2),
+        (Operation::Sub(l1, r1), Operation::Sub(l2, r2)) => expr_equal(l1, l2) && expr_equal(r1, r2),
+        (Operation::Mul(l1, r1), Operation::Mul(l2, r2)) => expr_equal(l1, l2) && expr_equal(r1, r2),
+        (Operation::Div(l1, r1), Operation::Div(l2, r2)) => expr_equal(l1, l2) && expr_equal(r1, r2),
+        (Operation::Mod(l1, r1), Operation::Mod(l2, r2)) => expr_equal(l1, l2) && expr_equal(r1, r2),
+        (Operation::Shl(l1, r1), Operation::Shl(l2, r2)) => expr_equal(l1, l2) && expr_equal(r1, r2),
+        (Operation::Shr(l1, r1), Operation::Shr(l2, r2)) => expr_equal(l1, l2) && expr_equal(r1, r2),
+        (Operation::And(l1, r1), Operation::And(l2, r2)) => expr_equal(l1, l2) && expr_equal(r1, r2),
+        (Operation::Or(l1, r1), Operation::Or(l2, r2)) => expr_equal(l1, l2) && expr_equal(r1, r2),
+        (Operation::LogicalAnd(l1, r1), Operation::LogicalAnd(l2, r2)) => expr_equal(l1, l2) && expr_equal(r1, r2),
+        (Operation::LogicalOr(l1, r1), Operation::LogicalOr(l2, r2)) => expr_equal(l1, l2) && expr_equal(r1, r2),
+        (Operation::Xor(l1, r1), Operation::Xor(l2, r2)) => expr_equal(l1, l2) && expr_equal(r1, r2),
+        (Operation::Eq(l1, r1), Operation::Eq(l2, r2)) => expr_equal(l1, l2) && expr_equal(r1, r2),
+        (Operation::NotEq(l1, r1), Operation::NotEq(l2, r2)) => expr_equal(l1, l2) && expr_equal(r1, r2),
+        (Operation::Gt(l1, r1), Operation::Gt(l2, r2)) => expr_equal(l1, l2) && expr_equal(r1, r2),
+        (Operation::Gte(l1, r1), Operation::Gte(l2, r2)) => expr_equal(l1, l2) && expr_equal(r1, r2),
+        (Operation::Lt(l1, r1), Operation::Lt(l2, r2)) => expr_equal(l1, l2) && expr_equal(r1, r2),
+        (Operation::Lte(l1, r1), Operation::Lte(l2, r2)) => expr_equal(l1, l2) && expr_equal(r1, r2),
+        (Operation::Neg(e1), Operation::Neg(e2)) => expr_equal(e1, e2),
+        (Operation::Not(e1), Operation::Not(e2)) => expr_equal(e1, e2),
+        (Operation::Incr(e1), Operation::Incr(e2)) => expr_equal(e1, e2),
+        (Operation::Decr(e1), Operation::Decr(e2)) => expr_equal(e1, e2),
+        _ => false,
+    }
+}
+
+// =============================================================================
+// For-In Detection: Convert while loops with counter patterns to for-in loops
+// =============================================================================
+
+/// Detect and convert while loops with counter patterns to for-in loops.
+///
+/// Transforms patterns like:
+/// ```haxe
+/// var i = 0;
+/// while (i < n) {
+///     // body
+///     i++;
+/// }
+/// ```
+/// into:
+/// ```haxe
+/// for (i in 0...n) {
+///     // body
+/// }
+/// ```
+///
+/// This produces cleaner, more idiomatic Haxe code.
+pub fn detect_for_in_loops(stmts: &mut Vec<Statement>) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+
+    while i < stmts.len() {
+        // Recursively process nested structures first
+        match &mut stmts[i] {
+            Statement::IfElse { if_, else_, .. } => {
+                if detect_for_in_loops(if_) { changed = true; }
+                if detect_for_in_loops(else_) { changed = true; }
+            }
+            Statement::IfElseChain { branches, else_ } => {
+                for (_, body) in branches.iter_mut() {
+                    if detect_for_in_loops(body) { changed = true; }
+                }
+                if detect_for_in_loops(else_) { changed = true; }
+            }
+            Statement::While { stmts: body, .. } => {
+                if detect_for_in_loops(body) { changed = true; }
+            }
+            Statement::ForIn { stmts: body, .. } => {
+                if detect_for_in_loops(body) { changed = true; }
+            }
+            Statement::Switch { default, cases, .. } => {
+                if detect_for_in_loops(default) { changed = true; }
+                for (_, case_stmts) in cases.iter_mut() {
+                    if detect_for_in_loops(case_stmts) { changed = true; }
+                }
+            }
+            Statement::TryCatch { try_stmts, catch_stmts, .. } => {
+                if detect_for_in_loops(try_stmts) { changed = true; }
+                if detect_for_in_loops(catch_stmts) { changed = true; }
+            }
+            Statement::Block { stmts: inner } | Statement::Sequence { stmts: inner } => {
+                if detect_for_in_loops(inner) { changed = true; }
+            }
+            _ => {}
+        }
+
+        // Look for pattern: var i = start; while (i < end) { body; i++; }
+        if i + 1 < stmts.len() {
+            if let Some((var_name, start_expr)) = extract_counter_init(&stmts[i]) {
+                if let Statement::While { cond, stmts: body } = &stmts[i + 1] {
+                    if let Some(end_expr) = extract_less_than_condition(cond, &var_name) {
+                        if let Some(new_body) = extract_body_with_increment(body, &var_name) {
+                            // Found the pattern! Convert to for-in
+                            let for_in = Statement::ForIn {
+                                var_name: var_name.into(),
+                                iterable: Expr::Range(
+                                    Box::new(start_expr),
+                                    Box::new(end_expr),
+                                ),
+                                stmts: new_body,
+                            };
+
+                            // Remove the init statement and replace while with for-in
+                            stmts.remove(i);
+                            stmts[i] = for_in;
+                            changed = true;
+                            // Don't increment i - we just modified it
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        i += 1;
+    }
+
+    changed
+}
+
+/// Extract counter initialization from a statement.
+/// Returns (var_name, start_value) if this is `var name = value` with an integer.
+fn extract_counter_init(stmt: &Statement) -> Option<(String, Expr)> {
+    match stmt {
+        Statement::Assign {
+            declaration: true,
+            variable: Expr::Variable(_, Some(name)),
+            assign,
+        } => {
+            // Check if the assignment is an integer (common case: var i = 0)
+            if is_integer_expr(assign) {
+                Some((name.to_string(), assign.clone()))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Check if expression is an integer constant.
+fn is_integer_expr(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Constant(Constant::Int(_)) | Expr::Constant(Constant::InlineInt(_))
+    )
+}
+
+/// Extract the upper bound from a less-than condition.
+/// Returns Some(end_expr) if condition is `var_name < end_expr`.
+fn extract_less_than_condition(cond: &Expr, var_name: &str) -> Option<Expr> {
+    match cond {
+        Expr::Op(Operation::Lt(left, right)) => {
+            // Check if left side is our counter variable
+            if is_var_named(left, var_name) {
+                Some((**right).clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Check if an expression is a variable with the given name.
+fn is_var_named(expr: &Expr, name: &str) -> bool {
+    match expr {
+        Expr::Variable(_, Some(var_name)) => var_name.as_ref() == name,
+        Expr::Ident(ident) => ident.as_ref() == name,
+        _ => false,
+    }
+}
+
+/// Extract the loop body if it ends with an increment of the counter variable.
+/// Returns Some(body_without_increment) if the body ends with `var++` or `var = var + 1`.
+fn extract_body_with_increment(body: &[Statement], var_name: &str) -> Option<Vec<Statement>> {
+    if body.is_empty() {
+        return None;
+    }
+
+    let last = &body[body.len() - 1];
+
+    // Check for i++ as expression statement
+    if let Statement::ExprStatement(Expr::Op(Operation::Incr(inner))) = last {
+        if is_var_named(inner, var_name) {
+            return Some(body[..body.len() - 1].to_vec());
+        }
+    }
+
+    // Check for i = i + 1 pattern
+    if let Statement::Assign {
+        variable,
+        assign: Expr::Op(Operation::Add(left, right)),
+        ..
+    } = last
+    {
+        if is_var_named(variable, var_name) {
+            // Check if it's var = var + 1 or var = 1 + var
+            let is_add_one = (is_var_named(left, var_name) && is_one(right))
+                || (is_one(left) && is_var_named(right, var_name));
+            if is_add_one {
+                return Some(body[..body.len() - 1].to_vec());
+            }
+        }
+    }
+
+    None
+}
+
+/// Check if expression is the constant 1.
+fn is_one(expr: &Expr) -> bool {
+    matches!(expr, Expr::Constant(Constant::InlineInt(1)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::{Constant, Expr, Operation, Statement};
+
+    #[test]
+    fn test_simplify_nested_if_to_and() {
+        // if (a) { if (b) { return true; } }
+        // should become: if (a && b) { return true; }
+        let mut stmts = vec![Statement::IfElse {
+            cond: Expr::Variable(hlbc::types::Reg(0), Some("a".into())),
+            if_: vec![Statement::IfElse {
+                cond: Expr::Variable(hlbc::types::Reg(1), Some("b".into())),
+                if_: vec![Statement::Return(Some(Expr::Constant(Constant::Bool(true))))],
+                else_: vec![],
+            }],
+            else_: vec![],
+        }];
+
+        let changed = simplify_boolean_conditions(&mut stmts);
+        assert!(changed, "Should have made changes");
+
+        // Check the result is if (a && b) { return true; }
+        match &stmts[0] {
+            Statement::IfElse { cond, if_, else_ } => {
+                // Condition should be a && b
+                assert!(matches!(cond, Expr::Op(Operation::LogicalAnd(_, _))));
+                // Body should be single return
+                assert_eq!(if_.len(), 1);
+                assert!(matches!(&if_[0], Statement::Return(Some(_))));
+                // Else should be empty
+                assert!(else_.is_empty());
+            }
+            _ => panic!("Expected IfElse"),
+        }
+    }
+
+    #[test]
+    fn test_simplify_or_chain() {
+        // if (a) { return x; } else if (b) { return x; }
+        // should become: if (a || b) { return x; }
+        let return_x = Statement::Return(Some(Expr::Variable(hlbc::types::Reg(2), Some("x".into()))));
+
+        let mut stmts = vec![Statement::IfElse {
+            cond: Expr::Variable(hlbc::types::Reg(0), Some("a".into())),
+            if_: vec![return_x.clone()],
+            else_: vec![Statement::IfElse {
+                cond: Expr::Variable(hlbc::types::Reg(1), Some("b".into())),
+                if_: vec![return_x.clone()],
+                else_: vec![],
+            }],
+        }];
+
+        let changed = simplify_boolean_conditions(&mut stmts);
+        assert!(changed, "Should have made changes");
+
+        // Check the result is if (a || b) { return x; }
+        match &stmts[0] {
+            Statement::IfElse { cond, if_, else_ } => {
+                // Condition should be a || b
+                assert!(matches!(cond, Expr::Op(Operation::LogicalOr(_, _))));
+                // Body should be single return
+                assert_eq!(if_.len(), 1);
+                // Else should be empty (from the inner else)
+                assert!(else_.is_empty());
+            }
+            _ => panic!("Expected IfElse"),
+        }
+    }
+
+    #[test]
+    fn test_statements_equal() {
+        let ret1 = Statement::Return(Some(Expr::Constant(Constant::Bool(true))));
+        let ret2 = Statement::Return(Some(Expr::Constant(Constant::Bool(true))));
+        let ret3 = Statement::Return(Some(Expr::Constant(Constant::Bool(false))));
+
+        assert!(statement_equal(&ret1, &ret2));
+        assert!(!statement_equal(&ret1, &ret3));
+    }
+
+    #[test]
+    fn test_expr_equal() {
+        let a = Expr::Variable(hlbc::types::Reg(0), Some("x".into()));
+        let b = Expr::Variable(hlbc::types::Reg(0), Some("x".into()));
+        let c = Expr::Variable(hlbc::types::Reg(1), Some("y".into()));
+
+        assert!(expr_equal(&a, &b));
+        assert!(!expr_equal(&a, &c));
+    }
+
+    #[test]
+    fn test_detect_for_in_loop() {
+        // var i = 0; while (i < 10) { doSomething(); i++; }
+        // should become: for (i in 0...10) { doSomething(); }
+        let mut stmts = vec![
+            // var i = 0;
+            Statement::Assign {
+                declaration: true,
+                variable: Expr::Variable(hlbc::types::Reg(0), Some("i".into())),
+                assign: Expr::Constant(Constant::InlineInt(0)),
+            },
+            // while (i < 10) { doSomething(); i++; }
+            Statement::While {
+                cond: Expr::Op(Operation::Lt(
+                    Box::new(Expr::Variable(hlbc::types::Reg(0), Some("i".into()))),
+                    Box::new(Expr::Constant(Constant::InlineInt(10))),
+                )),
+                stmts: vec![
+                    // doSomething() - placeholder
+                    Statement::ExprStatement(Expr::Call(Box::new(Call {
+                        fun: Expr::Ident("doSomething".into()),
+                        args: vec![],
+                    }))),
+                    // i++
+                    Statement::ExprStatement(Expr::Op(Operation::Incr(
+                        Box::new(Expr::Variable(hlbc::types::Reg(0), Some("i".into()))),
+                    ))),
+                ],
+            },
+        ];
+
+        let changed = detect_for_in_loops(&mut stmts);
+        assert!(changed, "Should have detected for-in pattern");
+        assert_eq!(stmts.len(), 1, "Should have combined into single for-in");
+
+        // Check the result is for (i in 0...10) { doSomething(); }
+        match &stmts[0] {
+            Statement::ForIn { var_name, iterable, stmts } => {
+                assert_eq!(var_name.as_ref(), "i");
+                assert!(matches!(iterable, Expr::Range(_, _)));
+                assert_eq!(stmts.len(), 1, "Body should only have doSomething()");
+            }
+            _ => panic!("Expected ForIn statement"),
+        }
     }
 }

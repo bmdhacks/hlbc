@@ -154,7 +154,8 @@ fn analyze_expr(
             match op {
                 Operation::Add(l, r) | Operation::Sub(l, r) | Operation::Mul(l, r)
                 | Operation::Div(l, r) | Operation::Mod(l, r) | Operation::And(l, r)
-                | Operation::Or(l, r) | Operation::Xor(l, r) | Operation::Shl(l, r)
+                | Operation::Or(l, r) | Operation::LogicalAnd(l, r) | Operation::LogicalOr(l, r)
+                | Operation::Xor(l, r) | Operation::Shl(l, r)
                 | Operation::Shr(l, r) | Operation::Eq(l, r) | Operation::NotEq(l, r)
                 | Operation::Lt(l, r) | Operation::Lte(l, r) | Operation::Gt(l, r)
                 | Operation::Gte(l, r) => {

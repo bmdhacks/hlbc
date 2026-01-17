@@ -145,10 +145,14 @@ pub enum Operation {
     Shl(Box<Expr>, Box<Expr>),
     /// `>>`
     Shr(Box<Expr>, Box<Expr>),
-    /// && &
+    /// Bitwise AND: &
     And(Box<Expr>, Box<Expr>),
-    /// || |
+    /// Bitwise OR: |
     Or(Box<Expr>, Box<Expr>),
+    /// Logical AND: && (short-circuit)
+    LogicalAnd(Box<Expr>, Box<Expr>),
+    /// Logical OR: || (short-circuit)
+    LogicalOr(Box<Expr>, Box<Expr>),
     /// ^
     Xor(Box<Expr>, Box<Expr>),
     /// \-
@@ -193,6 +197,9 @@ impl Operation {
             Eq(_, _) | NotEq(_, _) => 3,
             // Bitwise (already wrapped in parens)
             And(_, _) | Xor(_, _) | Or(_, _) => 2,
+            // Logical (lowest precedence for binary ops)
+            LogicalAnd(_, _) => 1,
+            LogicalOr(_, _) => 0,
         }
     }
 }
@@ -289,6 +296,9 @@ pub enum Expr {
     /// Type annotated variable (for declarations): var x:Type
     /// Used when we need to specify a type hint in variable declarations
     TypeAnnotated(Box<Expr>, Str),
+    /// Integer range: start...end (exclusive end, like Haxe)
+    /// Used for for-in loops: for (i in 0...10)
+    Range(Box<Expr>, Box<Expr>),
 }
 
 pub const fn cst_int(cst: RefInt) -> Expr {
@@ -452,6 +462,16 @@ pub enum Statement {
     /// While statement
     While {
         cond: Expr,
+        stmts: Vec<Statement>,
+    },
+    /// For-in statement: for (x in iterable) { body }
+    /// Handles both range iteration (for i in 0...n) and collection iteration
+    ForIn {
+        /// The loop variable name
+        var_name: Str,
+        /// The iterable expression (range like 0...n, or a collection)
+        iterable: Expr,
+        /// Loop body
         stmts: Vec<Statement>,
     },
     Break,

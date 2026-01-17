@@ -4,12 +4,15 @@
 //! - Uses loop info from Analyzer to emit `while` loops
 //! - Uses dominator tree to structure if/else
 //! - Converts φ-functions to variable assignments at branch ends
-//!
-//! This is a simplified implementation focused on correctness over optimization.
 
 pub mod expression;
 pub mod idioms;
+pub mod lower;
+pub mod patterns;
 pub mod reducer;
+pub mod region;
+pub mod region_graph;
+pub mod sese;
 pub mod stmts;
 
 use petgraph::graph::NodeIndex;
@@ -31,21 +34,20 @@ use crate::ssa::UseDefInfo;
 use crate::closure_analysis::ClosureAnalysis;
 use crate::exception_analysis::{ExceptionAnalysis, TryRegion};
 
-// Re-export simplify_statements for external use
-pub use stmts::simplify_statements;
+pub use stmts::simplify_statements; // external export
 
-/// Tracks memory dependencies for SSA inline expressions.
+/// Tracks memory dependencies for SSA inline expressions
 /// Used to determine when an inline expression must be invalidated
 /// because its source memory has been modified.
 #[derive(Clone, Debug)]
 pub(crate) enum MemoryDep {
     /// No memory dependency - constants, arithmetic results.
-    /// These are always safe to inline.
+    /// Always safe to inline.
     None,
-    /// Depends on reading a specific field of an object.
+    /// Depends on a specific field of an object.
     /// Invalidated when SetField writes to the same (obj_reg, field_idx).
     Field { obj: Reg, field: usize },
-    /// Depends on reading a specific global variable.
+    /// Depends on a specific global variable.
     /// Invalidated when SetGlobal writes to the same global.
     Global { global: hlbc::types::RefGlobal },
     /// Conservative dependency - could read any memory.
@@ -77,7 +79,6 @@ pub(crate) struct StringSwitchRegion {
     pub(crate) default_op: usize,
 }
 
-/// Context for structuring
 pub struct Structurer<'a> {
     pub(crate) code: &'a Bytecode,
     pub(crate) func: &'a Function,
@@ -85,7 +86,7 @@ pub struct Structurer<'a> {
     pub(crate) analysis: &'a CfgAnalysis,
     pub(crate) ssa: &'a SsaCfg,
     pub(crate) _type_info: &'a TypeInfo,
-    /// Closure analysis for detecting/handling closures
+
     pub(crate) closure_analysis: Option<&'a ClosureAnalysis>,
 
     /// Processed blocks (to avoid re-processing)
@@ -141,8 +142,6 @@ pub struct Structurer<'a> {
     pub(crate) current_ssa_uses: Vec<SsaVar>,
     /// Detected string switch regions (from bytecode pattern analysis)
     pub(crate) string_switches: Vec<StringSwitchRegion>,
-    /// Recursion depth counter to prevent stack overflow
-    pub(crate) recursion_depth: u32,
     /// Current loop header (if any) - used to distinguish continue from switch fall-through
     pub(crate) current_loop_header: Option<NodeIndex>,
     /// Expressions available for inlining (SSA var -> (expression, memory dependency))
@@ -182,13 +181,12 @@ impl<'a> Structurer<'a> {
         type_info: &'a TypeInfo,
         closure_analysis: Option<&'a ClosureAnalysis>,
     ) -> Self {
-        // Compute use counts for inlining decisions (needs func for purity info)
+        // (needs func for purity info)
         let use_info = ssa.compute_use_counts(func);
 
-        // Build method info map from all types' protos
         let method_info = Self::build_method_info(code);
 
-        // Pre-populate declared_vars with parameter names so we don't hoist them
+        // Pre-populate declared_vars so we don't hoist them
         let mut declared_vars = HashSet::new();
         if let Some(Type::Fun(fun_type) | Type::Method(fun_type)) = code.types.get(func.t.0) {
             let num_args = fun_type.args.len();
@@ -199,7 +197,7 @@ impl<'a> Structurer<'a> {
             }
         }
 
-        // Analyze exception regions for try/catch structuring
+        // used for try/catch structuring
         let exception_analysis = ExceptionAnalysis::analyze(func);
 
         Structurer {
@@ -230,7 +228,6 @@ impl<'a> Structurer<'a> {
             current_ssa_dst: None,
             current_ssa_uses: Vec::new(),
             string_switches: Self::detect_string_switches(code, func),
-            recursion_depth: 0,
             current_loop_header: None,
             inline_exprs: RefCell::new(HashMap::new()),
             suppressed_ops: HashSet::new(),
@@ -238,7 +235,6 @@ impl<'a> Structurer<'a> {
         }
     }
 
-    /// Build a map from function references to their owner types and method names.
     /// This is used to convert f(obj, args) to obj.f(args) syntax.
     fn build_method_info(code: &Bytecode) -> HashMap<RefFun, (RefType, Str)> {
         let mut info = HashMap::new();
@@ -257,7 +253,6 @@ impl<'a> Structurer<'a> {
         info
     }
 
-    /// Get the fully qualified class name of this function's containing class, if any.
     pub(crate) fn get_current_class_name(&self) -> Option<Str> {
         self.func.parent.map(|parent_ref| {
             self.code[parent_ref].get_type_obj()
@@ -268,16 +263,17 @@ impl<'a> Structurer<'a> {
 
     /// Structure the entire function into statements
     pub fn structure(&mut self) -> Vec<Statement> {
-        // Pre-process: detect patterns that should be suppressed
+
+        // preprosess: detect patterns for suppression
         self.detect_enum_switch_patterns();
         self.detect_internal_function_calls();
 
-        // For functions with exception regions, use opcode-range-based structuring
-        // which handles nested Trap/EndTrap correctly without CFG edge interference.
-        // For functions without exceptions, use CFG-based structuring.
         let stmts = if self.exception_analysis.has_exceptions() {
+            // use opcode-range-based structuring which handles nested Trap/EndTrap
+            // correctly without CFG edge interference.
             self.structure_block_range(0, self.func.ops.len())
         } else {
+            // use CFG-based structuring.
             self.structure_from(self.cfg.entry, None)
         };
 
@@ -286,11 +282,8 @@ impl<'a> Structurer<'a> {
         let current_class = self.get_current_class_name();
         let current_class_str = current_class.as_ref().map(|s| s.as_ref());
         for name in &self.hoisted_vars {
-            // Add type hint based on:
-            // 1. :Dynamic for vars that will hold empty anonymous objects
-            // 2. Type from hoisted_var_types if available
-            // 3. None if no type info
             let type_hint = if self.needs_dynamic_type.contains(name) {
+                // for vars that will hold empty anonymous objects
                 Some("Dynamic".into())
             } else if let Some(type_ref) = self.hoisted_var_types.get(name) {
                 let ty = &self.code.types[type_ref.0];
@@ -306,13 +299,12 @@ impl<'a> Structurer<'a> {
                     Some(type_str)
                 }
             } else {
-                None
+                None // no type available
             };
             result.push(Statement::VarDecl { name: name.clone(), type_hint });
         }
         result.extend(stmts);
 
-        // Post-process to simplify
         simplify_statements(result)
     }
 
@@ -322,24 +314,9 @@ impl<'a> Structurer<'a> {
             return vec![];
         }
 
-        // Prevent stack overflow from deep recursion
-        const MAX_RECURSION_DEPTH: u32 = 500;
-        if self.recursion_depth >= MAX_RECURSION_DEPTH {
-            return vec![Statement::Comment(format!(
-                "// [deep nesting truncated at depth {} - remaining {} blocks]",
-                MAX_RECURSION_DEPTH,
-                self.cfg.graph.node_count() - self.processed.len()
-            ))];
-        }
-        self.recursion_depth += 1;
-
-        let result = self.structure_from_inner(start, stop_at);
-
-        self.recursion_depth -= 1;
-        result
+        self.structure_from_inner(start, stop_at)
     }
 
-    /// Inner implementation of structure_from (separated for recursion depth tracking)
     /// Uses iterative processing for sequential blocks to avoid deep recursion
     fn structure_from_inner(&mut self, start: NodeIndex, stop_at: Option<NodeIndex>) -> Vec<Statement> {
         let mut all_stmts = Vec::new();
@@ -1059,7 +1036,17 @@ impl<'a> Structurer<'a> {
                 return (stmts, self.get_unprocessed_continuation(final_merge, stop_at));
             }
 
-            let effective_stop = merge.or(stop_at);
+            // Compute effective stop point. If merge == then_target, we can't use
+            // merge as the stop because structure_branch would skip the target entirely.
+            // In that case, use the target's successor as the stop point.
+            let effective_stop = if merge == then_target {
+                then_target.and_then(|t| {
+                    let succs = self.cfg.successors(t);
+                    if succs.len() == 1 { Some(succs[0]) } else { None }
+                }).or(stop_at)
+            } else {
+                merge.or(stop_at)
+            };
             let then_stmts = self.structure_branch(then_target, effective_stop);
             chain.push((preamble, condition, then_stmts));
 
@@ -1070,7 +1057,16 @@ impl<'a> Structurer<'a> {
                 }
             }
 
-            let else_stmts = self.structure_branch(else_target, effective_stop);
+            // Also handle merge == else_target case
+            let else_effective_stop = if merge == else_target {
+                else_target.and_then(|t| {
+                    let succs = self.cfg.successors(t);
+                    if succs.len() == 1 { Some(succs[0]) } else { None }
+                }).or(stop_at)
+            } else {
+                effective_stop
+            };
+            let else_stmts = self.structure_branch(else_target, else_effective_stop);
             let stmts = self.build_conditional_result(chain, else_stmts, has_preambles);
             return (stmts, self.get_unprocessed_continuation(final_merge, stop_at));
         }
@@ -1324,14 +1320,21 @@ impl<'a> Structurer<'a> {
         }
 
         if a_terminates && !b_succs.contains(&a) {
-            // Branch 'a' returns, branch 'b' doesn't flow into 'a'
-            // So 'b' is the continuation point
-            return Some(b);
+            // Branch 'a' terminates, branch 'b' doesn't flow into 'a'
+            // The merge point is b's successor (where control continues after b)
+            // If b has a single successor, that's the merge. Otherwise, no merge.
+            if b_succs.len() == 1 {
+                return b_succs.into_iter().next();
+            }
+            return None;
         }
         if b_terminates && !a_succs.contains(&b) {
-            // Branch 'b' returns, branch 'a' doesn't flow into 'b'
-            // So 'a' is the continuation point
-            return Some(a);
+            // Branch 'b' terminates, branch 'a' doesn't flow into 'b'
+            // The merge point is a's successor (where control continues after a)
+            if a_succs.len() == 1 {
+                return a_succs.into_iter().next();
+            }
+            return None;
         }
 
         None

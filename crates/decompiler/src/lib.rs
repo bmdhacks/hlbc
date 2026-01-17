@@ -251,6 +251,14 @@ pub fn decompile_code_with_closures(
     // This runs after inlining so the pattern is simplified
     post::collapse_trace_calls(&mut stmts);
 
+    // Pass 13: Boolean simplification - fold nested ifs into && and ||
+    // if (a) { if (b) { X } } → if (a && b) { X }
+    post::simplify_boolean_conditions(&mut stmts);
+
+    // Pass 14: For-in loop detection - convert while counter patterns to for-in
+    // var i = 0; while (i < n) { body; i++; } → for (i in 0...n) { body }
+    post::detect_for_in_loops(&mut stmts);
+
     // Clean up: remove this function from the "currently decompiling" set
     DECOMPILING_FUNCTIONS.with(|set| {
         set.borrow_mut().remove(&findex);

@@ -9,6 +9,7 @@
 ///
 /// # Examples
 /// ```
+/// use hlbc_decompiler::type_mappings::expand_module_path;
 /// assert_eq!(expand_module_path("haxe.macro.Binop"), Some("haxe.macro.Expr.Binop"));
 /// assert_eq!(expand_module_path("String"), None);
 /// ```

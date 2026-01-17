@@ -1807,6 +1807,9 @@ pub fn is_var_used_in_stmt(reg: &Reg, stmt: &Statement) -> bool {
                 is_var_used_in_expr(reg, cond) || body.iter().any(|s| is_var_used_in_stmt(reg, s))
             }) || else_.iter().any(|s| is_var_used_in_stmt(reg, s))
         }
+        Statement::ForIn { iterable, stmts, .. } => {
+            is_var_used_in_expr(reg, iterable) || stmts.iter().any(|s| is_var_used_in_stmt(reg, s))
+        }
         Statement::Comment(_) | Statement::Break | Statement::Continue | Statement::VarDecl { .. } => false,
     }
 }
@@ -1833,6 +1836,7 @@ pub fn is_var_used_in_expr(reg: &Reg, expr: &Expr) -> bool {
         Expr::EnumConstr(_, _, args) => args.iter().any(|a| is_var_used_in_expr(reg, a)),
         Expr::Closure(_, stmts) => stmts.iter().any(|s| is_var_used_in_stmt(reg, s)),
         Expr::Cast(inner, _) | Expr::TypeAnnotated(inner, _) => is_var_used_in_expr(reg, inner),
+        Expr::Range(start, end) => is_var_used_in_expr(reg, start) || is_var_used_in_expr(reg, end),
         // These don't contain variable references
         Expr::Constant(_) | Expr::Ident(_) | Expr::FunRef(_) | Expr::Unknown(_) => false,
     }
@@ -1843,8 +1847,8 @@ pub fn is_var_used_in_operation(reg: &Reg, op: &Operation) -> bool {
     use Operation::*;
     match op {
         Add(l, r) | Sub(l, r) | Mul(l, r) | Div(l, r) | Mod(l, r) |
-        Shl(l, r) | Shr(l, r) | And(l, r) | Or(l, r) | Xor(l, r) |
-        Eq(l, r) | NotEq(l, r) | Gt(l, r) | Gte(l, r) | Lt(l, r) | Lte(l, r) => {
+        Shl(l, r) | Shr(l, r) | And(l, r) | Or(l, r) | LogicalAnd(l, r) | LogicalOr(l, r) |
+        Xor(l, r) | Eq(l, r) | NotEq(l, r) | Gt(l, r) | Gte(l, r) | Lt(l, r) | Lte(l, r) => {
             is_var_used_in_expr(reg, l) || is_var_used_in_expr(reg, r)
         }
         Neg(e) | Not(e) | Incr(e) | Decr(e) => is_var_used_in_expr(reg, e),

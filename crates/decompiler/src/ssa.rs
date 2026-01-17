@@ -545,6 +545,51 @@ impl SsaCfg {
         false
     }
 
+    /// Debug: dump phi info for a specific register
+    #[allow(dead_code)]
+    pub fn debug_phi_info(&self, reg: Reg, cfg: &Cfg) {
+        eprintln!("=== SSA Debug for reg {} ===", reg.0);
+
+        // Show dominance frontiers for blocks that define this register
+        for (node, block) in &self.blocks {
+            let blk = &cfg.graph[*node];
+
+            // Check if this block has a phi for the register
+            for phi in &block.phis {
+                if let SsaInstr::Phi { dst, sources } = phi {
+                    if dst.reg == reg {
+                        eprintln!("  Block [{}-{}] has phi: {} = φ({:?})",
+                            blk.start, blk.end, dst.name(),
+                            sources.iter().map(|(n, v)| format!("{}@blk{:?}", v.name(), n.index())).collect::<Vec<_>>());
+                    }
+                }
+            }
+
+            // Check if this block defines the register
+            for op in &block.ops {
+                if let SsaInstr::Op { op_idx, dst: Some(dst), .. } = op {
+                    if dst.reg == reg {
+                        eprintln!("  Block [{}-{}] op {} defines {}",
+                            blk.start, blk.end, op_idx, dst.name());
+                    }
+                }
+            }
+        }
+
+        // Show dominance frontiers
+        eprintln!("  Dominance frontiers:");
+        for (node, frontier) in &self.dom_frontiers {
+            if !frontier.is_empty() {
+                let blk = &cfg.graph[*node];
+                eprintln!("    Block [{}-{}]: DF = {:?}",
+                    blk.start, blk.end,
+                    frontier.iter().map(|n| {
+                        let b = &cfg.graph[*n];
+                        format!("[{}-{}]", b.start, b.end)
+                    }).collect::<Vec<_>>());
+            }
+        }
+    }
 }
 
 /// Build a map from each node to its dominated children

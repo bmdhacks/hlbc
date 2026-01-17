@@ -990,6 +990,8 @@ impl<'a> Display for OperationDisplay<'a> {
             Shr(e1, e2) => write!(fmt, "({} >> {})", disp(e1), disp(e2)),
             And(e1, e2) => write!(fmt, "({} & {})", disp(e1), disp(e2)),
             Or(e1, e2) => write!(fmt, "({} | {})", disp(e1), disp(e2)),
+            LogicalAnd(e1, e2) => write!(fmt, "({} && {})", disp(e1), disp(e2)),
+            LogicalOr(e1, e2) => write!(fmt, "({} || {})", disp(e1), disp(e2)),
             Xor(e1, e2) => write!(fmt, "({} ^ {})", disp(e1), disp(e2)),
             // Unary
             Neg(expr) => write!(fmt, "-{}", disp(expr)),
@@ -1488,6 +1490,10 @@ impl Expr {
                     // For variable declarations: var x:Type
                     {disp!(expr)}":"{type_name}
                 }
+                Expr::Range(start, end) => {
+                    // Haxe range: start...end (exclusive)
+                    {disp!(start)}"..."{disp!(end)}
+                }
             }
         }
     }
@@ -1774,6 +1780,14 @@ impl Statement {
                 }
                 Statement::While { cond, stmts } => {
                     "while ("{disp!(cond)}") {\n"
+                    let indent2 = indent.inc_nesting();
+                    for stmt in stmts {
+                        {indent2}{stmt.display(&indent2, code, f)}"\n"
+                    }
+                    {indent}"}"
+                }
+                Statement::ForIn { var_name, iterable, stmts } => {
+                    "for ("{var_name}" in "{disp!(iterable)}") {\n"
                     let indent2 = indent.inc_nesting();
                     for stmt in stmts {
                         {indent2}{stmt.display(&indent2, code, f)}"\n"
