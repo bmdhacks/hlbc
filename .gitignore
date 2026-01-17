@@ -1,3 +1,6 @@
 /target
 .idea/
 *.hl
+tests/roundtrip/tmp/
+.claude
+CLAUDE.md
