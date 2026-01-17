@@ -11,9 +11,9 @@
 # Paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HLBC_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-HAXE="/home/bmd/haxe_heaps_gles/haxe/haxe"
+HAXE="/usr/bin/haxe"
 HLBC="$HLBC_ROOT/target/debug/hlbc"
-HL="/home/bmd/haxe_heaps_gles/hashlink/build/bin/hl"
+HL="/home/bmd/dev/hashlink/build/bin/hl"
 
 # Directories
 SRC_DIR="$SCRIPT_DIR/src"
