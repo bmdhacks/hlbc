@@ -28,7 +28,7 @@ const STDLIB_CLASSES: &[&str] = &[
     "Reflect",
     "Std",
     "StdTypes",
-    "String",
+    // "String" - excluded, too common to shadow
     "StringBuf",
     "StringTools",
     "Sys",

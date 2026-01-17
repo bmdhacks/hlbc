@@ -148,6 +148,10 @@ pub struct Structurer<'a> {
     /// Opcodes to suppress (not emit as statements)
     /// Used when an opcode's result is consumed by another construct (e.g., EnumIndex for switch)
     suppressed_ops: HashSet<usize>,
+    /// Enum pattern bindings: maps (switch_reg, construct_idx, field_idx) -> bound param name
+    /// When set, EnumField opcodes matching these keys emit the param name
+    /// instead of Type.enumParameters(...). Used to generate cleaner switch case patterns.
+    enum_param_bindings: HashMap<(Reg, usize, usize), String>,
 }
 
 impl<'a> Structurer<'a> {
@@ -223,6 +227,7 @@ impl<'a> Structurer<'a> {
             current_loop_header: None,
             inline_exprs: RefCell::new(HashMap::new()),
             suppressed_ops: HashSet::new(),
+            enum_param_bindings: HashMap::new(),
         }
     }
 
@@ -856,84 +861,101 @@ impl<'a> Structurer<'a> {
     }
 
     /// Inner implementation of structure_from (separated for recursion depth tracking)
+    /// Uses iterative processing for sequential blocks to avoid deep recursion
     fn structure_from_inner(&mut self, start: NodeIndex, stop_at: Option<NodeIndex>) -> Vec<Statement> {
-        let block_start_op = self.cfg.graph[start].start;
+        let mut all_stmts = Vec::new();
+        let mut current = Some(start);
 
-        // Check if this block starts a string switch
-        if let Some(switch_region) = self.string_switches.iter().find(|s| s.start_op == block_start_op).cloned() {
-            return self.structure_string_switch(&switch_region, stop_at);
-        }
+        while let Some(block) = current {
+            // Check stop conditions
+            if Some(block) == stop_at || self.processed.contains(&block) {
+                break;
+            }
 
-        // Check if this is a loop header
-        if let Some(loop_info) = self.analysis.loops.iter().find(|l| l.header == start).cloned() {
-            return self.structure_loop(&loop_info, stop_at);
-        }
+            let block_start_op = self.cfg.graph[block].start;
+            let block_end_op = self.cfg.graph[block].end;
 
-        // NOTE: Old CFG-based try/catch handling disabled in favor of
-        // ExceptionAnalysis-based approach in structure_block/structure_block_range.
-        // The CFG exception edges don't correctly handle nested Trap/EndTrap pairs.
-        // if let Some(handler) = self.cfg.get_exception_handler(start) {
-        //     return self.structure_try_catch(start, handler, stop_at);
-        // }
-
-        self.processed.insert(start);
-        let mut stmts = self.structure_block(start);
-
-        // Get successors
-        let succs: Vec<NodeIndex> = self.cfg.successors(start);
-
-        match succs.len() {
-            0 => stmts, // Terminal
-            1 => {
-                // Check if this is a `continue` statement:
-                // If the only successor is the loop header AND we're actually inside a loop
-                // (current_loop_header matches), and this block produced no statements
-                // (just a JAlways), emit Continue.
-                let is_in_loop = self.current_loop_header.is_some()
-                    && Some(succs[0]) == self.current_loop_header;
-                if is_in_loop && Some(succs[0]) == stop_at && stmts.is_empty() {
-                    // This block only contains a jump back to the loop header
-                    // Check if the block really only has a JAlways (not other ops)
-                    let block = &self.cfg.graph[start];
-                    let is_pure_jump = block.start == block.end
-                        && matches!(self.func.ops.get(block.start), Some(Opcode::JAlways { .. } | Opcode::Label));
-                    if is_pure_jump || block.end == block.start {
-                        stmts.push(Statement::Continue);
-                        return stmts;
+            // Check if this block CONTAINS a string switch (may start mid-block after setup ops)
+            if let Some(switch_region) = self.string_switches.iter()
+                .find(|s| s.start_op >= block_start_op && s.start_op <= block_end_op)
+                .cloned()
+            {
+                // Structure any ops before the switch starts (e.g., NullCheck, Field ops)
+                if switch_region.start_op > block_start_op {
+                    for op_idx in block_start_op..switch_region.start_op {
+                        self.current_op = op_idx;
+                        all_stmts.extend(self.opcode_to_statements(op_idx));
                     }
                 }
+                all_stmts.extend(self.structure_string_switch(&switch_region, stop_at));
+                break; // String switch handles its own continuation
+            }
 
-                // Check if this is a `break` statement:
-                // If we're inside a loop and the successor is outside the loop body,
-                // and this block is just a JAlways, emit Break.
-                if let Some(header) = self.current_loop_header {
-                    if let Some(loop_info) = self.analysis.loops.iter().find(|l| l.header == header) {
-                        if !loop_info.body.contains(&succs[0]) && stmts.is_empty() {
-                            // The successor is outside the loop - this is a break
-                            let block = &self.cfg.graph[start];
-                            let is_pure_jump = block.start == block.end
-                                && matches!(self.func.ops.get(block.start), Some(Opcode::JAlways { .. } | Opcode::Label));
-                            if is_pure_jump || block.end == block.start {
-                                stmts.push(Statement::Break);
-                                return stmts;
+            // Check if this is a loop header
+            if let Some(loop_info) = self.analysis.loops.iter().find(|l| l.header == block).cloned() {
+                all_stmts.extend(self.structure_loop(&loop_info, stop_at));
+                break; // Loop handles its own continuation
+            }
+
+            self.processed.insert(block);
+            let stmts = self.structure_block(block);
+            all_stmts.extend(stmts);
+
+            // Get successors
+            let succs: Vec<NodeIndex> = self.cfg.successors(block);
+
+            match succs.len() {
+                0 => {
+                    // Terminal block - done
+                    break;
+                }
+                1 => {
+                    // Single successor - check for continue/break, then iterate
+                    let is_in_loop = self.current_loop_header.is_some()
+                        && Some(succs[0]) == self.current_loop_header;
+                    if is_in_loop && Some(succs[0]) == stop_at {
+                        let block_data = &self.cfg.graph[block];
+                        let is_pure_jump = block_data.start == block_data.end
+                            && matches!(self.func.ops.get(block_data.start), Some(Opcode::JAlways { .. } | Opcode::Label));
+                        if is_pure_jump || block_data.end == block_data.start {
+                            all_stmts.push(Statement::Continue);
+                            break;
+                        }
+                    }
+
+                    if let Some(header) = self.current_loop_header {
+                        if let Some(loop_info) = self.analysis.loops.iter().find(|l| l.header == header) {
+                            if !loop_info.body.contains(&succs[0]) {
+                                let block_data = &self.cfg.graph[block];
+                                let is_pure_jump = block_data.start == block_data.end
+                                    && matches!(self.func.ops.get(block_data.start), Some(Opcode::JAlways { .. } | Opcode::Label));
+                                if is_pure_jump || block_data.end == block_data.start {
+                                    all_stmts.push(Statement::Break);
+                                    break;
+                                }
                             }
                         }
                     }
-                }
 
-                stmts.extend(self.structure_from(succs[0], stop_at));
-                stmts
-            }
-            2 => {
-                stmts.extend(self.structure_conditional(start, &succs, stop_at));
-                stmts
-            }
-            _ => {
-                // Switch statement - multiple successors means multiple cases
-                stmts.extend(self.structure_switch(start, &succs, stop_at));
-                stmts
+                    // Continue to next block iteratively
+                    current = Some(succs[0]);
+                }
+                2 => {
+                    // Conditional - structure it and get the continuation point
+                    let (cond_stmts, continuation) = self.structure_conditional_with_continuation(block, &succs, stop_at);
+                    all_stmts.extend(cond_stmts);
+                    current = continuation;
+                }
+                _ => {
+                    // Switch statement - structure it and get the continuation point
+                    let (switch_stmts, continuation) = self.structure_switch_with_continuation(block, &succs, stop_at);
+                    all_stmts.extend(switch_stmts);
+                    current = continuation;
+                }
             }
         }
+
+        all_stmts
     }
 
     /// Structure a detected string switch pattern
@@ -1464,6 +1486,171 @@ impl<'a> Structurer<'a> {
         }
     }
 
+    /// Structure a conditional and return (statements, continuation_point)
+    /// This version doesn't process the continuation - caller handles it iteratively
+    fn structure_conditional_with_continuation(
+        &mut self,
+        block: NodeIndex,
+        succs: &[NodeIndex],
+        stop_at: Option<NodeIndex>,
+    ) -> (Vec<Statement>, Option<NodeIndex>) {
+        // Collect the if-else-if chain iteratively
+        let mut chain: Vec<(Vec<Statement>, Expr, Vec<Statement>)> = vec![];
+        let mut current_block = Some(block);
+        let mut final_merge: Option<NodeIndex> = None;
+        let mut is_first = true;
+        let mut has_preambles = false;
+
+        self.scope_depth += 1;
+
+        while let Some(blk) = current_block {
+            if !is_first && self.processed.contains(&blk) {
+                break;
+            }
+
+            let preamble = if is_first {
+                is_first = false;
+                vec![]
+            } else {
+                self.processed.insert(blk);
+                let p = self.structure_block(blk);
+                if !p.is_empty() {
+                    has_preambles = true;
+                }
+                p
+            };
+
+            let block_data = &self.cfg.graph[blk];
+            let last_op = &self.func.ops[block_data.end];
+
+            self.current_op = block_data.end;
+            if let Some((ssa_dst, ssa_uses)) = self.ssa.get_instr_for_op(block_data.end) {
+                self.current_ssa_dst = ssa_dst;
+                self.current_ssa_uses = ssa_uses.clone();
+            } else {
+                self.current_ssa_dst = None;
+                self.current_ssa_uses.clear();
+            }
+
+            let (condition, then_target, else_target) = self.extract_condition(block_data.end, last_op);
+
+            let merge = self.find_merge_point(then_target, else_target);
+            if merge.is_some() {
+                final_merge = merge;
+            }
+
+            self.processed.insert(blk);
+
+            let is_not_eq = matches!(&condition, Expr::Op(Operation::NotEq(_, _)));
+
+            if is_not_eq {
+                let eq_condition = if let Expr::Op(Operation::NotEq(a, b)) = &condition {
+                    Expr::Op(Operation::Eq(a.clone(), b.clone()))
+                } else {
+                    condition.clone()
+                };
+
+                let chain_merge = if let Some(e) = else_target {
+                    let case_succs = self.cfg.successors(e);
+                    if case_succs.len() == 1 { Some(case_succs[0]) } else { merge }
+                } else {
+                    merge
+                };
+
+                if chain_merge.is_some() {
+                    final_merge = chain_merge;
+                }
+
+                let effective_stop = chain_merge.or(stop_at);
+                let case_stmts = self.structure_branch(else_target, effective_stop);
+                chain.push((preamble, eq_condition, case_stmts));
+
+                if let Some(t) = then_target {
+                    if Some(t) != chain_merge && self.is_chain_candidate(t) {
+                        current_block = Some(t);
+                        continue;
+                    }
+                }
+
+                let else_stmts = self.structure_branch(then_target, effective_stop);
+                let stmts = self.build_conditional_result_no_continuation(chain, else_stmts, has_preambles);
+                return (stmts, self.get_unprocessed_continuation(final_merge, stop_at));
+            }
+
+            let effective_stop = merge.or(stop_at);
+            let then_stmts = self.structure_branch(then_target, effective_stop);
+            chain.push((preamble, condition, then_stmts));
+
+            if let Some(e) = else_target {
+                if Some(e) != merge && self.is_chain_candidate(e) {
+                    current_block = Some(e);
+                    continue;
+                }
+            }
+
+            let else_stmts = self.structure_branch(else_target, effective_stop);
+            let stmts = self.build_conditional_result_no_continuation(chain, else_stmts, has_preambles);
+            return (stmts, self.get_unprocessed_continuation(final_merge, stop_at));
+        }
+
+        self.scope_depth -= 1;
+
+        if chain.is_empty() {
+            return (vec![], None);
+        }
+
+        let stmts = self.build_conditional_result_no_continuation(chain, vec![], has_preambles);
+        (stmts, self.get_unprocessed_continuation(final_merge, stop_at))
+    }
+
+    /// Build conditional result without processing continuation
+    fn build_conditional_result_no_continuation(
+        &mut self,
+        chain: Vec<(Vec<Statement>, Expr, Vec<Statement>)>,
+        else_stmts: Vec<Statement>,
+        has_preambles: bool,
+    ) -> Vec<Statement> {
+        self.scope_depth -= 1;
+
+        if has_preambles {
+            self.build_nested_if_else(chain, else_stmts)
+        } else {
+            let flat_chain: Vec<(Expr, Vec<Statement>)> = chain.into_iter()
+                .map(|(_, cond, body)| (cond, body))
+                .collect();
+
+            if flat_chain.len() > 1 {
+                vec![Statement::IfElseChain {
+                    branches: flat_chain,
+                    else_: else_stmts,
+                }]
+            } else if flat_chain.len() == 1 {
+                let (cond, then_stmts) = flat_chain.into_iter().next().unwrap();
+                if then_stmts.is_empty() && else_stmts.is_empty() {
+                    vec![]
+                } else {
+                    vec![Statement::IfElse {
+                        cond,
+                        if_: then_stmts,
+                        else_: else_stmts,
+                    }]
+                }
+            } else {
+                else_stmts
+            }
+        }
+    }
+
+    /// Get the continuation point if it's unprocessed and not at stop_at
+    fn get_unprocessed_continuation(&self, merge: Option<NodeIndex>, stop_at: Option<NodeIndex>) -> Option<NodeIndex> {
+        if let Some(m) = merge {
+            if Some(m) != stop_at && !self.processed.contains(&m) {
+                return Some(m);
+            }
+        }
+        None
+    }
+
     /// Structure a conditional - collects if-else-if chains iteratively
     /// Chain entry: (preamble_statements, condition, then_body)
     fn structure_conditional(
@@ -1517,8 +1704,10 @@ impl<'a> Structurer<'a> {
             let (condition, then_target, else_target) = self.extract_condition(block_data.end, last_op);
 
             // Find merge point for this conditional
+            // Update final_merge to track the continuation after the chain
+            // (should be the LAST entry's merge point, not the first)
             let merge = self.find_merge_point(then_target, else_target);
-            if final_merge.is_none() {
+            if merge.is_some() {
                 final_merge = merge;
             }
 
@@ -1543,7 +1732,9 @@ impl<'a> Structurer<'a> {
                     merge
                 };
 
-                if final_merge.is_none() && chain_merge.is_some() {
+                // Update final_merge to track the continuation after the chain
+                // (should be the LAST entry's merge point, not the first)
+                if chain_merge.is_some() {
                     final_merge = chain_merge;
                 }
 
@@ -1790,10 +1981,34 @@ impl<'a> Structurer<'a> {
         }
     }
 
-    /// Find merge point of two branches
+    /// Check if a block terminates (ends with Ret, Throw, or Rethrow)
+    fn block_terminates(&self, block: NodeIndex) -> bool {
+        let block_data = &self.cfg.graph[block];
+        matches!(
+            &self.func.ops[block_data.end],
+            Opcode::Ret { .. } | Opcode::Throw { .. } | Opcode::Rethrow { .. }
+        )
+    }
+
+    /// Check if a branch terminates (the target block ends in return/throw)
+    fn branch_terminates(&self, target: Option<NodeIndex>) -> bool {
+        match target {
+            Some(block) => {
+                // Check if the block itself terminates
+                self.block_terminates(block) || self.cfg.successors(block).is_empty()
+            }
+            None => true, // No target = terminates
+        }
+    }
+
+    /// Find merge point of two branches.
+    /// If one branch terminates (return/throw) and the other branch doesn't eventually
+    /// reach the same terminator, the non-terminating branch IS the merge point.
     fn find_merge_point(&self, a: Option<NodeIndex>, b: Option<NodeIndex>) -> Option<NodeIndex> {
         let a = a?;
         let b = b?;
+
+        // Standard merge point detection: find common successor
         let a_succs: HashSet<_> = self.cfg.successors(a).into_iter().collect();
         let b_succs: HashSet<_> = self.cfg.successors(b).into_iter().collect();
 
@@ -1802,9 +2017,33 @@ impl<'a> Structurer<'a> {
                 return Some(*s);
             }
         }
-        if a_succs.contains(&b) { Some(b) }
-        else if b_succs.contains(&a) { Some(a) }
-        else { None }
+        if a_succs.contains(&b) { return Some(b); }
+        if b_succs.contains(&a) { return Some(a); }
+
+        // If one branch terminates AND the other doesn't reach it,
+        // the non-terminating branch is where control "continues" after the if.
+        // But only apply this if the other branch doesn't eventually flow into
+        // the terminating branch (which would mean they share a merge point).
+        let a_terminates = self.branch_terminates(Some(a));
+        let b_terminates = self.branch_terminates(Some(b));
+
+        // If BOTH branches terminate, there is no merge point
+        if a_terminates && b_terminates {
+            return None;
+        }
+
+        if a_terminates && !b_succs.contains(&a) {
+            // Branch 'a' returns, branch 'b' doesn't flow into 'a'
+            // So 'b' is the continuation point
+            return Some(b);
+        }
+        if b_terminates && !a_succs.contains(&b) {
+            // Branch 'b' returns, branch 'a' doesn't flow into 'b'
+            // So 'a' is the continuation point
+            return Some(a);
+        }
+
+        None
     }
 
     /// Analyze an if-else-if chain to see if it can be converted to a switch statement.
@@ -2268,12 +2507,51 @@ impl<'a> Structurer<'a> {
         }))
     }
 
+    /// Structure a switch statement and return (statements, continuation_point)
+    /// This version doesn't process the continuation - caller handles it iteratively
+    fn structure_switch_with_continuation(
+        &mut self,
+        block: NodeIndex,
+        succs: &[NodeIndex],
+        stop_at: Option<NodeIndex>,
+    ) -> (Vec<Statement>, Option<NodeIndex>) {
+        // Use the core switch logic but capture the merge point
+        let merge_point = self.find_switch_merge_point(block);
+
+        // Structure the switch without continuation
+        let stmts = self.structure_switch_core(block, succs, stop_at, false);
+
+        // Return unprocessed continuation
+        let continuation = if let Some(m) = merge_point {
+            if Some(m) != stop_at && !self.processed.contains(&m) {
+                Some(m)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        (stmts, continuation)
+    }
+
     /// Structure a switch statement
     fn structure_switch(
         &mut self,
         block: NodeIndex,
         _succs: &[NodeIndex],
         stop_at: Option<NodeIndex>,
+    ) -> Vec<Statement> {
+        self.structure_switch_core(block, _succs, stop_at, true)
+    }
+
+    /// Core switch structuring logic
+    fn structure_switch_core(
+        &mut self,
+        block: NodeIndex,
+        _succs: &[NodeIndex],
+        stop_at: Option<NodeIndex>,
+        do_continuation: bool,
     ) -> Vec<Statement> {
         let block_data = &self.cfg.graph[block];
         let last_op = &self.func.ops[block_data.end];
@@ -2301,7 +2579,8 @@ impl<'a> Structurer<'a> {
 
         // Check if switch_arg is Type.enumIndex(x) and unwrap to just x
         // Also extract the enum type for proper case pattern formatting
-        let (switch_arg, enum_type) = self.unwrap_enum_index_switch(switch_arg, switch_reg);
+        // enum_value_reg is the register holding the actual enum value (for pattern binding)
+        let (switch_arg, enum_type, enum_value_reg) = self.unwrap_enum_index_switch(switch_arg, switch_reg);
 
         // Group cases by their target opcode
         // offsets[i] = offset for case value i, target = switch_op_idx + 1 + offset
@@ -2341,11 +2620,23 @@ impl<'a> Structurer<'a> {
         let mut sorted_targets: Vec<_> = target_to_cases.into_iter().collect();
         sorted_targets.sort_by_key(|(_, vals)| vals.iter().min().copied().unwrap_or(0));
 
-        for (target_op, case_vals) in sorted_targets {
-            if processed_targets.contains(&target_op) {
+        // Determine the merge_op for scanning case body ranges
+        let merge_op = merge_point.and_then(|mp| {
+            let mp_block = &self.cfg.graph[mp];
+            Some(mp_block.start)
+        }).unwrap_or(self.func.ops.len());
+
+        // Collect sorted target ops for determining case body end points
+        let all_target_ops: Vec<usize> = sorted_targets.iter().map(|(op, _)| *op).collect();
+
+        for (idx, (target_op, case_vals)) in sorted_targets.iter().enumerate() {
+            if processed_targets.contains(target_op) {
                 continue;
             }
-            processed_targets.insert(target_op);
+            processed_targets.insert(*target_op);
+
+            // Determine the end of this case's body (next case target or merge)
+            let case_end_op = all_target_ops.get(idx + 1).copied().unwrap_or(merge_op);
 
             // Convert case values to expressions
             // If we have an enum type, use constructor names instead of integers
@@ -2359,12 +2650,34 @@ impl<'a> Structurer<'a> {
                                 let name = self.code.strings.get(construct.name.0)
                                     .cloned()
                                     .unwrap_or_else(|| format!("_{}", v).into());
-                                // If constructor has parameters, emit EnumConstr with wildcards
+                                // If constructor has parameters, check if we can bind them
                                 if !construct.params.is_empty() {
-                                    let wildcards: Vec<Expr> = construct.params.iter()
-                                        .map(|_| Expr::Ident("_".into()))
+                                    // Scan the case body for EnumField accesses on this construct
+                                    let accessed_fields = if let Some(enum_reg) = enum_value_reg {
+                                        self.scan_enum_field_accesses(enum_reg, *target_op, case_end_op)
+                                    } else {
+                                        HashSet::new()
+                                    };
+
+                                    // Generate bindings for accessed fields, wildcards for others
+                                    let bindings: Vec<Expr> = construct.params.iter().enumerate()
+                                        .map(|(i, _)| {
+                                            if accessed_fields.contains(&(v, i)) {
+                                                let param_name = format!("param{}", i);
+                                                // Register this binding for EnumField handler
+                                                if let Some(enum_reg) = enum_value_reg {
+                                                    self.enum_param_bindings.insert(
+                                                        (enum_reg, v, i),
+                                                        param_name.clone()
+                                                    );
+                                                }
+                                                Expr::Ident(param_name.into())
+                                            } else {
+                                                Expr::Ident("_".into())
+                                            }
+                                        })
                                         .collect();
-                                    return Expr::EnumConstr(ref_type, RefEnumConstruct(v), wildcards);
+                                    return Expr::EnumConstr(ref_type, RefEnumConstruct(v), bindings);
                                 }
                                 return Expr::Ident(name);
                             }
@@ -2376,9 +2689,9 @@ impl<'a> Structurer<'a> {
                 .collect();
 
             // Skip default case target if it's also a case target
-            if target_op == default_op {
+            if *target_op == default_op {
                 // Add to cases instead of default
-                let stmts = if let Some(target_block) = self.cfg.block_for_op(target_op) {
+                let stmts = if let Some(target_block) = self.cfg.block_for_op(*target_op) {
                     if !self.processed.contains(&target_block) {
                         self.structure_from(target_block, merge_point)
                     } else {
@@ -2391,7 +2704,7 @@ impl<'a> Structurer<'a> {
                 continue;
             }
 
-            let stmts = if let Some(target_block) = self.cfg.block_for_op(target_op) {
+            let stmts = if let Some(target_block) = self.cfg.block_for_op(*target_op) {
                 if !self.processed.contains(&target_block) {
                     self.structure_from(target_block, merge_point)
                 } else {
@@ -2473,12 +2786,17 @@ impl<'a> Structurer<'a> {
             enum_type,
         });
 
-        // Continue after merge
-        if let Some(m) = merge_point {
-            if Some(m) != stop_at && !self.processed.contains(&m) {
-                result.extend(self.structure_from(m, stop_at));
+        // Continue after merge (only if requested)
+        if do_continuation {
+            if let Some(m) = merge_point {
+                if Some(m) != stop_at && !self.processed.contains(&m) {
+                    result.extend(self.structure_from(m, stop_at));
+                }
             }
         }
+
+        // Clear enum param bindings after processing switch
+        self.enum_param_bindings.clear();
 
         result
     }
@@ -2504,21 +2822,25 @@ impl<'a> Structurer<'a> {
             }
         }
 
-        // The merge point should be reachable from all/most cases
+        // The merge point must be reachable from at least 2 cases to be valid.
+        // If only one case reaches a node, it's part of that case's control flow,
+        // not a merge point. This prevents incorrectly skipping branches.
         candidate_merges
             .into_iter()
+            .filter(|(_, count)| *count >= 2)
             .max_by_key(|(_, count)| *count)
             .map(|(node, _)| node)
     }
 
     /// Check if switch_arg is Type.enumIndex(x) and unwrap to just x
     /// Also check if switch_reg was produced by EnumIndex opcode
-    /// Returns (unwrapped_arg, optional_enum_type)
+    /// Returns (unwrapped_arg, optional_enum_type, optional_enum_value_reg)
+    /// The enum_value_reg is the register holding the actual enum value (for pattern binding)
     fn unwrap_enum_index_switch(
         &mut self,
         switch_arg: Expr,
         switch_reg: Reg,
-    ) -> (Expr, Option<RefType>) {
+    ) -> (Expr, Option<RefType>, Option<Reg>) {
         // Check if switch_arg is Type.enumIndex(x) (already inlined)
         if let Expr::Call(call) = &switch_arg {
             if let Expr::Field(base, method) = &call.fun {
@@ -2526,9 +2848,14 @@ impl<'a> Structurer<'a> {
                     if let Expr::Ident(name) = base.as_ref() {
                         if name.as_ref() == "Type" {
                             if let Some(inner_arg) = call.args.first() {
-                                // Try to get enum type from the inner argument
+                                // Try to get enum type and register from the inner argument
                                 let enum_type = self.get_enum_type_from_expr(inner_arg);
-                                return (inner_arg.clone(), enum_type);
+                                let enum_reg = if let Expr::Variable(reg, _) = inner_arg {
+                                    Some(*reg)
+                                } else {
+                                    None
+                                };
+                                return (inner_arg.clone(), enum_type, enum_reg);
                             }
                         }
                     }
@@ -2565,14 +2892,36 @@ impl<'a> Structurer<'a> {
                     let enum_type = self.get_enum_type_for_reg(enum_reg);
                     // Suppress the EnumIndex opcode since we're using the enum directly
                     self.suppressed_ops.insert(def_op_idx);
-                    return (enum_expr, enum_type);
+                    return (enum_expr, enum_type, Some(enum_reg));
                 }
             }
         }
 
         // Not a Type.enumIndex call - try to get enum type from the register's type
         let enum_type = self.get_enum_type_for_reg(switch_reg);
-        (switch_arg, enum_type)
+        (switch_arg, enum_type, None)
+    }
+
+    /// Scan opcodes in a case body to find which enum fields are accessed.
+    /// Returns a set of (construct_idx, field_idx) pairs.
+    fn scan_enum_field_accesses(
+        &self,
+        enum_value_reg: Reg,
+        start_op: usize,
+        end_op: usize,
+    ) -> HashSet<(usize, usize)> {
+        let mut accessed = HashSet::new();
+        for idx in start_op..end_op {
+            if idx >= self.func.ops.len() {
+                break;
+            }
+            if let Opcode::EnumField { value, construct, field, .. } = &self.func.ops[idx] {
+                if *value == enum_value_reg {
+                    accessed.insert((construct.0, field.0));
+                }
+            }
+        }
+        accessed
     }
 
     /// Try to get the enum type from an expression
@@ -3838,6 +4187,16 @@ impl<'a> Structurer<'a> {
                         return stmts;
                     }
                 }
+
+                // Check if this field access has a bound param name from switch pattern
+                let binding_key = (*value, construct.0, field.0);
+                if let Some(param_name) = self.enum_param_bindings.get(&binding_key).cloned() {
+                    let var = self.reg_to_expr_dst(*dst);
+                    let expr = Expr::Ident(param_name.into());
+                    stmts.push(self.make_assign(var, expr));
+                    return stmts;
+                }
+
                 // Normal enum field access - use Type.enumParameters(value)[index]
                 // This is the proper Haxe way to extract enum parameters dynamically
                 let var = self.reg_to_expr_dst(*dst);

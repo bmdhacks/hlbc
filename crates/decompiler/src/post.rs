@@ -1458,12 +1458,30 @@ fn inline_constant_returns_pass(
 ) -> bool {
     let mut changed = false;
     let mut i = 0;
+
+    // For large functions, use conservative approach (all vars) to avoid O(n²) complexity.
+    // For normal functions, use precise per-position tracking for better inlining.
+    let use_conservative = stmts.len() > LARGE_FUNCTION_THRESHOLD;
+    let vars_used_from = if use_conservative {
+        Vec::new() // Won't be used
+    } else {
+        precompute_vars_used_from(stmts)
+    };
+    let all_vars_used = if use_conservative {
+        collect_all_var_names(stmts)
+    } else {
+        std::collections::HashSet::new() // Won't be used
+    };
+
     while i < stmts.len() {
         // First, recurse into nested structures, passing along info about
         // variables used later in this scope (so nested scopes don't inline them)
-        let vars_used_after = collect_vars_used_in_remaining(stmts, i + 1);
         let mut combined_outer: std::collections::HashSet<String> = outer_used_vars.clone();
-        combined_outer.extend(vars_used_after);
+        if use_conservative {
+            combined_outer.extend(all_vars_used.iter().cloned());
+        } else if i + 1 < vars_used_from.len() {
+            combined_outer.extend(vars_used_from[i + 1].iter().cloned());
+        }
 
         match &mut stmts[i] {
             Statement::IfElse { if_, else_, .. } => {
@@ -1545,13 +1563,35 @@ fn inline_constant_returns_pass(
     changed
 }
 
-/// Collect all variable names used in statements from index `start` onwards
-fn collect_vars_used_in_remaining(stmts: &[Statement], start: usize) -> std::collections::HashSet<String> {
-    let mut used = std::collections::HashSet::new();
-    for stmt in stmts.iter().skip(start) {
-        collect_var_names_in_stmt(stmt, &mut used);
+/// Threshold for switching to conservative variable tracking.
+/// Functions with more statements than this use the fast conservative approach.
+const LARGE_FUNCTION_THRESHOLD: usize = 1000;
+
+/// Pre-compute variable usage sets for all suffix positions.
+/// `result[i]` contains all variable names used in statements from index i to end.
+/// This allows O(1) lookup instead of O(n) rescanning.
+/// Note: This is O(n × m) due to cloning, where m = unique variable count.
+fn precompute_vars_used_from(stmts: &[Statement]) -> Vec<std::collections::HashSet<String>> {
+    let mut result = vec![std::collections::HashSet::new(); stmts.len() + 1];
+
+    // Build from end to start: result[i] = result[i+1] ∪ vars_in(stmts[i])
+    for i in (0..stmts.len()).rev() {
+        result[i] = result[i + 1].clone();
+        collect_var_names_in_stmt(&stmts[i], &mut result[i]);
     }
-    used
+
+    result
+}
+
+/// Collect all variable names used anywhere in the statements.
+/// This is a conservative over-approximation: treats all variables as potentially
+/// used later, which may miss some inlining opportunities but is truly O(n).
+fn collect_all_var_names(stmts: &[Statement]) -> std::collections::HashSet<String> {
+    let mut result = std::collections::HashSet::new();
+    for stmt in stmts {
+        collect_var_names_in_stmt(stmt, &mut result);
+    }
+    result
 }
 
 fn collect_var_names_in_stmt(stmt: &Statement, used: &mut std::collections::HashSet<String>) {

@@ -146,13 +146,18 @@ impl<'a> BatchDecompiler<'a> {
     /// Decompile all types to the output directory.
     #[cfg(feature = "batch")]
     pub fn decompile_all(&self, output_dir: &Path) -> io::Result<IndexFile> {
-        // Configure rayon thread pool if jobs specified
-        if let Some(jobs) = self.batch_opts.jobs {
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(jobs)
-                .build_global()
-                .ok(); // Ignore error if pool already initialized
-        }
+        // Configure rayon thread pool with larger stack size for deeply nested AST
+        // (some functions like level.LevelStruct.get have 100+ nested if statements)
+        let pool_builder = rayon::ThreadPoolBuilder::new()
+            .stack_size(16 * 1024 * 1024); // 16MB stack per thread
+
+        let pool_builder = if let Some(jobs) = self.batch_opts.jobs {
+            pool_builder.num_threads(jobs)
+        } else {
+            pool_builder
+        };
+
+        pool_builder.build_global().ok(); // Ignore error if pool already initialized
 
         let mut index = IndexFile::new();
 
