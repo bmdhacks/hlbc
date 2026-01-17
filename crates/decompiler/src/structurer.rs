@@ -16,8 +16,8 @@ use hlbc::types::{Function, Reg, RefFun, RefField, RefString, RefEnumConstruct, 
 use hlbc::{Bytecode, Resolve, Str};
 
 use crate::analyzer::{CfgAnalysis, NaturalLoop};
-use crate::ast::{not, Call, Constant, ConstructorCall, Expr, Operation, Statement};
-use crate::lifter::{BasicBlock, Cfg};
+use crate::ast::{Call, Constant, ConstructorCall, Expr, Operation, Statement};
+use crate::lifter::Cfg;
 use hlbc::types::RefType;
 use crate::ssa::{SsaCfg, SsaInstr, SsaVar, get_dst_reg as get_opcode_dst};
 use crate::type_prop::TypeInfo;
@@ -884,7 +884,8 @@ impl<'a> Structurer<'a> {
                 if switch_region.start_op > block_start_op {
                     for op_idx in block_start_op..switch_region.start_op {
                         self.current_op = op_idx;
-                        all_stmts.extend(self.opcode_to_statements(op_idx));
+                        let new_stmts = self.opcode_to_statements(op_idx);
+                        all_stmts.extend(new_stmts);
                     }
                 }
                 all_stmts.extend(self.structure_string_switch(&switch_region, stop_at));
@@ -942,7 +943,7 @@ impl<'a> Structurer<'a> {
                 }
                 2 => {
                     // Conditional - structure it and get the continuation point
-                    let (cond_stmts, continuation) = self.structure_conditional_with_continuation(block, &succs, stop_at);
+                    let (cond_stmts, continuation) = self.structure_conditional(block, &succs, stop_at);
                     all_stmts.extend(cond_stmts);
                     current = continuation;
                 }
@@ -1158,7 +1159,8 @@ impl<'a> Structurer<'a> {
                 }
             }
 
-            stmts.extend(self.opcode_to_statements(op_idx));
+            let new_stmts = self.opcode_to_statements(op_idx);
+            stmts.extend(new_stmts);
             op_idx += 1;
         }
         stmts
@@ -1268,7 +1270,8 @@ impl<'a> Structurer<'a> {
                 }
             }
 
-            stmts.extend(self.opcode_to_statements(op_idx));
+            let new_stmts = self.opcode_to_statements(op_idx);
+            stmts.extend(new_stmts);
             op_idx += 1;
         }
         stmts
@@ -1487,11 +1490,11 @@ impl<'a> Structurer<'a> {
     }
 
     /// Structure a conditional and return (statements, continuation_point)
-    /// This version doesn't process the continuation - caller handles it iteratively
-    fn structure_conditional_with_continuation(
+    /// Caller handles the continuation iteratively to avoid deep recursion
+    fn structure_conditional(
         &mut self,
         block: NodeIndex,
-        succs: &[NodeIndex],
+        _succs: &[NodeIndex],
         stop_at: Option<NodeIndex>,
     ) -> (Vec<Statement>, Option<NodeIndex>) {
         // Collect the if-else-if chain iteratively
@@ -1573,7 +1576,7 @@ impl<'a> Structurer<'a> {
                 }
 
                 let else_stmts = self.structure_branch(then_target, effective_stop);
-                let stmts = self.build_conditional_result_no_continuation(chain, else_stmts, has_preambles);
+                let stmts = self.build_conditional_result(chain, else_stmts, has_preambles);
                 return (stmts, self.get_unprocessed_continuation(final_merge, stop_at));
             }
 
@@ -1589,7 +1592,7 @@ impl<'a> Structurer<'a> {
             }
 
             let else_stmts = self.structure_branch(else_target, effective_stop);
-            let stmts = self.build_conditional_result_no_continuation(chain, else_stmts, has_preambles);
+            let stmts = self.build_conditional_result(chain, else_stmts, has_preambles);
             return (stmts, self.get_unprocessed_continuation(final_merge, stop_at));
         }
 
@@ -1599,12 +1602,13 @@ impl<'a> Structurer<'a> {
             return (vec![], None);
         }
 
-        let stmts = self.build_conditional_result_no_continuation(chain, vec![], has_preambles);
+        let stmts = self.build_conditional_result(chain, vec![], has_preambles);
         (stmts, self.get_unprocessed_continuation(final_merge, stop_at))
     }
 
     /// Build conditional result without processing continuation
-    fn build_conditional_result_no_continuation(
+    /// Includes optimizations: switch conversion, ternary condensation
+    fn build_conditional_result(
         &mut self,
         chain: Vec<(Vec<Statement>, Expr, Vec<Statement>)>,
         else_stmts: Vec<Statement>,
@@ -1619,7 +1623,15 @@ impl<'a> Structurer<'a> {
                 .map(|(_, cond, body)| (cond, body))
                 .collect();
 
-            if flat_chain.len() > 1 {
+            // Try to convert if-else-if chain to switch statement
+            if let Some((switch_arg, cases)) = self.analyze_for_switch(&flat_chain) {
+                vec![Statement::Switch {
+                    arg: switch_arg,
+                    default: else_stmts,
+                    cases,
+                    enum_type: None,
+                }]
+            } else if flat_chain.len() > 1 {
                 vec![Statement::IfElseChain {
                     branches: flat_chain,
                     else_: else_stmts,
@@ -1628,6 +1640,14 @@ impl<'a> Structurer<'a> {
                 let (cond, then_stmts) = flat_chain.into_iter().next().unwrap();
                 if then_stmts.is_empty() && else_stmts.is_empty() {
                     vec![]
+                }
+                // Try ternary condensation: both branches return directly
+                else if let Some(ternary) = self.try_condense_ternary_return(&cond, &then_stmts, &else_stmts) {
+                    vec![ternary]
+                }
+                // Try ternary assignment: both branches assign to same variable
+                else if let Some(ternary) = self.try_condense_ternary_assign(&cond, &then_stmts, &else_stmts) {
+                    vec![ternary]
                 } else {
                     vec![Statement::IfElse {
                         cond,
@@ -1649,214 +1669,6 @@ impl<'a> Structurer<'a> {
             }
         }
         None
-    }
-
-    /// Structure a conditional - collects if-else-if chains iteratively
-    /// Chain entry: (preamble_statements, condition, then_body)
-    fn structure_conditional(
-        &mut self,
-        block: NodeIndex,
-        _succs: &[NodeIndex],
-        stop_at: Option<NodeIndex>,
-    ) -> Vec<Statement> {
-        // Collect the if-else-if chain iteratively
-        // Each entry: (preamble, condition, then_body)
-        let mut chain: Vec<(Vec<Statement>, Expr, Vec<Statement>)> = vec![];
-        let mut current_block = Some(block);
-        let mut final_merge: Option<NodeIndex> = None;
-        let mut is_first = true;
-        let mut has_preambles = false;
-
-        self.scope_depth += 1;
-
-        while let Some(blk) = current_block {
-            // Skip processed check for first block - structure_from already marked it
-            if !is_first && self.processed.contains(&blk) {
-                break;
-            }
-
-            // Structure preamble for non-first blocks (first block's preamble is in structure_from)
-            let preamble = if is_first {
-                is_first = false;
-                vec![]  // First block's preamble already handled by structure_from
-            } else {
-                self.processed.insert(blk);
-                let p = self.structure_block(blk);
-                if !p.is_empty() {
-                    has_preambles = true;
-                }
-                p
-            };
-
-            let block_data = &self.cfg.graph[blk];
-            let last_op = &self.func.ops[block_data.end];
-
-            // Set SSA context for the conditional jump opcode
-            self.current_op = block_data.end;
-            if let Some((ssa_dst, ssa_uses)) = self.ssa.get_instr_for_op(block_data.end) {
-                self.current_ssa_dst = ssa_dst;
-                self.current_ssa_uses = ssa_uses.clone();
-            } else {
-                self.current_ssa_dst = None;
-                self.current_ssa_uses.clear();
-            }
-
-            let (condition, then_target, else_target) = self.extract_condition(block_data.end, last_op);
-
-            // Find merge point for this conditional
-            // Update final_merge to track the continuation after the chain
-            // (should be the LAST entry's merge point, not the first)
-            let merge = self.find_merge_point(then_target, else_target);
-            if merge.is_some() {
-                final_merge = merge;
-            }
-
-            // Mark this block as processed (if not already)
-            self.processed.insert(blk);
-
-            // Check if this is a NotEq pattern (used in if-else-if chains compiled from Haxe)
-            let is_not_eq = matches!(&condition, Expr::Op(Operation::NotEq(_, _)));
-
-            if is_not_eq {
-                // NotEq pattern: case body is in else branch, next case is in then branch
-                let eq_condition = if let Expr::Op(Operation::NotEq(a, b)) = &condition {
-                    Expr::Op(Operation::Eq(a.clone(), b.clone()))
-                } else {
-                    condition.clone()
-                };
-
-                let chain_merge = if let Some(e) = else_target {
-                    let case_succs = self.cfg.successors(e);
-                    if case_succs.len() == 1 { Some(case_succs[0]) } else { merge }
-                } else {
-                    merge
-                };
-
-                // Update final_merge to track the continuation after the chain
-                // (should be the LAST entry's merge point, not the first)
-                if chain_merge.is_some() {
-                    final_merge = chain_merge;
-                }
-
-                // Use stop_at as fallback if no merge point found (e.g., inside loops)
-                let effective_stop = chain_merge.or(stop_at);
-                let case_stmts = self.structure_branch(else_target, effective_stop);
-                chain.push((preamble, eq_condition, case_stmts));
-
-                // Check if the then branch can continue the chain
-                if let Some(t) = then_target {
-                    if Some(t) != chain_merge && self.is_chain_candidate(t) {
-                        current_block = Some(t);
-                        continue;
-                    }
-                }
-
-                // End of chain
-                let else_stmts = self.structure_branch(then_target, effective_stop);
-                return self.build_conditional_result(chain, else_stmts, has_preambles, final_merge, stop_at);
-            }
-
-            // Standard pattern: case body is in then branch
-            // Use stop_at as fallback if no merge point found (e.g., inside loops)
-            let effective_stop = merge.or(stop_at);
-            let then_stmts = self.structure_branch(then_target, effective_stop);
-            chain.push((preamble, condition, then_stmts));
-
-            // Check if the else branch can continue the chain
-            if let Some(e) = else_target {
-                if Some(e) != merge && self.is_chain_candidate(e) {
-                    current_block = Some(e);
-                    continue;
-                }
-            }
-
-            // End of chain
-            let else_stmts = self.structure_branch(else_target, effective_stop);
-            return self.build_conditional_result(chain, else_stmts, has_preambles, final_merge, stop_at);
-        }
-
-        self.scope_depth -= 1;
-
-        // Edge case: loop ended without producing result
-        if chain.is_empty() {
-            return vec![];
-        }
-
-        // Build result from accumulated chain (no else)
-        self.build_conditional_result(chain, vec![], has_preambles, final_merge, stop_at)
-    }
-
-    /// Build the final result from a collected conditional chain
-    fn build_conditional_result(
-        &mut self,
-        chain: Vec<(Vec<Statement>, Expr, Vec<Statement>)>,
-        else_stmts: Vec<Statement>,
-        has_preambles: bool,
-        final_merge: Option<NodeIndex>,
-        stop_at: Option<NodeIndex>,
-    ) -> Vec<Statement> {
-        self.scope_depth -= 1;
-
-        let result = if has_preambles {
-            // Build nested IfElse iteratively (from last to first) to include preambles
-            self.build_nested_if_else(chain, else_stmts)
-        } else {
-            // No preambles - can use flat representation
-            // Convert chain to (condition, body) format for analysis
-            let flat_chain: Vec<(Expr, Vec<Statement>)> = chain.into_iter()
-                .map(|(_, cond, body)| (cond, body))
-                .collect();
-
-            if let Some((switch_arg, cases)) = self.analyze_for_switch(&flat_chain) {
-                vec![Statement::Switch {
-                    arg: switch_arg,
-                    default: else_stmts,
-                    cases,
-                    enum_type: None,
-                }]
-            } else if flat_chain.len() > 1 {
-                vec![Statement::IfElseChain {
-                    branches: flat_chain,
-                    else_: else_stmts,
-                }]
-            } else if flat_chain.len() == 1 {
-                let (cond, then_stmts) = flat_chain.into_iter().next().unwrap();
-                // Skip if-else entirely if both branches are empty (e.g., suppressed internal ops)
-                if then_stmts.is_empty() && else_stmts.is_empty() {
-                    vec![]
-                }
-                // Try phi-return optimization: both branches assign, merge returns the phi var
-                else if let Some(optimized) = self.try_simplify_phi_return(&cond, &then_stmts, &else_stmts, final_merge) {
-                    return optimized;
-                }
-                // Try ternary condensation: both branches return directly
-                else if let Some(ternary) = self.try_condense_ternary_return(&cond, &then_stmts, &else_stmts) {
-                    vec![ternary]
-                }
-                // Try ternary assignment: both branches assign to same variable
-                else if let Some(ternary) = self.try_condense_ternary_assign(&cond, &then_stmts, &else_stmts) {
-                    vec![ternary]
-                } else {
-                    vec![Statement::IfElse {
-                        cond,
-                        if_: then_stmts,
-                        else_: else_stmts,
-                    }]
-                }
-            } else {
-                else_stmts
-            }
-        };
-
-        // Continue after merge
-        let mut full_result = result;
-        if let Some(m) = final_merge {
-            if Some(m) != stop_at && !self.processed.contains(&m) {
-                full_result.extend(self.structure_from(m, stop_at));
-            }
-        }
-
-        full_result
     }
 
     /// Build nested IfElse structure iteratively from a chain with preambles
@@ -2421,92 +2233,6 @@ impl<'a> Structurer<'a> {
         })
     }
 
-    /// Check if branches form a phi pattern where:
-    /// - Both branches assign to the same register
-    /// - The merge block immediately returns that register
-    /// Returns Some(optimized_statements) if pattern matched
-    fn try_simplify_phi_return(
-        &mut self,
-        cond: &Expr,
-        if_stmts: &[Statement],
-        else_stmts: &[Statement],
-        merge: Option<NodeIndex>,
-    ) -> Option<Vec<Statement>> {
-        let merge_node = merge?;
-        if self.processed.contains(&merge_node) {
-            return None;
-        }
-
-        // Get the return register from merge block
-        let merge_block = &self.cfg.graph[merge_node];
-        let ret_reg = self.get_merge_return_reg(merge_block)?;
-
-        // Check what each branch assigns to the return register
-        let if_assign = self.extract_assign_to_reg(if_stmts, ret_reg);
-        let else_assign = self.extract_assign_to_reg(else_stmts, ret_reg);
-
-        match (if_assign, else_assign) {
-            // Pattern 1: Both branches assign → ternary return
-            (Some(if_val), Some(else_val)) => {
-                self.processed.insert(merge_node);
-                Some(vec![self.make_ternary_return(cond, if_val, else_val)])
-            }
-            _ => None,
-        }
-    }
-
-    /// Check if merge block's first (and only) instruction is Ret, return the register
-    fn get_merge_return_reg(&self, block: &BasicBlock) -> Option<Reg> {
-        // Block must be a single instruction (just the Ret)
-        if block.start != block.end {
-            return None;
-        }
-        let op = self.func.ops.get(block.start)?;
-        if let &Opcode::Ret { ret } = op {
-            Some(ret)
-        } else {
-            None
-        }
-    }
-
-    /// Extract the assigned value if stmts is a single assignment to the given register
-    fn extract_assign_to_reg(&self, stmts: &[Statement], reg: Reg) -> Option<Expr> {
-        if stmts.len() != 1 {
-            return None;
-        }
-        if let Statement::Assign { variable, assign, .. } = &stmts[0] {
-            if let Expr::Variable(r, _) = variable {
-                if *r == reg {
-                    return Some(assign.clone());
-                }
-            }
-        }
-        None
-    }
-
-    /// Create optimized ternary return, with boolean simplification
-    fn make_ternary_return(&self, cond: &Expr, if_val: Expr, else_val: Expr) -> Statement {
-        // Boolean simplification: if both values are boolean constants
-        if let (Expr::Constant(Constant::Bool(if_b)), Expr::Constant(Constant::Bool(else_b))) =
-            (&if_val, &else_val)
-        {
-            let result = match (if_b, else_b) {
-                (true, false) => cond.clone(),
-                (false, true) => not(cond.clone()),
-                // Both same value - just return one
-                _ => return Statement::Return(Some(if_val)),
-            };
-            return Statement::Return(Some(result));
-        }
-
-        // General case: return cond ? if_val : else_val
-        Statement::Return(Some(Expr::IfElse {
-            cond: Box::new(cond.clone()),
-            if_: vec![Statement::ExprStatement(if_val)],
-            else_: vec![Statement::ExprStatement(else_val)],
-        }))
-    }
-
     /// Structure a switch statement and return (statements, continuation_point)
     /// This version doesn't process the continuation - caller handles it iteratively
     fn structure_switch_with_continuation(
@@ -3035,11 +2761,8 @@ impl<'a> Structurer<'a> {
             }
 
             // Emit statement for this opcode
-            if self.is_control_flow_op(op_idx) {
-                eprintln!("BUG: Control flow op {} in opcode_to_statements: {:?}", op_idx, &self.func.ops[op_idx]);
-                eprintln!("  block.start={}, block.end={}, end={}", block.start, block.end, end);
-            }
-            stmts.extend(self.opcode_to_statements(op_idx));
+            let new_stmts = self.opcode_to_statements(op_idx);
+            stmts.extend(new_stmts);
             op_idx += 1;
         }
 
@@ -5620,6 +5343,7 @@ impl<'a> Structurer<'a> {
 fn simplify_statements(stmts: Vec<Statement>) -> Vec<Statement> {
     // First, collect all statements into a vec so we can scan ahead
     let stmts: Vec<_> = stmts.into_iter().collect();
+
     let mut result = Vec::new();
     let mut i = 0;
 

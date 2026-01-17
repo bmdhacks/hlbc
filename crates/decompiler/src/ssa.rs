@@ -797,8 +797,10 @@ fn get_use_regs(op: &Opcode) -> Vec<Reg> {
         Switch { reg, .. } => vec![*reg],
         Ret { ret } => vec![*ret],
         Throw { exc } | Rethrow { exc } | EndTrap { exc } => vec![*exc],
-        // NullCheck is implicit in Haxe - don't count as a use for inlining purposes
-        NullCheck { .. } => vec![],
+        // NullCheck needs to track its register for proper variable name resolution.
+        // The debug info often marks variable assignments at NullCheck opcodes,
+        // so we need to track the register as a use for SSA purposes.
+        NullCheck { reg } => vec![*reg],
         Prefetch { value, .. } => vec![*value],
 
         // Misc

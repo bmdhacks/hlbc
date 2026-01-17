@@ -621,6 +621,15 @@ fn count_uses_in_stmt(stmt: &Statement, var_name: &str) -> usize {
         Statement::Block { stmts } | Statement::Sequence { stmts } => {
             count_uses_in_stmts(stmts, var_name)
         }
+        Statement::IfElseChain { branches, else_ } => {
+            let mut count = 0;
+            for (cond, branch_stmts) in branches {
+                count += count_uses_in_expr(cond, var_name);
+                count += count_uses_in_stmts(branch_stmts, var_name);
+            }
+            count += count_uses_in_stmts(else_, var_name);
+            count
+        }
         _ => 0,
     }
 }
@@ -833,6 +842,13 @@ fn replace_var_in_stmt(stmt: &mut Statement, var_name: &str, replacement: &Expr)
         }
         Statement::Block { stmts } | Statement::Sequence { stmts } => {
             replace_var_in_stmts(stmts, var_name, replacement);
+        }
+        Statement::IfElseChain { branches, else_ } => {
+            for (cond, branch_stmts) in branches {
+                *cond = replace_var_in_expr(cond, var_name, replacement);
+                replace_var_in_stmts(branch_stmts, var_name, replacement);
+            }
+            replace_var_in_stmts(else_, var_name, replacement);
         }
         _ => {}
     }
