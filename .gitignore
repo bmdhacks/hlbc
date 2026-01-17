@@ -4,3 +4,4 @@
 tests/roundtrip/tmp/
 .claude
 CLAUDE.md
+crates/decompiler/CLAUDE.md
