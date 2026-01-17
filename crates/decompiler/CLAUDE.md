@@ -4,7 +4,7 @@ This document explains the hlbc-decompiler architecture and iteration workflow.
 
 ## CRITICAL: Do Not Modify Test Files
 
-**NEVER modify the test files in `tests/roundtrip/src/` to make tests pass.** This is dishonest and has been a recurring problem across conversation compactions.
+**NEVER modify the test files in `tests/roundtrip/src/` to make tests pass.** all failures are good indicators of bugs to fix
 
 If a test fails:
 1. **Fix the decompiler code**, not the test
@@ -16,149 +16,141 @@ The test files are intentionally read-only and owned by root to prevent this. If
 
 ## Philosophy
 
-**Never crash, always produce readable output.** Even when control flow analysis fails, emit a comment like `// unhandled: JAlways +10` and continue. A complete imperfect decompilation is better than a partial crash.
+Asserting early is better than outputting incorrect code. Crashes are good, we will know to fix them.
 
 ## Architecture Overview
 
-The decompiler transforms HashLink bytecode opcodes into an AST, then formats that AST as Haxe-like pseudocode.
-
-```
-Opcodes → DecompilerState → AST (Statement/Expr) → Formatted Output
-```
-
-### Multi-Pass Architecture (Implemented)
-
-A new multi-pass architecture has been implemented:
+The decompiler uses a 7ish-pass pipeline to transform HashLink bytecode into Haxe source code:
 
 ```
 Bytecode → Lifter → CFG → Analyzer → SSA Builder → Type Prop → Structurer → AST → Printer → Haxe
+             (1)          (2)         (3)           (4)         (5)               (6)
 ```
 
-| Pass | Module | Status | Purpose |
-|------|--------|--------|---------|
-| 1 | `lifter.rs` | ✅ Done | Build petgraph CFG from bytecode |
-| 2 | `analyzer.rs` | ✅ Done | Compute dominators, identify loops, detect reducibility |
-| 3 | `ssa.rs` | ✅ Done | SSA conversion with φ-functions (Cytron et al.) |
-| 4 | `type_prop.rs` | ✅ Done | Infer types from usage, unify φ-function types |
-| 5 | `structurer.rs` | ✅ Done | Convert SSA-CFG to structured AST |
-| 6 | `fmt.rs` | ✅ Exists | Print AST as Haxe code |
+| Pass | Module | Purpose |
+|------|--------|---------|
+| 1 | `lifter.rs` | Build petgraph CFG from bytecode (basic blocks + edges) |
+| 2 | `analyzer.rs` | Compute dominator tree, identify natural loops, detect reducibility |
+| 3 | `ssa.rs` | SSA conversion with φ-functions (Cytron et al. algorithm) |
+| 4 | `type_prop.rs` | Forward type inference through SSA graph, φ-function type unification |
+| 5 | `structurer.rs` | Convert SSA-CFG to structured AST, φ-elimination, expression inlining |
+| 6 | `fmt.rs` | Format AST as Haxe pseudocode |
 
-**Next step:** Wire up new pipeline to replace current scope-based decompiler.
+The pipeline is wired up in `lib.rs:decompile_code()`:
+```rust
+let cfg = Cfg::build(f);                           // Pass 1
+let analysis = CfgAnalysis::analyze(&cfg);         // Pass 2
+let ssa = SsaCfg::build(f, &cfg, &analysis);       // Pass 3
+let type_info = TypePropagator::new(...).propagate(); // Pass 4
+let stmts = Structurer::new(...).structure();      // Pass 5
+// Pass 6 (fmt.rs) applied when rendering output
+```
 
 ### Key Files
 
 | File | Purpose |
 |------|---------|
-| `src/lib.rs` | Main decompilation loop, opcode handlers, `DecompilerState` |
+| `src/lib.rs` | Pipeline orchestration, entry points (`decompile_code`, `decompile_function`) |
 | `src/lifter.rs` | Pass 1: CFG construction using petgraph |
 | `src/analyzer.rs` | Pass 2: Dominator trees, natural loop detection |
 | `src/ssa.rs` | Pass 3: SSA construction with φ-functions |
 | `src/type_prop.rs` | Pass 4: Type inference through SSA graph |
-| `src/structurer.rs` | Pass 5: Convert SSA-CFG to structured AST |
-| `src/ast.rs` | AST types: `Statement`, `Expr`, `Constant` |
-| `src/scopes.rs` | Scope stack for control flow (legacy, to be replaced) |
-| `src/fmt.rs` | AST → string formatting with indentation |
-| `src/post.rs` | Post-processing visitors for AST cleanup |
-| `src/liveness/` | Live range analysis for variable naming |
+| `src/structurer.rs` | Pass 5: Convert SSA-CFG to structured AST (~2500 lines) |
+| `src/ast.rs` | AST types: `Statement`, `Expr`, `Constant`, `Operation` |
+| `src/fmt.rs` | Pass 6: AST → Haxe string formatting |
+| `src/post.rs` | Post-processing visitors (defined but not yet integrated) |
+| `src/batch.rs` | Batch decompilation to files with package/class structure |
+| `src/natives.rs` | Native function name lookup |
 
 ### Core Data Structures
 
-**DecompilerState** (`lib.rs`):
+**Cfg** (`lifter.rs`):
 ```rust
-struct DecompilerState<'c> {
-    f: &'c Function,           // Current function being decompiled
-    reg_state: HashMap<Reg, Expr>,  // Current expression in each register
-    expr_ctx: Vec<ExprCtx>,    // Context stack (constructors, etc.)
-    scopes: Scopes,            // Control flow scope stack
-    seen: HashSet<Str>,        // Declared variable names
-    synthetic_var_counter: u32, // For generating v0, v1, etc.
+struct Cfg {
+    graph: DiGraph<BasicBlock, EdgeKind>,  // petgraph directed graph
+    entry: NodeIndex,
+    op_to_block: HashMap<usize, NodeIndex>,
 }
 ```
 
-**Scopes** (`scopes.rs`):
-- Stack of `Scope` objects tracking nested control flow
-- Each scope has: `ScopeType` (Len or Manual), `ScopeData` (If/Else/Loop/Switch/etc.), and accumulated `stmts`
-- `advance()` decrements length-based scopes and closes them when they expire
-- `push_*` methods create new scopes, `pop_*` methods close them
-
-## Common Patterns
-
-### Register State Tracking
-
-The decompiler tracks what expression is "in" each register:
+**CfgAnalysis** (`analyzer.rs`):
 ```rust
-// After: OInt r5, 42
-state.reg_state.insert(r5, Expr::Constant(Constant::Int(42)));
-
-// After: OAdd r3, r1, r2
-let left = state.expr(r1);   // Get current expr in r1
-let right = state.expr(r2);  // Get current expr in r2
-state.reg_state.insert(r3, Expr::Op(left, Op::Add, right));
-```
-
-### Synthetic Variables
-
-When expressions get too complex (function calls, increments), create synthetic variables:
-```rust
-fn ensure_variable(&mut self, reg: Reg) -> Expr {
-    // If already a variable, return it
-    // Otherwise: create "v0", "v1", etc., emit assignment, update reg_state
+struct CfgAnalysis {
+    dominators: Dominators<NodeIndex>,
+    loops: Vec<NaturalLoop>,       // Header, body, back-edges, exits
+    is_reducible: bool,
+    node_to_loop: HashMap<NodeIndex, NodeIndex>,
 }
 ```
 
-### Loop Detection
-
-Loops are detected by Label + backward JAlways:
-```
-Label           ; op N - loop start
-...
-JAlways -X      ; jumps back to op N
-```
-
-Loop conditions come from conditional jumps that exit the loop:
-```
-Label           ; loop start
-JNull r0, +20   ; if r0 == null, exit loop (condition: r0 != null)
-...
-JAlways -15     ; back to label
+**SsaCfg** (`ssa.rs`):
+```rust
+struct SsaCfg {
+    blocks: HashMap<NodeIndex, SsaBlock>,  // φ-functions + SSA ops per block
+    dom_frontiers: HashMap<NodeIndex, HashSet<NodeIndex>>,
+}
 ```
 
-### Control Flow Scope Lifecycle
+**Note:** `post.rs` contains AST transformation visitors (IfExpressions, StringConcat, Trace, etc.) that are fully implemented but not yet wired into the pipeline. These could be integrated as a post-structuring cleanup pass.
 
-1. **Open scope**: `push_if()`, `push_loop()`, `push_switch()`, etc.
-2. **Accumulate statements**: opcodes add to `scopes.last_mut().stmts`
-3. **Close scope**: `advance()` or explicit close, calls `make_stmt()` to convert to Statement
+## Key Algorithms
+
+### Pass 1: CFG Construction (lifter.rs)
+
+Splits bytecode into basic blocks at:
+- Jump targets (Label opcodes, branch destinations)
+- After unconditional jumps (JAlways, Ret, Throw)
+- After conditional jumps (JSLt, JNull, etc.)
+
+Edge types: `FallThrough`, `Jump`, `ConditionalTrue`, `ConditionalFalse`, `ExceptionHandler`
+
+### Pass 2: Loop Detection (analyzer.rs)
+
+Uses standard back-edge detection:
+1. Compute dominator tree via `petgraph::algo::dominators`
+2. Find back-edges: edges where target dominates source
+3. Back-edge target is loop header, compute loop body via reverse reachability
+
+### Pass 3: SSA Conversion (ssa.rs)
+
+Implements Cytron et al. algorithm:
+1. Compute dominance frontiers for each node
+2. Insert φ-functions at merge points (DF nodes)
+3. Rename variables: `reg0` → `v0_1`, `v0_2` with version counters
+4. Track use-def chains for later inlining decisions
+
+### Pass 5: Structuring (structurer.rs)
+
+Reconstructs high-level control flow:
+- Uses dominator tree to structure if/else (immediate dominator relationship)
+- Uses loop info from analyzer for while loops
+- φ-elimination: converts φ-functions to explicit assignments at branch ends
+- Single-use inlining: expressions used once are inlined at use site
 
 ## Debugging Workflow
+
+### Build Types
+
+**IMPORTANT: `eprintln!()` output only appears in debug builds!**
+
+```bash
+cargo build                              # Debug build → ./target/debug/hlbc
+cargo build --release                    # Release build → ./target/release/hlbc (NO eprintln!)
+```
+
+When adding debug prints, always test with the debug build:
+```bash
+cargo build && ./target/debug/hlbc file.hl -c "decomp 27"
+```
 
 ### Quick Iteration Cycle
 
 ```bash
-# 1. Build
-cargo build -p hlbc-decompiler --release
+# 1. Build (use debug for eprintln, release for speed)
+cargo build -p hlbc-decompiler
 
 # 2. Test single function
-./target/release/hlbc ../dead_cells.hl -c "decomp 30632"
-
-# 3. Batch decompile and check
-./target/release/hlbc ../dead_cells.hl --decompile-all -o ../analysis/decompiled/
-
-# 4. Count issues
-grep -r '\[missing expr\]' ../analysis/decompiled/ | wc -l
-grep -r 'Decompilation failed' ../analysis/decompiled/ | wc -l
-```
-
-### Investigating Issues
-
-**Find problematic functions:**
-```bash
-# Find files with specific issue
-grep -l '\[missing expr\]' ../analysis/decompiled/**/*.hx
-
-# Get function index from decompiled file header
-head -5 ../analysis/decompiled/path/to/File.hx
-# Shows: // fun@XXXXX (N ops)
-```
+./target/debug/hlbc ../dead_cells.hl -c "decomp 30632"
 
 **Examine bytecode:**
 ```bash
@@ -166,42 +158,28 @@ head -5 ../analysis/decompiled/path/to/File.hx
 grep -A 100 "=== Function 30632 ===" ../analysis/dead_cells_orig_dump.txt
 
 # Or use CLI
-./target/release/hlbc ../dead_cells.hl -c "f 30632"
+./target/debug/hlbc ../dead_cells.hl -c "f 30632"
 ```
 
 **Trace execution:**
-Add debug prints in `lib.rs`:
+Add debug prints in `structurer.rs` or other modules:
 ```rust
-eprintln!("{i}: {:?} -> reg_state: {:?}", op, state.reg_state.keys());
+eprintln!("{i}: {:?}", op);  // Only visible in debug builds!
 ```
+Also you can use the gdb mcp, but it tends to fill up the context fast, so a better option is to ask the user to pilot GDB and get targeted information that way.
 
-### Common Issue Patterns
+## Testing Against Hashlink Unit Tests
 
-**`[missing expr]`** - Register has no tracked expression
-- Usually: opcode handler not updating `reg_state`
-- Or: constructor context eating the call without proper fallthrough
-- Fix: ensure all opcodes that write to registers call `state.push_expr()` or update `reg_state`
-
-**`[unknown X]`** - Type/variant not resolved
-- Check the specific Unknown variant in `ast.rs`
-- Usually needs lookup logic in the opcode handler
-
-**Scope panics** - Control flow mismatch
-- Add fallback handling instead of `unreachable!()`
-- Emit comment and continue
-
-## Testing Against Dead Cells
-
-The primary test target is `../dead_cells.hl` (Dead Cells game bytecode).
+The primary test target is `/home/bmd/dev/hashlink/build/unit/unit.hl` (Hashlink unit test suite).
 
 **Regenerate all decompiled output:**
 ```bash
-./target/release/hlbc ../dead_cells.hl --decompile-all -o ../analysis/decompiled/
+./target/release/hlbc /home/bmd/dev/hashlink/build/unit/unit.hl --decompile-all -o ../analysis/unit_decompiled/
 ```
 
 **Check specific type:**
 ```bash
-cat ../analysis/decompiled/h3d/impl/GlDriver.hx | head -100
+cat ../analysis/unit_decompiled/h3d/impl/GlDriver.hx | head -100
 ```
 
 **Metrics to track:**
@@ -214,52 +192,18 @@ grep -r 'Decompilation failed' ../analysis/decompiled/ | wc -l
 # As of last session: 294 missing expr, 0 unknown, 0 failed
 ```
 
-## Adding New Opcode Handlers
-
-1. Find unhandled opcode in `lib.rs` main match
-2. Add handler that:
-   - Reads source registers with `state.expr(reg)`
-   - Constructs appropriate `Expr` or `Statement`
-   - Updates destination register: `state.push_expr(i, dst, expr)` or `state.reg_state.insert(dst, expr)`
-   - Or pushes statement: `state.push_stmt(stmt)`
-
-Example:
-```rust
-&Opcode::OSomething { dst, src1, src2 } => {
-    let left = state.expr(src1);
-    let right = state.expr(src2);
-    state.push_expr(i, dst, Expr::Op(Box::new(left), Op::Something, Box::new(right)));
-}
-```
-
 ## Known Limitations
 
 1. **Complex compound loop conditions**: Loops with `while (a || (b && c))` show as `while (true)` with internal breaks - acceptable tradeoff
-2. **Exception handling**: Try/catch is basic, some edge cases produce `[missing expr]`
-3. **Switch case merging**: Complex switch patterns may not reconstruct perfectly
-4. **Closures**: Anonymous functions decompile but references may show as indices
-5. **Array iteration**: `for (x in arr)` compiles to low-level iterator with `.bytes` access that can't be reconstructed. Use explicit while loops with indexing instead.
+2. **Switch case merging**: Complex switch patterns may not reconstruct perfectly
+3. **Closures**: Anonymous functions decompile but references may show as indices
+4. **Array iteration**: `for (x in arr)` compiles to low-level iterator with `.bytes` access that can't be reconstructed. Use explicit while loops with indexing instead.
 
-### Round-Trip Test Status (as of 2026-01-11)
+### Round-Trip Test Status
 
-**16/21 tests pass.** The remaining 5 failures have known limitations:
+**All tests pass** with the current SSA-based architecture.
 
-**DefaultParams.hx** - Unknown identifier issue
-- Variable scoping/initialization problem
-
-**ForLoop.hx** - Uninitialized variable
-- Variable used without being initialized in decompiled output
-
-**InterfaceTest.hx / IntMapTest.hx** - Method resolution
-- `p.[method_0]()` syntax - interface method calls not properly resolved
-
-**TryCatch.hx** - Private field access
-- Cannot access private field `unwrap` on exception object
-
-## Code Quality Checklist
-
-Before committing decompiler changes:
-- [ ] `cargo build -p hlbc-decompiler --release` succeeds
-- [ ] `cargo test -p hlbc-decompiler` passes
-- [ ] Batch decompile produces 0 failed files
-- [ ] Issue counts don't regress (check `[missing expr]`, etc.)
+Run tests with:
+```bash
+cd /home/bmd/hhg/hlbc/tests/roundtrip && ./run_tests.sh
+```

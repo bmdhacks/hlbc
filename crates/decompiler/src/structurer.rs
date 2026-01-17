@@ -3355,8 +3355,12 @@ impl<'a> Structurer<'a> {
             Opcode::New { dst } => {
                 let var = self.reg_to_expr_dst(*dst);
                 let type_ref = self.get_type_ref(*dst);
-                // For Virtual types (anonymous objects), use empty object literal
-                if matches!(&self.code.types[type_ref.0], hlbc::types::Type::Virtual { .. }) {
+                // For Virtual types and DynObj (anonymous objects), use empty object literal
+                // DynObj is used when fields are set dynamically via DynSet, then cast to Virtual
+                if matches!(
+                    &self.code.types[type_ref.0],
+                    hlbc::types::Type::Virtual { .. } | hlbc::types::Type::DynObj
+                ) {
                     Some(self.make_assign(var, Expr::Anonymous(type_ref, HashMap::new())))
                 } else {
                     // Look ahead for __constructor__ call to get constructor arguments

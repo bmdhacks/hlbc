@@ -1093,6 +1093,9 @@ impl Expr {
                                 })
                             })) }"}"
                     }
+                    // DynObj is used when fields are set dynamically via DynSet
+                    // Just emit empty object literal - fields will be set by subsequent statements
+                    Type::DynObj => "{}",
                     other => {{panic_invalid_anon_type(other)}},
                 },
                 Expr::Array(array, index) => {
