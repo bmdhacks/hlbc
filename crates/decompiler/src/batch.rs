@@ -213,34 +213,63 @@ impl<'a> BatchDecompiler<'a> {
 
                     // Insert any nested types BEFORE the main class (Haxe module-private style)
                     if let Some(nested_types) = nested_type_map.get(name) {
-                        // Collect all nested class content
+                        // Collect all nested type content (classes and enums)
                         let mut nested_content_all = String::new();
 
-                        for (nested_name, nested_idx, nested_obj) in nested_types {
+                        for (nested_name, nested_idx, nested_type) in nested_types {
                             // Skip $-prefixed types (static type holders)
                             if nested_name.starts_with('$') {
                                 continue;
                             }
 
-                            // Decompile nested type
-                            let nested_class = decompile_class_with_closures(
-                                self.code, *nested_obj, static_inits, Some(closure_analysis)
-                            );
-                            let nested_display = nested_class.display_with_index(
-                                self.code, &self.opts, Some(*nested_idx)
-                            );
-                            let nested_content = nested_display.to_string();
+                            let nested_content = match nested_type {
+                                NestedType::Class(nested_obj) => {
+                                    // Decompile nested class
+                                    let nested_class = decompile_class_with_closures(
+                                        self.code, *nested_obj, static_inits, Some(closure_analysis)
+                                    );
+                                    let nested_display = nested_class.display_with_index(
+                                        self.code, &self.opts, Some(*nested_idx)
+                                    );
+                                    let nested_content = nested_display.to_string();
 
-                            // Strip package declaration from nested class
-                            // (it will have "package _ClassName;" which is invalid)
-                            let nested_content = if let Some(class_start) = nested_content.find("class ") {
-                                &nested_content[class_start..]
-                            } else {
-                                &nested_content
+                                    // Strip package declaration from nested class
+                                    // (it will have "package _ClassName;" which is invalid)
+                                    let nested_content = if let Some(class_start) = nested_content.find("class ") {
+                                        nested_content[class_start..].to_string()
+                                    } else {
+                                        nested_content
+                                    };
+
+                                    // Add "private" modifier for module-private class
+                                    format!("private {}", nested_content)
+                                }
+                                NestedType::Enum { constructs, .. } => {
+                                    // Generate nested enum definition
+                                    let mut enum_content = String::new();
+                                    enum_content.push_str(&format!("// type@{}\n", nested_idx));
+                                    enum_content.push_str(&format!("private enum {} {{\n", nested_name));
+
+                                    for construct in *constructs {
+                                        let construct_name = self.code.get(construct.name);
+                                        if construct.params.is_empty() {
+                                            enum_content.push_str(&format!("    {};\n", construct_name));
+                                        } else {
+                                            // Constructor with parameters
+                                            enum_content.push_str(&format!("    {}(", construct_name));
+                                            for (i, _param) in construct.params.iter().enumerate() {
+                                                if i > 0 {
+                                                    enum_content.push_str(", ");
+                                                }
+                                                enum_content.push_str(&format!("param{}: Dynamic", i));
+                                            }
+                                            enum_content.push_str(");\n");
+                                        }
+                                    }
+                                    enum_content.push_str("}\n");
+                                    enum_content
+                                }
                             };
-
-                            // Add "private" modifier for module-private class
-                            let nested_content = format!("private {}", nested_content);
 
                             nested_content_all.push_str(&nested_content);
                             nested_content_all.push_str("\n");
@@ -414,6 +443,11 @@ impl<'a> BatchDecompiler<'a> {
 
                 // Skip anonymous closure enums (names starting with $)
                 if enum_name.starts_with('$') {
+                    continue;
+                }
+
+                // Skip nested enums (they are embedded in their parent class file)
+                if parse_nested_type(&enum_name).is_some() {
                     continue;
                 }
 
@@ -593,20 +627,41 @@ fn parse_nested_type(name: &str) -> Option<(String, String)> {
     None
 }
 
-/// Build a map from parent type names to their nested types.
-/// Returns a HashMap where keys are parent type names and values are lists of (nested_name, type_index, TypeObj).
+/// Represents a nested type - either a class/struct or an enum.
+#[derive(Clone)]
+enum NestedType<'a> {
+    Class(&'a hlbc::types::TypeObj),
+    Enum {
+        constructs: &'a [hlbc::types::EnumConstruct],
+    },
+}
+
+/// Build a map from parent type names to their nested types (classes and enums).
+/// Returns a HashMap where keys are parent type names and values are lists of (nested_name, type_index, NestedType).
 fn build_nested_type_map<'a>(
     code: &'a Bytecode,
-) -> HashMap<String, Vec<(String, usize, &'a hlbc::types::TypeObj)>> {
+) -> HashMap<String, Vec<(String, usize, NestedType<'a>)>> {
     let mut map: HashMap<String, Vec<_>> = HashMap::new();
 
     for (type_idx, ty) in code.types.iter().enumerate() {
+        // Handle classes/structs
         if let Some(obj) = ty.get_type_obj() {
             let name = obj.name(code).to_string();
             if let Some((parent_name, nested_name)) = parse_nested_type(&name) {
                 map.entry(parent_name)
                     .or_default()
-                    .push((nested_name, type_idx, obj));
+                    .push((nested_name, type_idx, NestedType::Class(obj)));
+            }
+        }
+        // Handle enums
+        if let Type::Enum { name, constructs, .. } = ty {
+            let enum_name = code.get(*name).to_string();
+            if let Some((parent_name, nested_name)) = parse_nested_type(&enum_name) {
+                map.entry(parent_name)
+                    .or_default()
+                    .push((nested_name, type_idx, NestedType::Enum {
+                        constructs,
+                    }));
             }
         }
     }

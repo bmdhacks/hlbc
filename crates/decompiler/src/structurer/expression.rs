@@ -418,6 +418,10 @@ impl<'a> Structurer<'a> {
                         }
                     }
                 }
+
+                // For regular functions with unnamed parameters, use "_" to match fmt.rs
+                // This ensures the body uses the same name as the function signature
+                return Some("_".to_string());
             }
         }
 

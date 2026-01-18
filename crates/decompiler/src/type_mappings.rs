@@ -19,6 +19,7 @@ pub fn expand_module_path(path: &str) -> Option<&'static str> {
         "haxe.EnumValueTools" => Some("haxe.EnumTools.EnumValueTools"),
         "haxe.FlatEnum" => Some("haxe.Constraints.FlatEnum"),
         "haxe.Function" => Some("haxe.Constraints.Function"),
+        "haxe.MainEvent" => Some("haxe.MainLoop.MainEvent"),
         "haxe.NotVoid" => Some("haxe.Constraints.NotVoid"),
         "haxe.Symbol" => Some("haxe.NativeStackTrace.Symbol"),
         "haxe.io.BytesDataAbstract" => Some("haxe.io.BytesData.BytesDataAbstract"),

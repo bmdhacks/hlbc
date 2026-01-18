@@ -1062,6 +1062,12 @@ pub fn remove_unused_var_decls(stmts: &mut Vec<Statement>) {
             Statement::Block { stmts } | Statement::Sequence { stmts } => {
                 remove_unused_var_decls(stmts);
             }
+            Statement::IfElseChain { branches, else_ } => {
+                for (_, branch_stmts) in branches {
+                    remove_unused_var_decls(branch_stmts);
+                }
+                remove_unused_var_decls(else_);
+            }
             _ => {}
         }
     }
@@ -1103,6 +1109,16 @@ fn collect_used_vars(stmts: &[Statement], used: &mut std::collections::HashSet<S
             }
             Statement::Block { stmts } | Statement::Sequence { stmts } => {
                 collect_used_vars(stmts, used);
+            }
+            Statement::IfElseChain { branches, else_ } => {
+                for (cond, branch_stmts) in branches {
+                    collect_used_vars_in_expr(cond, used);
+                    collect_used_vars(branch_stmts, used);
+                }
+                collect_used_vars(else_, used);
+            }
+            Statement::Throw(e) => {
+                collect_used_vars_in_expr(e, used);
             }
             _ => {}
         }

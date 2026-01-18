@@ -14,6 +14,7 @@ use hlbc::types::{Reg, RefFun, RefType, Type};
 use hlbc::{Resolve, Str};
 
 use crate::ast::{Call, Constant, ConstructorCall, Expr, Operation, Statement};
+use crate::fmt::extract_nested_type_simple_name;
 
 use super::Structurer;
 
@@ -100,8 +101,8 @@ impl<'a> Structurer<'a> {
         };
 
         let is_declaration = match var_name {
-            Some(name) => {
-                if self.declared_vars.contains(&name) {
+            Some(ref name) => {
+                if self.declared_vars.contains(name) {
                     // Already declared - but if assigning empty object, track for :Dynamic
                     if Self::is_empty_anonymous(&assign) {
                         self.needs_dynamic_type.insert(name.clone());
@@ -250,9 +251,12 @@ impl<'a> Structurer<'a> {
                 }
                 hlbc::types::Type::Enum { name, constructs, .. } => {
                     // For enum globals, look up the constructor from the constants table
-                    let enum_name = self.code.strings.get(name.0)
-                        .cloned()
-                        .unwrap_or_else(|| "Enum".into());
+                    let raw_enum_name = self.code.strings.get(name.0)
+                        .map(|s| s.as_ref())
+                        .unwrap_or("Enum");
+                    // Extract just the simple enum name (e.g., _PrivateEnum.Token → Token)
+                    let enum_name = extract_nested_type_simple_name(raw_enum_name)
+                        .unwrap_or_else(|| raw_enum_name.to_string());
 
                     // Check if we have constant initializer data for this global
                     if let Some(&const_idx) = self.code.globals_initializers.get(&global) {
@@ -344,13 +348,35 @@ impl<'a> Structurer<'a> {
         }
     }
 
+    /// Get method info (owner type, method name) if the function is a method.
+    /// Checks both method_info map and function signature.
+    pub(super) fn get_method_info(&self, fun: RefFun) -> Option<(RefType, Str)> {
+        // Check if this function is a method (from protos)
+        if let Some((ot, mn)) = self.method_info.get(&fun) {
+            return Some((*ot, mn.clone()));
+        }
+
+        // Try to detect method from function signature
+        // A function is a method if it has a parent type that matches its first parameter
+        if let Some(func) = fun.as_fn(self.code) {
+            if let Some(parent_ref) = func.parent {
+                let fun_type = func.ty(self.code);
+                if !fun_type.args.is_empty() && fun_type.args[0] == parent_ref {
+                    let method_name = func.name(self.code);
+                    return Some((parent_ref, method_name));
+                }
+            }
+        }
+
+        None
+    }
+
     /// Try to create a method call from a function reference and arguments.
     /// If the function is a method (first arg is `this` of the owner type),
     /// returns a Call with obj.method(rest_args) syntax.
     /// Otherwise returns None and the caller should use normal function call syntax.
     pub(super) fn try_make_method_call(&self, fun: RefFun, args: &[Reg]) -> Option<Call> {
-        // Check if this function is a method
-        let (owner_type, method_name) = self.method_info.get(&fun)?;
+        let (owner_type, method_name) = self.get_method_info(fun)?;
 
         // Must have at least one argument (the object)
         if args.is_empty() {
@@ -360,7 +386,7 @@ impl<'a> Structurer<'a> {
         // Check if the first argument's type is compatible with the owner type
         // (either the same type or a subtype that inherits from it)
         let first_arg_type = self.get_type_ref(args[0]);
-        if !self.is_subtype_of(first_arg_type, *owner_type) {
+        if !self.is_subtype_of(first_arg_type, owner_type) {
             return None;
         }
 
@@ -421,6 +447,43 @@ impl<'a> Structurer<'a> {
             }
         }
         false
+    }
+
+    /// Get the class name if a register holds a class type reference ($ClassName).
+    /// This looks at the preceding GetGlobal opcode to find the type.
+    /// Returns the clean class name (without $ prefix) and the opcode index if found.
+    pub(super) fn get_class_type_name_with_op(&self, type_reg: Reg) -> Option<(String, usize)> {
+        // Look back at instructions to find the GetGlobal opcode that set this register
+        for idx in (0..self.current_op).rev() {
+            if let Some(Opcode::GetGlobal { dst, global }) = self.func.ops.get(idx) {
+                if *dst == type_reg {
+                    // Found the GetGlobal opcode - check if global's type is a static class holder
+                    if let Some(global_type) = self.code.globals.get(global.0) {
+                        if let Some(Type::Obj(obj)) = self.code.types.get(global_type.0) {
+                            let type_name = self.code.get(obj.name).to_string();
+                            // Static class holders have $ prefix: hxd.snd.effect.$Pitch
+                            if type_name.contains(".$") {
+                                // Clean the name: "pkg.$Class" -> "pkg.Class"
+                                let clean_name = type_name.replace(".$", ".");
+                                return Some((clean_name, idx));
+                            }
+                            // Also handle top-level: "$Class" -> "Class"
+                            if type_name.starts_with('$') {
+                                return Some((type_name[1..].to_string(), idx));
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        None
+    }
+
+    /// Get the class name if a register holds a class type reference ($ClassName).
+    /// Convenience wrapper that returns just the name.
+    pub(super) fn get_class_type_name(&self, type_reg: Reg) -> Option<String> {
+        self.get_class_type_name_with_op(type_reg).map(|(name, _)| name)
     }
 
     /// Check if a type register (from alloc_array arg0) holds a nullable element type
@@ -797,21 +860,29 @@ impl<'a> Structurer<'a> {
                     }
                 }
 
-                // Check if this is an internal array property accessor (get_length -> .length)
+                // Property getter pattern: get_X(obj) -> obj.X
+                // Only apply for external/library types where we know the property exists
+                // User-defined types may not have property declarations in decompiled output
                 let fun_name = fun.name(self.code);
-                if fun_name.as_ref() == "get_length" {
-                    if let Some((owner_type, _)) = self.method_info.get(fun) {
-                        if let Some(hlbc::types::Type::Obj(owner_obj)) = self.code.types.get(owner_type.0) {
-                            let owner_name = self.code.get(owner_obj.name);
-                            if owner_name.contains("hl.types.") && owner_name.contains("Array") {
-                                // Emit as .length property access instead of method call
-                                let var = self.reg_to_expr_dst(*dst);
-                                let obj = self.reg_to_expr(*arg0);
-                                let field_access = Expr::Field(Box::new(obj), "length".into());
-                                stmts.push(self.make_assign(var, field_access));
-                                return stmts;
-                            }
-                        }
+                if fun_name.starts_with("get_") {
+                    let is_external_type = fun.as_fn(self.code)
+                        .and_then(|f| f.parent)
+                        .and_then(|p| p.as_obj(self.code))
+                        .map(|obj| {
+                            let parent_name = obj.name(self.code);
+                            // Library types that have real property definitions
+                            parent_name.starts_with("haxe.") ||
+                            parent_name.starts_with("hl.") ||
+                            parent_name.starts_with("sys.") ||
+                            parent_name.starts_with("std.")
+                        })
+                        .unwrap_or(false);
+
+                    if is_external_type {
+                        let prop_name: Str = fun_name[4..].into();
+                        let obj_expr = self.reg_to_expr(*arg0);
+                        let expr = Expr::Field(Box::new(obj_expr), prop_name);
+                        return self.try_inline_or_assign(*dst, expr).into_iter().collect();
                     }
                 }
 
@@ -823,6 +894,43 @@ impl<'a> Structurer<'a> {
 
             Opcode::Call2 { dst, fun, arg0, arg1 } => {
                 let name = fun.name(self.code);
+
+                // Handle hl.BaseType.check(type, value) -> Std.isOfType(value, Type)
+                // This is an internal type-checking function used by Haxe
+                if name.as_ref() == "check" {
+                    // Verify this is hl.BaseType.check by checking the parent type
+                    let is_basetype_check = fun.as_fn(self.code)
+                        .and_then(|f| f.parent)
+                        .and_then(|p| p.as_obj(self.code))
+                        .map(|obj| {
+                            let parent_name = obj.name(self.code);
+                            parent_name == "hl.BaseType" || parent_name == "hl.$BaseType"
+                        })
+                        .unwrap_or(false);
+
+                    if is_basetype_check {
+                        // Check if arg0 is a class type global ($ClassName)
+                        if let Some(class_name) = self.get_class_type_name(*arg0) {
+                            // Consume the inlined expression for arg0 to prevent it from being
+                            // emitted as a separate statement (the GetGlobal that loaded the type)
+                            if let Some(ssa_var) = self.find_ssa_use(*arg0) {
+                                let _ = self.try_get_inline_expr(ssa_var);
+                            }
+
+                            // Emit as Std.isOfType(value, ClassName)
+                            let std_is_of_type = Expr::Field(
+                                Box::new(Expr::Ident("Std".into())),
+                                "isOfType".into()
+                            );
+                            let value_expr = self.reg_to_expr(*arg1);
+                            let type_expr = Expr::Ident(class_name.into());
+                            let call = Call::new(std_is_of_type, vec![value_expr, type_expr]);
+                            let stmt = self.make_call_stmt(*dst, call);
+                            stmts.push(stmt);
+                            return stmts;
+                        }
+                    }
+                }
 
                 // Handle alloc_array(type, size) -> output as empty array literal []
                 // This native allocates a raw array that gets filled by SetArray ops
@@ -898,6 +1006,32 @@ impl<'a> Structurer<'a> {
                     }
                 }
 
+                // Property setter pattern: set_X(obj, value) -> obj.X = value
+                // Only apply for external/library types where we know the property exists
+                // User-defined types may not have property declarations in decompiled output
+                if name.starts_with("set_") {
+                    let is_external_type = fun.as_fn(self.code)
+                        .and_then(|f| f.parent)
+                        .and_then(|p| p.as_obj(self.code))
+                        .map(|obj| {
+                            let parent_name = obj.name(self.code);
+                            // Library types that have real property definitions
+                            parent_name.starts_with("haxe.") ||
+                            parent_name.starts_with("hl.") ||
+                            parent_name.starts_with("sys.") ||
+                            parent_name.starts_with("std.")
+                        })
+                        .unwrap_or(false);
+
+                    if is_external_type {
+                        let prop_name: Str = name[4..].into();
+                        let obj_expr = self.reg_to_expr(*arg0);
+                        let target = Expr::Field(Box::new(obj_expr), prop_name);
+                        let value = self.reg_to_expr(*arg1);
+                        return vec![self.make_assign(target, value)];
+                    }
+                }
+
                 let args = [*arg0, *arg1];
                 let call = self.try_make_method_call(*fun, &args)
                     .unwrap_or_else(|| Call::new_fun(*fun, vec![self.reg_to_expr(*arg0), self.reg_to_expr(*arg1)]));
@@ -956,6 +1090,39 @@ impl<'a> Structurer<'a> {
                 // For CallMethod, 'field' is a proto array index (NOT a pindex or field index)
                 let method_name = self.get_proto_name(args[0], *field);
 
+                // Check if object is an external/library type for property transformation
+                let is_external_type = self.func.regs.get(args[0].0 as usize)
+                    .and_then(|tr| self.code.types.get(tr.0))
+                    .map(|ty| {
+                        if let Type::Obj(obj) = ty {
+                            let type_name = self.code.get(obj.name);
+                            type_name.starts_with("haxe.") ||
+                            type_name.starts_with("hl.") ||
+                            type_name.starts_with("sys.") ||
+                            type_name.starts_with("std.")
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+
+                // Property setter pattern: set_X(value) -> obj.X = value
+                // Only apply for external/library types where we know the property exists
+                if method_name.starts_with("set_") && args.len() == 2 && is_external_type {
+                    let prop_name: Str = method_name[4..].into();
+                    let target = Expr::Field(Box::new(obj), prop_name);
+                    let value = self.reg_to_expr(args[1]);
+                    return vec![self.make_assign(target, value)];
+                }
+
+                // Property getter pattern: get_X() -> obj.X
+                // Only apply for external/library types where we know the property exists
+                if method_name.starts_with("get_") && args.len() == 1 && is_external_type {
+                    let prop_name: Str = method_name[4..].into();
+                    let expr = Expr::Field(Box::new(obj), prop_name);
+                    return self.try_inline_or_assign(*dst, expr).into_iter().collect();
+                }
+
                 // When calling .next() on an iterator, the result might get the same debug name
                 // as the iterator itself (e.g., `key = key.next()`). This causes type errors
                 // because `key` would need to be both Iterator<T> and T.
@@ -993,6 +1160,11 @@ impl<'a> Structurer<'a> {
             Opcode::CallThis { dst, field, args } => {
                 let this = Expr::Variable(Reg(0), Some("this".into()));
                 let method_name = self.get_proto_name(Reg(0), *field);
+
+                // NOTE: We don't apply property transformation for CallThis because
+                // `this` is always the current class being decompiled (user-defined),
+                // and we don't yet generate property declarations for user-defined types.
+
                 let method = Expr::Field(Box::new(this), method_name);
                 let arg_exprs: Vec<_> = args.iter().map(|r| self.reg_to_expr(*r)).collect();
                 let call = Call { fun: method, args: arg_exprs };
@@ -1627,11 +1799,18 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::VirtualClosure { dst, obj, field } => {
+                // VirtualClosure creates a method reference from an object's vtable.
+                // The 'field' register's NUMBER is used as the proto index (vtable slot).
+                // This is different from CallMethod where 'field' is a RefField.
                 let var = self.reg_to_expr_dst(*dst);
                 let obj_expr = self.reg_to_expr(*obj);
-                let field_expr = self.reg_to_expr(*field);
-                // Dynamic method lookup: obj[field] or obj.getMethod(field)
-                let expr = Expr::Array(Box::new(obj_expr), Box::new(field_expr));
+
+                // Use field.0 (register number) as proto index to look up method name
+                let proto_idx = hlbc::types::RefField(field.0 as usize);
+                let method_name = self.get_proto_name(*obj, proto_idx);
+
+                // Emit as obj.methodName (a method reference/closure)
+                let expr = Expr::Field(Box::new(obj_expr), method_name);
                 Some(self.make_assign(var, expr))
             }
 

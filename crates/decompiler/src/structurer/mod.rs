@@ -1052,12 +1052,12 @@ impl<'a> Structurer<'a> {
             return (stmts, self.get_unprocessed_continuation(final_merge, stop_at));
         }
 
-        self.scope_depth -= 1;
-
         if chain.is_empty() {
+            self.scope_depth -= 1;
             return (vec![], None);
         }
 
+        // Note: build_conditional_result decrements scope_depth
         let stmts = self.build_conditional_result(chain, vec![], has_preambles);
         (stmts, self.get_unprocessed_continuation(final_merge, stop_at))
     }
@@ -1758,9 +1758,6 @@ impl<'a> Structurer<'a> {
                         // Try to get enum constructor name for this index
                         if let Type::Enum { constructs, .. } = &self.code[ref_type] {
                             if let Some(construct) = constructs.get(v) {
-                                let name = self.code.strings.get(construct.name.0)
-                                    .cloned()
-                                    .unwrap_or_else(|| format!("_{}", v).into());
                                 // If constructor has parameters, check if we can bind them
                                 if !construct.params.is_empty() {
                                     // Scan the case body for EnumField accesses on this construct
@@ -1790,7 +1787,9 @@ impl<'a> Structurer<'a> {
                                         .collect();
                                     return Expr::EnumConstr(ref_type, RefEnumConstruct(v), bindings);
                                 }
-                                return Expr::Ident(name);
+                                // Use EnumConstr for fully qualified name (e.g., ImageType.NoImage)
+                                // This ensures the enum type is always included in the output
+                                return Expr::EnumConstr(ref_type, RefEnumConstruct(v), vec![]);
                             }
                         }
                     }

@@ -400,26 +400,77 @@ fn demangle_type_param(param: &str) -> String {
 /// E.g., "hxsl._Splitter.VarProps" → "hxsl.Splitter.VarProps"
 /// In Haxe bytecode, nested types are stored under a module type named `_ClassName`,
 /// but in Haxe source you reference them as `ClassName.NestedType`.
-fn fix_nested_type_name(name: &str) -> Option<String> {
+///
+/// Also handles abstract type internal implementations:
+/// E.g., "haxe._Int64.___Int64" → "haxe.Int64"
+/// The `___` (triple underscore) prefix indicates an internal implementation class
+/// for an abstract type. The abstract type itself is the container name.
+pub fn fix_nested_type_name(name: &str) -> Option<String> {
     // Look for "._" pattern indicating a nested type container
     if let Some(pos) = name.find("._") {
         // Find the end of the underscore-prefixed segment
         let after_underscore = pos + 2; // skip "._"
         if let Some(dot_pos) = name[after_underscore..].find('.') {
             // We have "pkg._Container.NestedType"
-            // Transform to "pkg.Container.NestedType"
             let prefix = &name[..pos + 1]; // "pkg."
             let container = &name[after_underscore..after_underscore + dot_pos]; // "Container"
-            let rest = &name[after_underscore + dot_pos..]; // ".NestedType"
-            return Some(format!("{}{}{}", prefix, container, rest));
+            let nested = &name[after_underscore + dot_pos + 1..]; // "NestedType" (skip the dot)
+
+            // Check for abstract type internal implementation pattern:
+            // "pkg._TypeName.___TypeName" → the nested type starts with "___"
+            // and matches the container name. This is the internal implementation
+            // of an abstract type, so we return just "pkg.TypeName".
+            if nested.starts_with("___") {
+                let impl_name = &nested[3..]; // Strip "___" prefix
+                if impl_name == container {
+                    // This is an abstract type internal implementation
+                    // e.g., "haxe._Int64.___Int64" → "haxe.Int64"
+                    return Some(format!("{}{}", prefix, container));
+                }
+            }
+
+            // Regular nested type: "pkg._Container.NestedType" → "pkg.Container.NestedType"
+            return Some(format!("{}{}.{}", prefix, container, nested));
         }
     }
     // Also handle top-level underscore prefix: "_Splitter.VarProps" → "Splitter.VarProps"
     if name.starts_with('_') && name.contains('.') {
         let dot_pos = name.find('.').unwrap();
         let container = &name[1..dot_pos]; // Skip leading underscore
-        let rest = &name[dot_pos..];
-        return Some(format!("{}{}", container, rest));
+        let nested = &name[dot_pos + 1..];
+
+        // Check for abstract type internal implementation at top level
+        if nested.starts_with("___") {
+            let impl_name = &nested[3..];
+            if impl_name == container {
+                return Some(container.to_string());
+            }
+        }
+
+        return Some(format!("{}.{}", container, nested));
+    }
+    None
+}
+
+/// Extract just the simple nested type name from a private/nested type.
+/// E.g., "_PrivateEnum.Token" → "Token"
+/// E.g., "pkg._Container.NestedType" → "NestedType"
+/// This is used when the nested type is in scope and doesn't need qualification.
+pub fn extract_nested_type_simple_name(name: &str) -> Option<String> {
+    // Look for "._" pattern indicating a nested type container
+    if let Some(pos) = name.find("._") {
+        let after_underscore = pos + 2;
+        if let Some(dot_pos) = name[after_underscore..].find('.') {
+            // We have "pkg._Container.NestedType" - return just "NestedType"
+            let nested = &name[after_underscore + dot_pos + 1..];
+            return Some(nested.to_string());
+        }
+    }
+    // Handle top-level: "_Container.NestedType" → "NestedType"
+    if name.starts_with('_') && name.contains('.') {
+        let dot_pos = name.find('.').unwrap();
+        let nested = &name[dot_pos + 1..];
+        return Some(nested.to_string());
     }
     None
 }
@@ -1338,8 +1389,12 @@ impl Expr {
                         let raw_enum_name = code.strings.get(name.0)
                             .map(|s| s.as_ref())
                             .unwrap_or("Enum");
-                        // Expand shortened module paths (e.g., haxe.macro.Binop → haxe.macro.Expr.Binop)
-                        let enum_name = expand_module_path(raw_enum_name).unwrap_or(raw_enum_name);
+                        // Extract simple nested type name (e.g., _PrivateEnum.Token → Token)
+                        // or expand shortened module paths (e.g., haxe.macro.Binop → haxe.macro.Expr.Binop)
+                        let simple_name = extract_nested_type_simple_name(raw_enum_name);
+                        let enum_name = simple_name.as_deref()
+                            .or_else(|| expand_module_path(raw_enum_name))
+                            .unwrap_or(raw_enum_name);
                         if let Some(c) = constructs.get(constr.0) {
                             let construct_name = c.name(code);
                             if args.is_empty() {
@@ -1387,9 +1442,16 @@ impl Expr {
                                         {name}
                                     } else {
                                         // Strip leading $ from static class type names
-                                        let clean_name = parent_name.strip_prefix('$').unwrap_or(&parent_name);
                                         // Check if this is a static method (parent is a static class type)
-                                        if parent_name.starts_with('$') {
+                                        // Static class names have $ prefix: either "$Foo" or "pkg.$Foo"
+                                        let is_static_class = parent_name.starts_with('$') || parent_name.contains(".$");
+                                        let clean_name = if parent_name.contains(".$") {
+                                            parent_name.replace(".$", ".")
+                                        } else {
+                                            parent_name.strip_prefix('$').unwrap_or(&parent_name).to_string()
+                                        };
+                                        let clean_name = clean_name.as_str();
+                                        if is_static_class {
                                             // Add std. prefix for stdlib classes to avoid shadowing
                                             if needs_std_prefix(clean_name) {
                                                 "std."{clean_name}"."{name}

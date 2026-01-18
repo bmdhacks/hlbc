@@ -613,6 +613,10 @@ impl<'a> Structurer<'a> {
         // Track which opcodes contribute to constructor arguments (to suppress them)
         let mut consumed_ops: Vec<usize> = Vec::new();
 
+        // Track which Call opcodes wrote to which registers, so we can consume them
+        // when their results are used as constructor arguments
+        let mut call_dst_to_idx: HashMap<Reg, usize> = HashMap::new();
+
         for idx in (new_op_idx + 1)..=search_end {
             // Search within the same basic block for constructor call
             if idx >= self.func.ops.len() {
@@ -720,20 +724,34 @@ impl<'a> Structurer<'a> {
                     reg_values.insert(*dst, call);
                     consumed_ops.push(idx);
                 }
-                // Track function calls (for things like Math.cos, Math.sin, computeX(), etc.)
-                // NOTE: We track calls into reg_values for value propagation, but do NOT
-                // add them to consumed_ops because calls have side effects and must still
-                // emit their statements. The constructor arg will reference the result variable.
+                // Track function calls (for things like Math.cos, Math.sin, inner.clone(), etc.)
+                // We track calls into reg_values for value propagation and map dst -> idx
+                // in call_dst_to_idx. When the constructor is found, we consume any calls
+                // whose results are directly used as constructor arguments (the call is
+                // inlined into the constructor expression, so no separate statement needed).
                 Opcode::Call0 { dst, fun } => {
                     let call = Expr::Call(Box::new(Call::new_fun(*fun, vec![])));
                     reg_values.insert(*dst, call);
-                    // Don't suppress - calls have side effects
+                    call_dst_to_idx.insert(*dst, idx);
                 }
                 Opcode::Call1 { dst, fun, arg0 } => {
                     let arg = get_val(*arg0, &reg_values);
-                    let call = Expr::Call(Box::new(Call::new_fun(*fun, vec![arg])));
+                    // Try to detect method call (obj.method() instead of method(obj))
+                    // Use the tracked value (arg) as receiver, not reg_to_expr
+                    let call = if let Some((owner_type, method_name)) = self.get_method_info(*fun) {
+                        let first_arg_type = self.get_type_ref(*arg0);
+                        if self.is_subtype_of(first_arg_type, owner_type) {
+                            // Create method call: obj.method()
+                            let method = Expr::Field(Box::new(arg.clone()), method_name);
+                            Expr::Call(Box::new(Call { fun: method, args: vec![] }))
+                        } else {
+                            Expr::Call(Box::new(Call::new_fun(*fun, vec![arg])))
+                        }
+                    } else {
+                        Expr::Call(Box::new(Call::new_fun(*fun, vec![arg])))
+                    };
                     reg_values.insert(*dst, call);
-                    // Don't suppress - calls have side effects
+                    call_dst_to_idx.insert(*dst, idx);
                 }
                 // Track Call2 but skip if it's the constructor call we're looking for
                 Opcode::Call2 { dst, fun, arg0, arg1 } if *arg0 != new_dst => {
@@ -741,7 +759,7 @@ impl<'a> Structurer<'a> {
                     let a1 = get_val(*arg1, &reg_values);
                     let call = Expr::Call(Box::new(Call::new_fun(*fun, vec![a0, a1])));
                     reg_values.insert(*dst, call);
-                    // Don't suppress - calls have side effects
+                    call_dst_to_idx.insert(*dst, idx);
                 }
                 // Track Call3 but skip if it's the constructor call
                 Opcode::Call3 { dst, fun, arg0, arg1, arg2 } if *arg0 != new_dst => {
@@ -750,7 +768,7 @@ impl<'a> Structurer<'a> {
                     let a2 = get_val(*arg2, &reg_values);
                     let call = Expr::Call(Box::new(Call::new_fun(*fun, vec![a0, a1, a2])));
                     reg_values.insert(*dst, call);
-                    // Don't suppress - calls have side effects
+                    call_dst_to_idx.insert(*dst, idx);
                 }
                 // Track Call4 but skip if it's the constructor call
                 Opcode::Call4 { dst, fun, arg0, arg1, arg2, arg3 } if *arg0 != new_dst => {
@@ -760,14 +778,14 @@ impl<'a> Structurer<'a> {
                     let a3 = get_val(*arg3, &reg_values);
                     let call = Expr::Call(Box::new(Call::new_fun(*fun, vec![a0, a1, a2, a3])));
                     reg_values.insert(*dst, call);
-                    // Don't suppress - calls have side effects
+                    call_dst_to_idx.insert(*dst, idx);
                 }
                 // Track CallN but skip if it's the constructor call
                 Opcode::CallN { dst, fun, args } if args.first() != Some(&new_dst) => {
                     let call_args: Vec<_> = args.iter().map(|r| get_val(*r, &reg_values)).collect();
                     let call = Expr::Call(Box::new(Call::new_fun(*fun, call_args)));
                     reg_values.insert(*dst, call);
-                    // Don't suppress - calls have side effects
+                    call_dst_to_idx.insert(*dst, idx);
                 }
                 // GetGlobal is pure (just reads a global) - safe to suppress
                 Opcode::GetGlobal { dst, global } => {
@@ -786,8 +804,22 @@ impl<'a> Structurer<'a> {
             }
 
             // Helper function to get expression for a register (not a closure to avoid borrow issues)
-            fn get_expr(reg: Reg, reg_values: &HashMap<Reg, Expr>, structurer: &Structurer) -> Expr {
-                reg_values.get(&reg).cloned().unwrap_or_else(|| structurer.reg_to_expr(reg))
+            // Also checks pending_new for New operations without constructor calls (e.g., internal HL arrays)
+            fn get_expr(
+                reg: Reg,
+                reg_values: &HashMap<Reg, Expr>,
+                pending_new: &HashMap<Reg, RefType>,
+                structurer: &Structurer
+            ) -> Expr {
+                if let Some(expr) = reg_values.get(&reg) {
+                    expr.clone()
+                } else if let Some(type_ref) = pending_new.get(&reg) {
+                    // New without constructor call - create empty constructor expression
+                    // This handles internal HL types like hl.types.ArrayObj
+                    Expr::Constructor(ConstructorCall::new(*type_ref, vec![]))
+                } else {
+                    structurer.reg_to_expr(reg)
+                }
             }
 
             // Check for intermediate __constructor__ calls (for nested constructors)
@@ -797,7 +829,7 @@ impl<'a> Structurer<'a> {
                     if *arg0 != new_dst && self.is_constructor_function(*fun) => {
                     // Build the complete constructor expression for this intermediate object
                     if let Some(ty_ref) = pending_new.remove(arg0) {
-                        let args = vec![get_expr(*arg1, &reg_values, self)];
+                        let args = vec![get_expr(*arg1, &reg_values, &pending_new, self)];
                         let ctor = Expr::Constructor(ConstructorCall::new(ty_ref, args));
                         reg_values.insert(*arg0, ctor);
                     }
@@ -806,8 +838,8 @@ impl<'a> Structurer<'a> {
                     if *arg0 != new_dst && self.is_constructor_function(*fun) => {
                     if let Some(ty_ref) = pending_new.remove(arg0) {
                         let args = vec![
-                            get_expr(*arg1, &reg_values, self),
-                            get_expr(*arg2, &reg_values, self)
+                            get_expr(*arg1, &reg_values, &pending_new, self),
+                            get_expr(*arg2, &reg_values, &pending_new, self)
                         ];
                         let ctor = Expr::Constructor(ConstructorCall::new(ty_ref, args));
                         reg_values.insert(*arg0, ctor);
@@ -817,9 +849,9 @@ impl<'a> Structurer<'a> {
                     if *arg0 != new_dst && self.is_constructor_function(*fun) => {
                     if let Some(ty_ref) = pending_new.remove(arg0) {
                         let args = vec![
-                            get_expr(*arg1, &reg_values, self),
-                            get_expr(*arg2, &reg_values, self),
-                            get_expr(*arg3, &reg_values, self),
+                            get_expr(*arg1, &reg_values, &pending_new, self),
+                            get_expr(*arg2, &reg_values, &pending_new, self),
+                            get_expr(*arg3, &reg_values, &pending_new, self),
                         ];
                         let ctor = Expr::Constructor(ConstructorCall::new(ty_ref, args));
                         reg_values.insert(*arg0, ctor);
@@ -829,7 +861,7 @@ impl<'a> Structurer<'a> {
                     if !args.is_empty() && args[0] != new_dst && self.is_constructor_function(*fun) => {
                     if let Some(ty_ref) = pending_new.remove(&args[0]) {
                         let ctor_args: Vec<_> = args[1..].iter()
-                            .map(|r| get_expr(*r, &reg_values, self))
+                            .map(|r| get_expr(*r, &reg_values, &pending_new, self))
                             .collect();
                         let ctor = Expr::Constructor(ConstructorCall::new(ty_ref, ctor_args));
                         reg_values.insert(args[0], ctor);
@@ -843,33 +875,55 @@ impl<'a> Structurer<'a> {
                 // Call2 __constructor__(obj, arg1)
                 Opcode::Call2 { fun, arg0, arg1, .. } if *arg0 == new_dst => {
                     if self.is_constructor_function(*fun) {
-                        return (vec![get_expr(*arg1, &reg_values, self)], Some(idx), consumed_ops);
+                        // Consume any Call that wrote to arg registers
+                        if let Some(&call_idx) = call_dst_to_idx.get(arg1) {
+                            consumed_ops.push(call_idx);
+                        }
+                        return (vec![get_expr(*arg1, &reg_values, &pending_new, self)], Some(idx), consumed_ops);
                     }
                 }
                 // Call3 __constructor__(obj, arg1, arg2)
                 Opcode::Call3 { fun, arg0, arg1, arg2, .. } if *arg0 == new_dst => {
                     if self.is_constructor_function(*fun) {
+                        // Consume any Call that wrote to arg registers
+                        for arg in [arg1, arg2] {
+                            if let Some(&call_idx) = call_dst_to_idx.get(arg) {
+                                consumed_ops.push(call_idx);
+                            }
+                        }
                         return (vec![
-                            get_expr(*arg1, &reg_values, self),
-                            get_expr(*arg2, &reg_values, self)
+                            get_expr(*arg1, &reg_values, &pending_new, self),
+                            get_expr(*arg2, &reg_values, &pending_new, self)
                         ], Some(idx), consumed_ops);
                     }
                 }
                 // Call4 __constructor__(obj, arg1, arg2, arg3)
                 Opcode::Call4 { fun, arg0, arg1, arg2, arg3, .. } if *arg0 == new_dst => {
                     if self.is_constructor_function(*fun) {
+                        // Consume any Call that wrote to arg registers
+                        for arg in [arg1, arg2, arg3] {
+                            if let Some(&call_idx) = call_dst_to_idx.get(arg) {
+                                consumed_ops.push(call_idx);
+                            }
+                        }
                         return (vec![
-                            get_expr(*arg1, &reg_values, self),
-                            get_expr(*arg2, &reg_values, self),
-                            get_expr(*arg3, &reg_values, self),
+                            get_expr(*arg1, &reg_values, &pending_new, self),
+                            get_expr(*arg2, &reg_values, &pending_new, self),
+                            get_expr(*arg3, &reg_values, &pending_new, self),
                         ], Some(idx), consumed_ops);
                     }
                 }
                 // CallN __constructor__(obj, args...)
                 Opcode::CallN { fun, args, .. } if !args.is_empty() && args[0] == new_dst => {
                     if self.is_constructor_function(*fun) {
+                        // Consume any Call that wrote to arg registers
+                        for arg in &args[1..] {
+                            if let Some(&call_idx) = call_dst_to_idx.get(arg) {
+                                consumed_ops.push(call_idx);
+                            }
+                        }
                         return (args[1..].iter()
-                            .map(|r| get_expr(*r, &reg_values, self))
+                            .map(|r| get_expr(*r, &reg_values, &pending_new, self))
                             .collect(), Some(idx), consumed_ops);
                     }
                 }
