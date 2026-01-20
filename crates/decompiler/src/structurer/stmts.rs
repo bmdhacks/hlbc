@@ -1702,6 +1702,24 @@ impl<'a> Structurer<'a> {
                     }
                 }
 
+                // Check if this is an anonymous inline function (name.0 == 0)
+                // These are `this`-bound closures without enum capture contexts
+                if let Some(inner_func) = fun.as_fn(self.code) {
+                    if inner_func.name.0 == 0 {
+                        // Anonymous function bound to `this` - inline it as a closure
+                        // Pass is_this_bound_closure=true so reg0 is treated as `this`
+                        let inner_stmts = crate::decompile_code_with_options(
+                            self.code,
+                            inner_func,
+                            self.closure_analysis,
+                            true,  // is_this_bound_closure
+                        );
+                        let expr = Expr::Closure(*fun, inner_stmts);
+                        stmts.push(self.make_assign(var, expr));
+                        return stmts;
+                    }
+                }
+
                 // Fallback: Method reference syntax (obj.methodName)
                 let obj_expr = self.reg_to_expr(*obj);
                 // Method reference: obj.methodName

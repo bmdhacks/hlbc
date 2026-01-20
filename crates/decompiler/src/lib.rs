@@ -174,6 +174,19 @@ pub fn decompile_code_with_closures(
     f: &Function,
     closure_analysis: Option<&ClosureAnalysis>,
 ) -> Vec<Statement> {
+    decompile_code_with_options(code, f, closure_analysis, false)
+}
+
+/// Decompile a function with full options.
+///
+/// `is_this_bound_closure`: Set to true when decompiling an inline function from
+/// an `InstanceClosure` opcode where reg0 is implicitly bound to `this`.
+pub fn decompile_code_with_options(
+    code: &Bytecode,
+    f: &Function,
+    closure_analysis: Option<&ClosureAnalysis>,
+    is_this_bound_closure: bool,
+) -> Vec<Statement> {
     use crate::lifter::Cfg;
     use crate::analyzer::CfgAnalysis;
     use crate::ssa::SsaCfg;
@@ -202,8 +215,8 @@ pub fn decompile_code_with_closures(
     let type_info = propagator.propagate();
 
     // Pass 5: Structure into AST (with optional closure context)
-    let mut structurer = Structurer::new_with_closures(
-        code, f, &cfg, &analysis, &ssa, &type_info, closure_analysis
+    let mut structurer = Structurer::new_with_options(
+        code, f, &cfg, &analysis, &ssa, &type_info, closure_analysis, is_this_bound_closure
     );
     let mut stmts = structurer.structure();
 

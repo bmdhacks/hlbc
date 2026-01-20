@@ -1348,24 +1348,30 @@ impl Expr {
                     if let Some(fun) = f.as_fn(code) {
                         let args = &fun.ty(code).args;
 
-                        // Check if first param is closure context (enum type)
-                        let has_capture = args.first().map(|t| matches!(&code[*t], Type::Enum { .. })).unwrap_or(false);
-                        let skip_first = if has_capture { 1 } else { 0 };
+                        // Check if first param is closure context (enum type) or `this` (object type)
+                        // - Enum: captured variables context
+                        // - Obj: `this`-bound InstanceClosure
+                        let has_implicit_first = args.first().map(|t| {
+                            matches!(&code[*t], Type::Enum { .. } | Type::Obj { .. })
+                        }).unwrap_or(false);
+                        let skip_first = if has_implicit_first { 1 } else { 0 };
 
-                        // Build parameter names using same logic as DecompilerState::new()
-                        // Uses a counter for synthetic names to match body variable references
+                        // Build parameter names for visible params only
+                        // arg_name expects index into explicit params (not including implicit first)
                         let mut param_counter = 0u32;
-                        let param_names = args.iter().enumerate().map(|(i, _)| {
-                            fun.arg_name(code, i).unwrap_or_else(|| {
+                        let param_names = args.iter().enumerate().skip(skip_first).map(|(i, _)| {
+                            // Adjust index: arg_name(0) = first explicit param, which is args[skip_first]
+                            let arg_name_idx = i - skip_first;
+                            fun.arg_name(code, arg_name_idx).unwrap_or_else(|| {
                                 let name = Str::from(format!("arg{}", param_counter));
                                 param_counter += 1;
                                 name
                             })
                         }).collect::<Vec<_>>();
 
-                        // Format visible parameters (skip closure context if present)
-                        let params_display = args.iter().enumerate().skip(skip_first).map(|(i, arg)| {
-                            format!("{}: {}", param_names[i], to_haxe_type(&code[*arg], code))
+                        // Format visible parameters
+                        let params_display = args.iter().skip(skip_first).zip(param_names.iter()).map(|(arg, name)| {
+                            format!("{}: {}", name, to_haxe_type(&code[*arg], code))
                         }).collect::<Vec<_>>().join(", ");
                         "("{params_display}") -> {\n"
                         let indent2 = indent.inc_nesting();

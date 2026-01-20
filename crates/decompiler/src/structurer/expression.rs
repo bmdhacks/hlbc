@@ -361,40 +361,31 @@ impl<'a> Structurer<'a> {
         if let Some(Type::Fun(fun_type) | Type::Method(fun_type)) = self.code.types.get(self.func.t.0) {
             let num_args = fun_type.args.len();
             if reg_idx < num_args {
-                // For instance methods, reg0 is 'this' and doesn't have an assign entry.
-                // The assigns at op_idx 0 start from the first explicit parameter (reg1).
-                // So we need to adjust: arg_name_pos = reg_idx - 1 for instance methods.
-                //
-                // Instance methods are detected by:
-                // 1. Constructors (name starts with "__constructor__")
-                // 2. Methods where first arg type matches parent type
-                //
-                // Note: Just having parent.is_some() is NOT enough - static methods
-                // also have parent set (they belong to a class).
-                let func_name = self.code.strings.get(self.func.name.0)
-                    .map(|s| s.as_ref())
-                    .unwrap_or("");
-                let is_constructor = func_name.starts_with("__constructor__");
+                // Check if first param is implicit:
+                // - `this` for instance methods/this-bound closures (is_this_bound_closure)
+                // - Enum capture context for closures (first arg is enum AND we're in a closure)
+                // Note: Regular enums as parameters (like Color) are NOT implicit
+                let first_is_capture_context = fun_type.args.first().map(|t| {
+                    matches!(self.code.types.get(t.0), Some(hlbc::types::Type::Enum { .. }))
+                }).unwrap_or(false) && self.is_current_function_closure();
+                let has_implicit_first = self.is_this_bound_closure || first_is_capture_context;
 
-                // Check if first arg type matches parent type (indicates instance method)
-                let first_arg_is_self = if let Some(parent_type) = self.func.parent {
-                    !fun_type.args.is_empty() && fun_type.args[0] == parent_type
-                } else {
-                    false
-                };
-
-                let is_instance_method = is_constructor || first_arg_is_self;
-
-                if reg_idx == 0 && is_instance_method {
-                    // reg0 is 'this' for instance methods
+                // is_this_bound_closure covers:
+                // - Constructors (name starts with "__constructor__")
+                // - Instance methods (first arg type matches parent type)
+                // - This-bound closures (InstanceClosure opcode)
+                if reg_idx == 0 && self.is_this_bound_closure {
                     return Some("this".to_string());
                 }
 
-                // For explicit parameters, adjust the position for arg_name
-                let arg_name_pos = if is_instance_method { reg_idx - 1 } else { reg_idx };
-                if let Some(name) = self.func.arg_name(self.code, arg_name_pos) {
-                    if self.is_valid_identifier(&name) {
-                        return Some(name.to_string());
+                // Skip implicit first param (enum context or `this`) when looking up arg name
+                // For reg0 when implicit, there's no debug name to look up
+                if !(has_implicit_first && reg_idx == 0) {
+                    let arg_name_pos = if has_implicit_first { reg_idx - 1 } else { reg_idx };
+                    if let Some(name) = self.func.arg_name(self.code, arg_name_pos) {
+                        if self.is_valid_identifier(&name) {
+                            return Some(name.to_string());
+                        }
                     }
                 }
 

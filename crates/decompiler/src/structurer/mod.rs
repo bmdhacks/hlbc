@@ -89,6 +89,10 @@ pub struct Structurer<'a> {
 
     pub(crate) closure_analysis: Option<&'a ClosureAnalysis>,
 
+    /// True if this is a `this`-bound closure (from InstanceClosure opcode)
+    /// where reg0 is implicitly bound to `this`
+    pub(crate) is_this_bound_closure: bool,
+
     /// Processed blocks (to avoid re-processing)
     pub(crate) processed: HashSet<NodeIndex>,
     /// Use-def info for inlining decisions (ILSpy-style)
@@ -181,6 +185,19 @@ impl<'a> Structurer<'a> {
         type_info: &'a TypeInfo,
         closure_analysis: Option<&'a ClosureAnalysis>,
     ) -> Self {
+        Self::new_with_options(code, func, cfg, analysis, ssa, type_info, closure_analysis, false)
+    }
+
+    pub fn new_with_options(
+        code: &'a Bytecode,
+        func: &'a Function,
+        cfg: &'a Cfg,
+        analysis: &'a CfgAnalysis,
+        ssa: &'a SsaCfg,
+        type_info: &'a TypeInfo,
+        closure_analysis: Option<&'a ClosureAnalysis>,
+        is_this_bound_closure: bool,
+    ) -> Self {
         // (needs func for purity info)
         let use_info = ssa.compute_use_counts(func);
 
@@ -200,6 +217,26 @@ impl<'a> Structurer<'a> {
         // used for try/catch structuring
         let exception_analysis = ExceptionAnalysis::analyze(func);
 
+        // Determine if reg0 is `this`:
+        // - Explicitly passed for this-bound closures (InstanceClosure)
+        // - Or detected as instance method (constructor or first arg matches parent type)
+        let is_this_bound_closure = is_this_bound_closure || {
+            if let Some(Type::Fun(fun_type) | Type::Method(fun_type)) = code.types.get(func.t.0) {
+                let func_name = code.strings.get(func.name.0)
+                    .map(|s| s.as_ref())
+                    .unwrap_or("");
+                let is_constructor = func_name.starts_with("__constructor__");
+                let first_arg_is_self = if let Some(parent_type) = func.parent {
+                    !fun_type.args.is_empty() && fun_type.args[0] == parent_type
+                } else {
+                    false
+                };
+                is_constructor || first_arg_is_self
+            } else {
+                false
+            }
+        };
+
         Structurer {
             code,
             func,
@@ -208,6 +245,7 @@ impl<'a> Structurer<'a> {
             ssa,
             _type_info: type_info,
             closure_analysis,
+            is_this_bound_closure,
             processed: HashSet::new(),
             use_info,
             exception_analysis,
