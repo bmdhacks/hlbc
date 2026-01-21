@@ -47,10 +47,11 @@ pub fn lower_region(region: &Region, ctx: &mut LoweringContext<'_>) -> Vec<State
         } => lower_loop(kind, *header, condition.as_ref(), body, *exit, ctx),
         Region::Switch {
             selector,
+            selector_block,
             cases,
             default,
             merge,
-        } => lower_switch(selector, cases, default, *merge, ctx),
+        } => lower_switch(selector, *selector_block, cases, default, *merge, ctx),
         Region::Goto { target } => lower_goto(*target, ctx),
         Region::Empty => Vec::new(),
     }
@@ -408,31 +409,49 @@ fn lower_loop(
                 });
             }
         }
-        LoopKind::ForIn { iterator_reg, value_reg, next_op } => {
+        LoopKind::ForIn { iterator_reg, value_reg, next_op, iterator_init_op } => {
             // For-in iterator loop: `for (value in collection) { body }`
-            // Currently emit as while loop with the hasNext() condition.
-            // Note: For for-in loops, the condition from hasNext() is already
-            // the CONTINUE condition (true when iteration should continue),
-            // so we don't need to negate it. We use exit_cond which is loop_cond
-            // since extract_condition for hasNext returns the continue condition.
-            // TODO: Full implementation would find the collection expression
-            // and emit Statement::ForIn when collection tracking is complete.
+            //
+            // If we have iterator_init_op, we can recover the collection expression
+            // and emit a proper for-in loop. Otherwise, fall back to while loop.
 
-            // Filter out the .next() assignment from body if we know which op it is
-            let mut filtered_body = body_stmts.clone();
-            if let Some(_next_idx) = next_op {
-                filtered_body.retain(|s| !is_next_assignment(s, *value_reg));
+            if let Some(init_op) = iterator_init_op {
+                // Try to extract the collection expression from the iterator init
+                if let Some(collection_expr) = extract_collection_expr(*init_op, ctx) {
+                    // Get the variable name from value_reg
+                    let var_name = ctx.structurer.reg_name(*value_reg);
+
+                    // Filter out the .next() assignment from the body
+                    let filtered_body: Vec<Statement> = body_stmts
+                        .into_iter()
+                        .filter(|stmt| !is_next_assignment(stmt, *value_reg))
+                        .collect();
+
+                    stmts.push(Statement::ForIn {
+                        var_name,
+                        iterable: collection_expr,
+                        stmts: filtered_body,
+                    });
+
+                    // Suppress unused warnings
+                    let _ = (iterator_reg, next_op);
+
+                    return stmts;
+                }
             }
 
-            // Suppress unused variable warnings (will be used for full for-in emit)
-            let _ = iterator_reg;
+            // Fallback: emit as while loop (keeping .next() call)
+            // NOTE: We do NOT filter out the .next() assignment because we're
+            // emitting as a while loop, not a proper for-in. The .next() call
+            // is essential to advance the iterator.
+            let _ = (iterator_reg, value_reg, next_op, iterator_init_op);
 
             // For hasNext(), the condition IS the continue condition (true = continue)
             // so we need to negate for break check
             if header_stmts.is_empty() {
                 stmts.push(Statement::While {
                     cond: continue_cond,
-                    stmts: filtered_body,
+                    stmts: body_stmts,
                 });
             } else {
                 let mut loop_body = header_stmts;
@@ -441,7 +460,7 @@ fn lower_loop(
                     if_: vec![Statement::Break],
                     else_: vec![],
                 });
-                loop_body.extend(filtered_body);
+                loop_body.extend(body_stmts);
                 stmts.push(Statement::While {
                     cond: Expr::Constant(Constant::Bool(true)),
                     stmts: loop_body,
@@ -465,12 +484,64 @@ fn lower_loop(
 /// Lower a switch region to statements.
 fn lower_switch(
     selector: &Expr,
+    selector_block: Option<NodeIndex>,
     cases: &[crate::structurer::region::SwitchCase],
     default: &Region,
     _merge: NodeIndex,
     ctx: &mut LoweringContext<'_>,
 ) -> Vec<Statement> {
+    use hlbc::opcodes::Opcode;
+
+    let mut result = Vec::new();
     ctx.structurer.scope_depth += 1;
+
+    // Extract proper selector expression from the selector block
+    // Also emit any statements from the selector block that come before the Switch
+    let switch_arg = if let Some(block_idx) = selector_block {
+        // Get the block and find the Switch opcode
+        let block = &ctx.structurer.cfg.graph[block_idx];
+        let switch_op_idx = block.end;
+        let switch_op = &ctx.structurer.func.ops[switch_op_idx];
+
+        // First, emit statements from the selector block (except the Switch itself)
+        // These are the setup statements (like var x = 2) before the switch
+        for op_idx in block.start..block.end {
+            ctx.structurer.current_op = op_idx;
+            if let Some((dst, uses)) = ctx.structurer.ssa.get_instr_for_op(op_idx) {
+                ctx.structurer.current_ssa_dst = dst;
+                ctx.structurer.current_ssa_uses = uses.to_vec();
+            } else {
+                ctx.structurer.current_ssa_dst = None;
+                ctx.structurer.current_ssa_uses.clear();
+            }
+            // Skip control flow instructions
+            let op = &ctx.structurer.func.ops[op_idx];
+            if !matches!(op, Opcode::Switch { .. } | Opcode::JTrue { .. } | Opcode::JFalse { .. } | Opcode::JAlways { .. }) {
+                let stmts = ctx.structurer.opcode_to_statements(op_idx);
+                result.extend(stmts);
+            }
+        }
+
+        if let Opcode::Switch { reg, .. } = switch_op {
+            // Set up SSA context for proper register naming
+            ctx.structurer.current_op = switch_op_idx;
+            if let Some((ssa_dst, ssa_uses)) = ctx.structurer.ssa.get_instr_for_op(switch_op_idx) {
+                ctx.structurer.current_ssa_dst = ssa_dst;
+                ctx.structurer.current_ssa_uses = ssa_uses.clone();
+            } else {
+                ctx.structurer.current_ssa_dst = None;
+                ctx.structurer.current_ssa_uses.clear();
+            }
+            // Build proper expression using reg_to_expr
+            ctx.structurer.reg_to_expr(*reg)
+        } else {
+            // Fallback to the stored selector if Switch opcode not found
+            selector.clone()
+        }
+    } else {
+        // No block info, use stored selector
+        selector.clone()
+    };
 
     // Lower each case
     let lowered_cases: Vec<(Vec<Expr>, Vec<Statement>)> = cases
@@ -491,12 +562,15 @@ fn lower_switch(
 
     ctx.structurer.scope_depth -= 1;
 
-    vec![Statement::Switch {
-        arg: selector.clone(),
+    // Add the switch statement to the result
+    result.push(Statement::Switch {
+        arg: switch_arg,
         default: default_stmts,
         cases: lowered_cases,
         enum_type: None,
-    }]
+    });
+
+    result
 }
 
 /// Lower a goto region to statements.
@@ -513,7 +587,8 @@ fn lower_goto(target: NodeIndex, _ctx: &mut LoweringContext<'_>) -> Vec<Statemen
 }
 
 /// Check if a statement is an assignment to the value register from .next() call.
-/// Used to filter out the iterator next() assignment from for-in loop bodies.
+/// Used to filter out the iterator next() assignment from for-in loop bodies
+/// when emitting proper `for (x in collection)` statements.
 fn is_next_assignment(stmt: &Statement, value_reg: Reg) -> bool {
     match stmt {
         Statement::Assign { variable, .. } => {
@@ -525,6 +600,50 @@ fn is_next_assignment(stmt: &Statement, value_reg: Reg) -> bool {
             }
         }
         _ => false,
+    }
+}
+
+/// Extract the collection/iterator expression from an iterator initialization opcode.
+///
+/// Given an opcode like `it = map.keys()` or `it = collection.iterator()`,
+/// extracts the full iterator expression (e.g., `map.keys()` or `collection.iterator()`).
+/// This preserves the method call so the for-in loop shows the proper iterable.
+fn extract_collection_expr(init_op_idx: usize, ctx: &mut LoweringContext<'_>) -> Option<Expr> {
+    use crate::ast::Call;
+
+    let op = &ctx.structurer.func.ops[init_op_idx].clone();
+
+    // Set up SSA context for proper register resolution
+    ctx.structurer.current_op = init_op_idx;
+    if let Some((dst, uses)) = ctx.structurer.ssa.get_instr_for_op(init_op_idx) {
+        ctx.structurer.current_ssa_dst = dst;
+        ctx.structurer.current_ssa_uses = uses.to_vec();
+    } else {
+        ctx.structurer.current_ssa_dst = None;
+        ctx.structurer.current_ssa_uses.clear();
+    }
+
+    match &op {
+        // Call1: it = fn(collection) - build the full call expression
+        // e.g., map.keys() where fun is the keys function
+        Opcode::Call1 { fun, arg0, .. } => {
+            let obj_expr = ctx.structurer.reg_to_expr(*arg0);
+            let method_name = fun.name(ctx.structurer.code);
+            Some(Expr::Call(Box::new(Call::new(
+                Expr::Field(Box::new(obj_expr), method_name),
+                vec![],
+            ))))
+        }
+        // CallMethod: it = collection.keys() - build the full call expression
+        Opcode::CallMethod { field, args, .. } if !args.is_empty() => {
+            let obj_expr = ctx.structurer.reg_to_expr(args[0]);
+            let method_name = ctx.structurer.get_field_name(args[0], *field);
+            Some(Expr::Call(Box::new(Call::new(
+                Expr::Field(Box::new(obj_expr), method_name),
+                vec![],
+            ))))
+        }
+        _ => None,
     }
 }
 

@@ -141,9 +141,9 @@ fn reduce_one_step(
                 made_progress = true;
             } else {
                 // Priority 4: Collapse switch patterns
-                let switch_patterns = find_switch_patterns(graph, cfg, analysis);
+                let switch_patterns = find_switch_patterns(graph, cfg, analysis, ctx);
                 if let Some(sp) = switch_patterns.into_iter().next() {
-                    collapse_switch(graph, cfg, &sp);
+                    collapse_switch(graph, cfg, &sp, ctx);
                     made_progress = true;
                 } else {
                     // Priority 5: Collapse linear sequences
@@ -341,12 +341,17 @@ fn collapse_if(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &IfPattern) {
 }
 
 /// Collapse a switch pattern into a Region::Switch node.
-fn collapse_switch(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &SwitchPattern) {
+fn collapse_switch(
+    graph: &mut RegionGraph,
+    _cfg: &Cfg,
+    pattern: &SwitchPattern,
+    _ctx: Option<&PatternContext<'_>>,
+) {
+    use crate::ast::Constant;
+
     // Build cases from case nodes
     let mut cases = Vec::new();
     for &case_node in &pattern.case_nodes {
-        // Each case becomes a SwitchCase with empty patterns for now
-        // The actual patterns will be determined during lowering
         let body = if let Some(node) = graph.get_node(case_node) {
             match node {
                 RegionNode::Block(cfg_idx) => Region::Block(*cfg_idx),
@@ -356,10 +361,15 @@ fn collapse_switch(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &SwitchPattern)
             Region::Empty
         };
 
-        cases.push(SwitchCase {
-            patterns: Vec::new(), // Will be filled during lowering
-            body,
-        });
+        // Get case values for this node from the pattern
+        // Use InlineInt since these are literal case values, not indices into the int table
+        let patterns: Vec<Constant> = pattern
+            .case_values
+            .get(&case_node)
+            .map(|values| values.iter().map(|&v| Constant::InlineInt(v as usize)).collect())
+            .unwrap_or_default();
+
+        cases.push(SwitchCase { patterns, body });
     }
 
     // Build default case
@@ -376,9 +386,19 @@ fn collapse_switch(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &SwitchPattern)
         Region::Empty
     };
 
+    // Build selector expression from the register
+    let selector = if let Some(reg) = pattern.selector_reg {
+        // Use the register directly - the expression builder will name it properly during lowering
+        Expr::Variable(reg, None)
+    } else {
+        // Fallback: placeholder constant (shouldn't happen if ctx was available)
+        Expr::Constant(Constant::Int(RefInt(0)))
+    };
+
     // Create the switch region
     let switch_region = Region::Switch {
-        selector: Expr::Constant(crate::ast::Constant::Int(RefInt(0))), // Placeholder
+        selector,
+        selector_block: Some(pattern.selector_cfg_block),
         cases,
         default: Box::new(default),
         merge: pattern.merge,

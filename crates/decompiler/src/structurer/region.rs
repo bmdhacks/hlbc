@@ -50,6 +50,9 @@ pub enum LoopKind {
         value_reg: Reg,
         /// Opcode index of the .next() call (to suppress in body output)
         next_op: Option<usize>,
+        /// Opcode index where iterator was created (e.g., `it = coll.keys()`)
+        /// Used to extract the collection expression for proper for-in syntax.
+        iterator_init_op: Option<usize>,
     },
 
     /// Infinite loop: `while (true) { body }`
@@ -128,8 +131,11 @@ pub enum Region {
 
     /// A switch/match region.
     Switch {
-        /// The expression being switched on.
+        /// The expression being switched on (may be placeholder if selector_block is set).
         selector: Expr,
+
+        /// The CFG block containing the Switch opcode (for extracting proper expression during lowering).
+        selector_block: Option<NodeIndex>,
 
         /// The cases with their patterns and body regions.
         cases: Vec<SwitchCase>,

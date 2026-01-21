@@ -10,7 +10,7 @@
 //! these patterns to collapse the graph.
 
 use petgraph::graph::NodeIndex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use hlbc::opcodes::Opcode;
 use hlbc::types::{Function, Reg};
@@ -80,6 +80,10 @@ pub struct SwitchPattern {
     /// The switch selector node (contains the Switch opcode).
     pub selector_node: NodeIndex,
 
+    /// The CFG block index containing the Switch opcode.
+    /// Used during lowering to properly extract the selector expression.
+    pub selector_cfg_block: NodeIndex,
+
     /// Case target nodes (one per case).
     pub case_nodes: Vec<NodeIndex>,
 
@@ -91,6 +95,13 @@ pub struct SwitchPattern {
 
     /// All nodes in the switch body.
     pub body_nodes: HashSet<NodeIndex>,
+
+    /// The register being switched on (if ctx was available).
+    pub selector_reg: Option<Reg>,
+
+    /// Map from case node (region index) to case values that jump there.
+    /// Multiple values may map to the same node (fallthrough/combined cases).
+    pub case_values: HashMap<NodeIndex, Vec<i32>>,
 }
 
 /// Find loop patterns in the graph that can be collapsed.
@@ -261,11 +272,94 @@ fn try_detect_for_in(
     // Find .next() call in body to get value register
     let (value_reg, next_op) = find_next_call(cfg, natural_loop, iterator_reg, ctx)?;
 
+    // Find the iterator initialization (e.g., `it = map.keys()`)
+    let iterator_init_op = find_iterator_init(cfg, natural_loop, iterator_reg, ctx);
+
     Some(LoopKind::ForIn {
         iterator_reg,
         value_reg,
         next_op: Some(next_op),
+        iterator_init_op,
     })
+}
+
+/// Find the iterator initialization opcode.
+/// Traces the iterator register back to find where it was assigned
+/// (e.g., `it = map.keys()` or `it = collection.iterator()`).
+fn find_iterator_init(
+    cfg: &Cfg,
+    natural_loop: &NaturalLoop,
+    iterator_reg: Reg,
+    ctx: &PatternContext<'_>,
+) -> Option<usize> {
+    // Search predecessors of the loop header for the iterator assignment
+    for pred in cfg.graph.neighbors_directed(natural_loop.header, petgraph::Direction::Incoming) {
+        // Skip back-edges (nodes inside the loop)
+        if natural_loop.body.contains(&pred) {
+            continue;
+        }
+
+        if let Some(ssa_block) = ctx.ssa.blocks.get(&pred) {
+            // Search for assignment to iterator_reg
+            for instr in ssa_block.ops.iter().rev() {
+                if let SsaInstr::Op { op_idx, dst: Some(dst), .. } = instr {
+                    if dst.reg == iterator_reg {
+                        let op = &ctx.func.ops[*op_idx];
+                        if is_iterator_creation(op, ctx) {
+                            return Some(*op_idx);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Also check the header block itself - iterator might be created there before
+    // the hasNext() call in the same block.
+    if let Some(ssa_block) = ctx.ssa.blocks.get(&natural_loop.header) {
+        for instr in &ssa_block.ops {
+            if let SsaInstr::Op { op_idx, dst: Some(dst), .. } = instr {
+                if dst.reg == iterator_reg {
+                    let op = &ctx.func.ops[*op_idx];
+                    if is_iterator_creation(op, ctx) {
+                        return Some(*op_idx);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Check if an opcode creates an iterator (e.g., .iterator(), .keys(), .keyValueIterator()).
+fn is_iterator_creation(op: &Opcode, ctx: &PatternContext<'_>) -> bool {
+    match op {
+        Opcode::Call1 { fun, .. } => {
+            // Use RefFun.name() which properly looks up through findexes
+            let name = fun.name(ctx.code);
+            matches!(
+                name.as_ref(),
+                "iterator" | "keys" | "keyValueIterator" | "values"
+            )
+        }
+        Opcode::CallMethod { field, args, .. } => {
+            if let Some(obj_reg) = args.first() {
+                let obj_type = &ctx.code[ctx.func.regs[obj_reg.0 as usize]];
+                if let hlbc::types::Type::Virtual { fields } = obj_type {
+                    if let Some(obj_field) = fields.get(field.0) {
+                        let name = ctx.code.get(obj_field.name);
+                        return matches!(
+                            name.as_ref(),
+                            "iterator" | "keys" | "keyValueIterator" | "values"
+                        );
+                    }
+                }
+            }
+            false
+        }
+        _ => false,
+    }
 }
 
 /// Extract the condition register from a conditional jump opcode.
@@ -678,10 +772,13 @@ fn collect_branch_nodes(
 /// A switch pattern is detected when:
 /// 1. A node has 3+ successors (multi-way branch)
 /// 2. All branches eventually merge at the post-dominator
+///
+/// If `ctx` is provided, extracts case values from the Switch opcode.
 pub fn find_switch_patterns(
     region_graph: &RegionGraph,
     cfg: &Cfg,
     analysis: &CfgAnalysis,
+    ctx: Option<&PatternContext<'_>>,
 ) -> Vec<SwitchPattern> {
     let mut patterns = Vec::new();
 
@@ -690,7 +787,7 @@ pub fn find_switch_patterns(
             continue;
         }
 
-        if let Some(pattern) = match_switch_pattern(region_graph, cfg, analysis, node) {
+        if let Some(pattern) = match_switch_pattern(region_graph, cfg, analysis, node, ctx) {
             patterns.push(pattern);
         }
     }
@@ -704,6 +801,7 @@ fn match_switch_pattern(
     cfg: &Cfg,
     analysis: &CfgAnalysis,
     node: NodeIndex,
+    ctx: Option<&PatternContext<'_>>,
 ) -> Option<SwitchPattern> {
     let cfg_node = region_graph.get_node(node)?.as_block()?;
 
@@ -717,21 +815,24 @@ fn match_switch_pattern(
     let merge_cfg = analysis.ipdom(cfg_node)?;
 
     // Collect case nodes and body
+    let mut case_nodes_set = HashSet::new();
     let mut case_nodes = Vec::new();
     let mut body_nodes = HashSet::new();
     let mut default_node = None;
 
     // Check edge types to identify default vs cases
+    // Note: Switch can have multiple edges to the same target (multiple case values),
+    // so we deduplicate by using a HashSet
     for (target, kind) in cfg.successors_with_edges(cfg_node) {
         match kind {
             EdgeKind::FallThrough => {
                 default_node = Some(target);
             }
-            EdgeKind::ConditionalTrue => {
-                case_nodes.push(target);
-            }
-            _ => {
-                case_nodes.push(target);
+            EdgeKind::ConditionalTrue | _ => {
+                // Only add each target once
+                if case_nodes_set.insert(target) {
+                    case_nodes.push(target);
+                }
             }
         }
 
@@ -753,13 +854,76 @@ fn match_switch_pattern(
 
     let merge = region_graph.get_region_node(merge_cfg)?;
 
+    // Extract selector register and case values from the Switch opcode if ctx is available
+    let (selector_reg, case_values) = if let Some(ctx) = ctx {
+        extract_switch_info(cfg, cfg_node, region_graph, ctx)
+    } else {
+        (None, HashMap::new())
+    };
+
     Some(SwitchPattern {
         selector_node: node,
+        selector_cfg_block: cfg_node,
         case_nodes: case_region_nodes,
         default_node: default_node.and_then(|n| region_graph.get_region_node(n)),
         merge,
         body_nodes: body_region_nodes,
+        selector_reg,
+        case_values,
     })
+}
+
+/// Extract switch information from the Switch opcode in a basic block.
+///
+/// Returns (selector_reg, case_values_map) where case_values_map maps
+/// region node indices to their corresponding case values.
+fn extract_switch_info(
+    cfg: &Cfg,
+    cfg_node: NodeIndex,
+    region_graph: &RegionGraph,
+    ctx: &PatternContext<'_>,
+) -> (Option<Reg>, HashMap<NodeIndex, Vec<i32>>) {
+    let block = &cfg.graph[cfg_node];
+    let ops = &ctx.func.ops;
+
+    // Find the Switch opcode at the end of the block
+    let switch_op = &ops[block.end];
+    let (reg, offsets) = match switch_op {
+        Opcode::Switch { reg, offsets, .. } => (*reg, offsets),
+        _ => return (None, HashMap::new()),
+    };
+
+    // Build mapping from CFG node -> case values
+    // offsets[i] = jump offset for case value i
+    let mut cfg_to_values: HashMap<NodeIndex, Vec<i32>> = HashMap::new();
+    let num_ops = ops.len();
+
+    for (case_value, &offset) in offsets.iter().enumerate() {
+        // Compute target address: block.end + offset + 1
+        let target_addr = block.end as i64 + offset as i64 + 1;
+        if target_addr < 0 || target_addr as usize >= num_ops {
+            continue;
+        }
+        let target_addr = target_addr as usize;
+
+        // Find the CFG node for this target
+        if let Some(&target_cfg_node) = cfg.op_to_block.get(&target_addr) {
+            cfg_to_values
+                .entry(target_cfg_node)
+                .or_default()
+                .push(case_value as i32);
+        }
+    }
+
+    // Convert CFG nodes to region graph indices
+    let mut region_to_values: HashMap<NodeIndex, Vec<i32>> = HashMap::new();
+    for (cfg_idx, values) in cfg_to_values {
+        if let Some(region_idx) = region_graph.get_region_node(cfg_idx) {
+            region_to_values.insert(region_idx, values);
+        }
+    }
+
+    (Some(reg), region_to_values)
 }
 
 /// Find the innermost pattern that can be collapsed.
@@ -787,7 +951,7 @@ pub fn find_innermost_pattern(
     }
 
     // Then try switch patterns
-    let switch_patterns = find_switch_patterns(region_graph, cfg, analysis);
+    let switch_patterns = find_switch_patterns(region_graph, cfg, analysis, ctx);
     if let Some(sp) = switch_patterns.into_iter().next() {
         return Some(Pattern::Switch(sp));
     }
