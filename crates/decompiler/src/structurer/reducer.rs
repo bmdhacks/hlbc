@@ -93,16 +93,22 @@ fn reduce_one_step(
     // Priority 1: Collapse if-then-else patterns that are INSIDE loops first
     // This ensures nested if-else structures are reduced before their containing loops.
     // Skip patterns whose condition is a loop header (those are loop conditions, not inner if-else).
+    // Also skip patterns with empty branches (no nodes to collapse beyond condition).
     let if_patterns = find_if_patterns(graph, cfg, analysis);
     if let Some(ip) = if_patterns
         .into_iter()
         .find(|p| {
             // Skip if the condition node is a loop header
-            if let Some(cfg_node) = graph.get_node(p.condition_node).and_then(|n| n.as_block()) {
-                !loop_headers.contains(&cfg_node)
-            } else {
-                true // Collapsed nodes are fine to process
-            }
+            let is_loop_header = graph
+                .get_node(p.condition_node)
+                .and_then(|n| n.as_block())
+                .map(|cfg_node| loop_headers.contains(&cfg_node))
+                .unwrap_or(false);
+
+            // Skip if both branches are empty (collapsing would not reduce node count)
+            let has_branch_nodes = !p.then_nodes.is_empty() || !p.else_nodes.is_empty();
+
+            !is_loop_header && has_branch_nodes
         })
     {
         collapse_if(graph, cfg, &ip);
@@ -116,8 +122,12 @@ fn reduce_one_step(
             made_progress = true;
         } else {
             // Priority 3: Collapse remaining if-then-else patterns (including loop headers)
+            // Still skip patterns with empty branches (would not reduce node count)
             let if_patterns = find_if_patterns(graph, cfg, analysis);
-            if let Some(ip) = if_patterns.into_iter().next() {
+            if let Some(ip) = if_patterns
+                .into_iter()
+                .find(|p| !p.then_nodes.is_empty() || !p.else_nodes.is_empty())
+            {
                 collapse_if(graph, cfg, &ip);
                 made_progress = true;
             } else {

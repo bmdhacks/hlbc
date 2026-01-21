@@ -138,14 +138,14 @@ fn match_loop_pattern(
     }
 
     // Skip if this loop was already collapsed - all CFG nodes map to a single
-    // region node that's already a Loop. Without this check, we'd wrap the
-    // collapsed loop in another loop infinitely.
+    // region node that's already collapsed. Without this check, we'd try to
+    // wrap an already-collapsed region in another loop.
     if body_region_nodes.len() == 1 && natural_loop.body.len() > 1 {
         let single_node = *body_region_nodes.iter().next().unwrap();
-        if let Some(crate::structurer::region_graph::RegionNode::Collapsed(
-            crate::structurer::region::Region::Loop { .. }
-        )) = region_graph.get_node(single_node) {
-            return None; // Already collapsed as a loop
+        if let Some(crate::structurer::region_graph::RegionNode::Collapsed(_)) =
+            region_graph.get_node(single_node)
+        {
+            return None; // Already collapsed
         }
     }
 
