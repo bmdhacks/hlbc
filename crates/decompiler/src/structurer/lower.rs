@@ -16,6 +16,7 @@
 use petgraph::graph::NodeIndex;
 
 use hlbc::opcodes::Opcode;
+use hlbc::types::Reg;
 
 use crate::ast::{Constant, Expr, Operation, Statement};
 use crate::structurer::region::{LoopKind, Region};
@@ -349,6 +350,41 @@ fn lower_loop(
                 });
             }
         }
+        LoopKind::ForIn { iterator_reg, value_reg, next_op } => {
+            // For-in iterator loop: `for (value in collection) { body }`
+            // Currently emit as while loop with the hasNext() condition.
+            // TODO: Full implementation would find the collection expression
+            // and emit Statement::ForIn when collection tracking is complete.
+
+            // Filter out the .next() assignment from body if we know which op it is
+            let mut filtered_body = body_stmts.clone();
+            if let Some(_next_idx) = next_op {
+                filtered_body.retain(|s| !is_next_assignment(s, *value_reg));
+            }
+
+            // Suppress unused variable warnings (will be used for full for-in emit)
+            let _ = iterator_reg;
+
+            if header_stmts.is_empty() {
+                stmts.push(Statement::While {
+                    cond: loop_cond,
+                    stmts: filtered_body,
+                });
+            } else {
+                let break_cond = Expr::Op(Operation::Not(Box::new(loop_cond)));
+                let mut loop_body = header_stmts;
+                loop_body.push(Statement::IfElse {
+                    cond: break_cond,
+                    if_: vec![Statement::Break],
+                    else_: vec![],
+                });
+                loop_body.extend(filtered_body);
+                stmts.push(Statement::While {
+                    cond: Expr::Constant(Constant::Bool(true)),
+                    stmts: loop_body,
+                });
+            }
+        }
         LoopKind::Endless => {
             // while(true) { body }
             let mut loop_body = header_stmts;
@@ -411,6 +447,22 @@ fn lower_goto(target: NodeIndex, _ctx: &mut LoweringContext<'_>) -> Vec<Statemen
         "goto block_{} (irreducible control flow)",
         target.index()
     ))]
+}
+
+/// Check if a statement is an assignment to the value register from .next() call.
+/// Used to filter out the iterator next() assignment from for-in loop bodies.
+fn is_next_assignment(stmt: &Statement, value_reg: Reg) -> bool {
+    match stmt {
+        Statement::Assign { variable, .. } => {
+            // Check if the variable is a Reg matching value_reg
+            if let Expr::Variable(reg, _) = variable {
+                *reg == value_reg
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]

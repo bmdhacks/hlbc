@@ -191,7 +191,10 @@ pub fn decompile_code_with_options(
     use crate::analyzer::CfgAnalysis;
     use crate::ssa::SsaCfg;
     use crate::type_prop::TypePropagator;
-    use crate::structurer::Structurer;
+    use crate::structurer::{
+        Structurer, PatternContext, reduce_to_region, LoweringContext, lower_region,
+        simplify_statements,
+    };
 
     let findex = f.findex.0;
 
@@ -214,11 +217,60 @@ pub fn decompile_code_with_options(
     let propagator = TypePropagator::new(code, f, &cfg, &ssa);
     let type_info = propagator.propagate();
 
-    // Pass 5: Structure into AST (with optional closure context)
+    // Pass 5: Structure into AST using the new iterative reducer
+    // The reducer detects high-level patterns like for-in loops via SSA analysis
     let mut structurer = Structurer::new_with_options(
         code, f, &cfg, &analysis, &ssa, &type_info, closure_analysis, is_this_bound_closure
     );
-    let mut stmts = structurer.structure();
+
+    // Run preprocessing for pattern suppression
+    structurer.detect_enum_switch_patterns();
+    structurer.detect_internal_function_calls();
+
+    // Check if function has exception handling - use legacy path for try/catch
+    let mut stmts = if structurer.exception_analysis.has_exceptions() {
+        // Legacy path handles Trap/EndTrap regions correctly
+        structurer.structure()
+    } else {
+        // New reducer path with for-in detection
+        let pattern_ctx = PatternContext {
+            code,
+            func: f,
+            ssa: &ssa,
+            type_info: &type_info,
+        };
+        let region = reduce_to_region(&cfg, &analysis, Some(&pattern_ctx));
+
+        // Lower the region tree to statements
+        let mut lowering_ctx = LoweringContext::new(&mut structurer);
+        let lowered_stmts = lower_region(&region, &mut lowering_ctx);
+
+        // Extract needed data from structurer while it's still borrowed
+        let current_class = lowering_ctx.structurer.get_current_class_name();
+        let current_class_str = current_class.as_ref().map(|s| s.as_ref());
+
+        // Prepend hoisted variable declarations (same as legacy structure())
+        let mut result = Vec::new();
+        for name in &lowering_ctx.structurer.hoisted_vars {
+            let type_hint = if lowering_ctx.structurer.needs_dynamic_type.contains(name) {
+                Some("Dynamic".into())
+            } else if let Some(type_ref) = lowering_ctx.structurer.hoisted_var_types.get(name) {
+                let ty = &code.types[type_ref.0];
+                let type_str = crate::fmt::to_haxe_type_in_context(ty, code, current_class_str);
+                if type_str == "Void" || type_str == "haxe.Exception" {
+                    Some("Dynamic".into())
+                } else {
+                    Some(type_str)
+                }
+            } else {
+                None
+            };
+            result.push(Statement::VarDecl { name: name.clone(), type_hint });
+        }
+        result.extend(lowered_stmts);
+
+        simplify_statements(result)
+    };
 
     // Pass 6: Post-processing transformations
     post::reconstruct_array_literals(code, &mut stmts);

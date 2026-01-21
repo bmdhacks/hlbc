@@ -34,6 +34,11 @@ use crate::ssa::UseDefInfo;
 use crate::closure_analysis::ClosureAnalysis;
 use crate::exception_analysis::{ExceptionAnalysis, TryRegion};
 
+// Re-exports for new reducer-based structuring (used by lib.rs)
+pub use lower::{lower_region, LoweringContext};
+pub use patterns::PatternContext;
+pub use reducer::reduce_to_region;
+
 pub use stmts::simplify_statements; // external export
 
 /// Tracks memory dependencies for SSA inline expressions

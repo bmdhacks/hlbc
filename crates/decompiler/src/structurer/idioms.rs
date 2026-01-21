@@ -28,7 +28,7 @@ impl<'a> Structurer<'a> {
     ///   ... (0 or more ops)
     ///   Switch dst
     /// When detected, the EnumIndex opcode is suppressed and the switch uses the original enum.
-    pub(super) fn detect_enum_switch_patterns(&mut self) {
+    pub fn detect_enum_switch_patterns(&mut self) {
         let ops = &self.func.ops;
 
         for (i, op) in ops.iter().enumerate() {
@@ -56,7 +56,7 @@ impl<'a> Structurer<'a> {
 
     /// Detect internal function calls (__expand, __construct, __constructor__) and suppress them.
     /// These are runtime implementation details that shouldn't appear in decompiled output.
-    pub(super) fn detect_internal_function_calls(&mut self) {
+    pub fn detect_internal_function_calls(&mut self) {
         let ops = &self.func.ops;
 
         for (i, op) in ops.iter().enumerate() {

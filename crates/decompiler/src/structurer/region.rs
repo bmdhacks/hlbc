@@ -14,6 +14,7 @@ use petgraph::graph::NodeIndex;
 use std::collections::HashSet;
 
 use crate::ast::{Constant, Expr};
+use hlbc::types::Reg;
 
 /// The kind of loop detected during structuring.
 ///
@@ -38,6 +39,17 @@ pub enum LoopKind {
         init_op: Option<usize>,
         /// Opcode index of the increment statement (end of loop body).
         incr_op: Option<usize>,
+    },
+
+    /// For-in iterator loop: `for (value in collection) { body }`
+    /// Detected from pattern: `it = coll.iterator(); while(it.hasNext()) { val = it.next(); ... }`
+    ForIn {
+        /// Register holding the iterator object
+        iterator_reg: Reg,
+        /// Register receiving values from .next()
+        value_reg: Reg,
+        /// Opcode index of the .next() call (to suppress in body output)
+        next_op: Option<usize>,
     },
 
     /// Infinite loop: `while (true) { body }`

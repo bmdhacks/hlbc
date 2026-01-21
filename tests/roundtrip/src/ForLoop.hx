@@ -2,10 +2,10 @@ class ForLoop {
     static function main() {
         // Basic for loop with range
         var sum = 0;
-        for (i in 0...5) {
+        for (i in 0...1000) {
             sum += i;
         }
-        Sys.println("sum=" + sum);  // 0+1+2+3+4 = 10
+        Sys.println("sum=" + sum);  // 499500
 
         // For loop over array
         var arr = [10, 20, 30];
@@ -17,11 +17,11 @@ class ForLoop {
 
         // Nested for loops
         var product = 0;
-        for (i in 0...3) {
-            for (j in 0...2) {
+        for (i in 0...100) {
+            for (j in 0...100) {
                 product += i * j;
             }
         }
-        Sys.println("product=" + product);  // 3
+        Sys.println("product=" + product);
     }
 }

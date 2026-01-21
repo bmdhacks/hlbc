@@ -12,10 +12,26 @@
 use petgraph::graph::NodeIndex;
 use std::collections::HashSet;
 
+use hlbc::opcodes::Opcode;
+use hlbc::types::{Function, Reg};
+use hlbc::{Bytecode, Resolve};
+
 use crate::analyzer::{CfgAnalysis, NaturalLoop};
 use crate::lifter::{Cfg, EdgeKind};
+use crate::ssa::{SsaCfg, SsaInstr, SsaVar};
 use crate::structurer::region::LoopKind;
 use crate::structurer::region_graph::RegionGraph;
+use crate::type_prop::TypeInfo;
+
+/// Context for pattern matching with access to SSA and type information.
+/// This allows pattern matchers to look at the SSA definitions to detect
+/// higher-level patterns like for-in iterator loops.
+pub struct PatternContext<'a> {
+    pub code: &'a Bytecode,
+    pub func: &'a Function,
+    pub ssa: &'a SsaCfg,
+    pub type_info: &'a TypeInfo,
+}
 
 /// A detected loop pattern ready for collapse.
 #[derive(Debug, Clone)]
@@ -83,10 +99,13 @@ pub struct SwitchPattern {
 /// where all body nodes are still present in the RegionGraph (not yet collapsed).
 ///
 /// Returns loops in innermost-first order for proper nesting.
+///
+/// If `ctx` is provided, enables detection of higher-level patterns like for-in loops.
 pub fn find_loop_patterns(
     region_graph: &RegionGraph,
     cfg: &Cfg,
     analysis: &CfgAnalysis,
+    ctx: Option<&PatternContext<'_>>,
 ) -> Vec<LoopPattern> {
     let mut patterns = Vec::new();
 
@@ -95,7 +114,7 @@ pub fn find_loop_patterns(
     loops.sort_by_key(|l| l.body.len());
 
     for natural_loop in loops {
-        if let Some(pattern) = match_loop_pattern(region_graph, cfg, analysis, natural_loop) {
+        if let Some(pattern) = match_loop_pattern(region_graph, cfg, analysis, natural_loop, ctx) {
             patterns.push(pattern);
         }
     }
@@ -107,8 +126,9 @@ pub fn find_loop_patterns(
 fn match_loop_pattern(
     region_graph: &RegionGraph,
     cfg: &Cfg,
-    _analysis: &CfgAnalysis,
+    analysis: &CfgAnalysis,
     natural_loop: &NaturalLoop,
+    ctx: Option<&PatternContext<'_>>,
 ) -> Option<LoopPattern> {
     // Check that all loop body nodes are still in the region graph
     let mut body_region_nodes = HashSet::new();
@@ -117,18 +137,33 @@ fn match_loop_pattern(
         body_region_nodes.insert(region_node);
     }
 
+    // Skip if this loop was already collapsed - all CFG nodes map to a single
+    // region node that's already a Loop. Without this check, we'd wrap the
+    // collapsed loop in another loop infinitely.
+    if body_region_nodes.len() == 1 && natural_loop.body.len() > 1 {
+        let single_node = *body_region_nodes.iter().next().unwrap();
+        if let Some(crate::structurer::region_graph::RegionNode::Collapsed(
+            crate::structurer::region::Region::Loop { .. }
+        )) = region_graph.get_node(single_node) {
+            return None; // Already collapsed as a loop
+        }
+    }
+
     // Find the exit node (first node outside the loop that's reachable from inside)
     let exit = find_loop_exit(cfg, natural_loop)?;
 
     // Determine loop kind
-    let kind = detect_loop_kind(cfg, natural_loop);
+    let kind = detect_loop_kind(cfg, analysis, natural_loop, ctx);
 
     // The condition is typically at the header for while loops
-    let condition_node = if kind == LoopKind::While || kind == LoopKind::Endless {
-        Some(natural_loop.header)
-    } else {
-        // For do-while, condition is at a back-edge source
-        natural_loop.back_edge_sources.first().copied()
+    let condition_node = match &kind {
+        LoopKind::While | LoopKind::Endless | LoopKind::ForIn { .. } => {
+            Some(natural_loop.header)
+        }
+        _ => {
+            // For do-while, condition is at a back-edge source
+            natural_loop.back_edge_sources.first().copied()
+        }
     };
 
     Some(LoopPattern {
@@ -163,7 +198,12 @@ fn find_loop_exit(cfg: &Cfg, natural_loop: &NaturalLoop) -> Option<NodeIndex> {
 }
 
 /// Detect the kind of loop based on structure.
-fn detect_loop_kind(cfg: &Cfg, natural_loop: &NaturalLoop) -> LoopKind {
+fn detect_loop_kind(
+    cfg: &Cfg,
+    _analysis: &CfgAnalysis,
+    natural_loop: &NaturalLoop,
+    ctx: Option<&PatternContext<'_>>,
+) -> LoopKind {
     let header = natural_loop.header;
     let header_succs = cfg.successors(header);
 
@@ -174,7 +214,12 @@ fn detect_loop_kind(cfg: &Cfg, natural_loop: &NaturalLoop) -> LoopKind {
 
     if header_exits {
         // Header checks condition and may exit -> while loop
-        // Could also be a for loop, but we detect that later during lowering
+        // But first, try to detect for-in pattern if we have SSA context
+        if let Some(ctx) = ctx {
+            if let Some(for_in) = try_detect_for_in(cfg, natural_loop, ctx) {
+                return for_in;
+            }
+        }
         LoopKind::While
     } else if natural_loop.back_edge_sources.len() == 1 {
         // Single back-edge, no header exit -> check if back-edge source exits
@@ -195,6 +240,161 @@ fn detect_loop_kind(cfg: &Cfg, natural_loop: &NaturalLoop) -> LoopKind {
         // Multiple back edges or complex structure -> default to while
         LoopKind::While
     }
+}
+
+/// Try to detect for-in iterator pattern.
+/// Pattern: `it = coll.iterator(); while(it.hasNext()) { val = it.next(); ... }`
+fn try_detect_for_in(
+    cfg: &Cfg,
+    natural_loop: &NaturalLoop,
+    ctx: &PatternContext<'_>,
+) -> Option<LoopKind> {
+    let header = natural_loop.header;
+    let block = &cfg.graph[header];
+
+    // Find condition register from terminating jump
+    let cond_reg = extract_condition_reg(&ctx.func.ops[block.end])?;
+
+    // Look for hasNext() call defining the condition
+    let (iterator_reg, _has_next_op) = find_has_next_call(header, cond_reg, ctx)?;
+
+    // Find .next() call in body to get value register
+    let (value_reg, next_op) = find_next_call(cfg, natural_loop, iterator_reg, ctx)?;
+
+    Some(LoopKind::ForIn {
+        iterator_reg,
+        value_reg,
+        next_op: Some(next_op),
+    })
+}
+
+/// Extract the condition register from a conditional jump opcode.
+fn extract_condition_reg(op: &Opcode) -> Option<Reg> {
+    match op {
+        Opcode::JTrue { cond, .. } | Opcode::JFalse { cond, .. } => Some(*cond),
+        Opcode::JNotNull { reg, .. } | Opcode::JNull { reg, .. } => Some(*reg),
+        _ => None,
+    }
+}
+
+/// Find a hasNext() call that defines the condition register.
+/// Returns the iterator register and the opcode index of the hasNext call.
+fn find_has_next_call(
+    header: NodeIndex,
+    cond_reg: Reg,
+    ctx: &PatternContext<'_>,
+) -> Option<(Reg, usize)> {
+    let ssa_block = ctx.ssa.blocks.get(&header)?;
+
+    // Search backwards through ops for the definition of cond_reg
+    for instr in ssa_block.ops.iter().rev() {
+        if let SsaInstr::Op { op_idx, dst: Some(dst), uses } = instr {
+            if dst.reg == cond_reg {
+                let op = &ctx.func.ops[*op_idx];
+                if is_has_next_call(op, ctx) && !uses.is_empty() {
+                    // The first use is the iterator register (the `this` arg to hasNext)
+                    return Some((uses[0].reg, *op_idx));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Check if an opcode is a call to a function named "hasNext".
+/// Handles both Call1 (direct call) and CallMethod (virtual/interface call).
+fn is_has_next_call(op: &Opcode, ctx: &PatternContext<'_>) -> bool {
+    match op {
+        Opcode::Call1 { fun, .. } => {
+            let name = ctx.code.functions[fun.0].name(ctx.code);
+            name == "hasNext"
+        }
+        Opcode::CallMethod { field, args, .. } => {
+            // CallMethod uses a field index into the object's virtual type.
+            // We need to look up the type of the first arg (the object) to find the method name.
+            if let Some(obj_reg) = args.first() {
+                let obj_type = &ctx.code[ctx.func.regs[obj_reg.0 as usize]];
+                if let hlbc::types::Type::Virtual { fields } = obj_type {
+                    if let Some(obj_field) = fields.get(field.0) {
+                        let name = ctx.code.get(obj_field.name);
+                        return name.as_ref() == "hasNext";
+                    }
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Find a .next() call in the loop body that uses the iterator register.
+/// Returns the value register (destination of next()) and the opcode index.
+fn find_next_call(
+    cfg: &Cfg,
+    natural_loop: &NaturalLoop,
+    iterator_reg: Reg,
+    ctx: &PatternContext<'_>,
+) -> Option<(Reg, usize)> {
+    // Search through body nodes (excluding header) for the next() call
+    for &body_node in &natural_loop.body {
+        if body_node == natural_loop.header {
+            continue;
+        }
+        if let Some(ssa_block) = ctx.ssa.blocks.get(&body_node) {
+            for instr in &ssa_block.ops {
+                if let SsaInstr::Op { op_idx, dst: Some(dst), uses } = instr {
+                    let op = &ctx.func.ops[*op_idx];
+                    if is_next_call(op, uses, iterator_reg, ctx) {
+                        return Some((dst.reg, *op_idx));
+                    }
+                }
+            }
+        }
+    }
+
+    // Also check if next() is in the header block itself (after the condition)
+    if let Some(ssa_block) = ctx.ssa.blocks.get(&natural_loop.header) {
+        let block = &cfg.graph[natural_loop.header];
+        for instr in &ssa_block.ops {
+            if let SsaInstr::Op { op_idx, dst: Some(dst), uses } = instr {
+                // Only consider ops in the header that are not the terminating jump
+                if *op_idx < block.end {
+                    let op = &ctx.func.ops[*op_idx];
+                    if is_next_call(op, uses, iterator_reg, ctx) {
+                        return Some((dst.reg, *op_idx));
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Check if an opcode is a call to "next" using the given iterator register.
+/// Handles both Call1 (direct call) and CallMethod (virtual/interface call).
+fn is_next_call(op: &Opcode, uses: &[SsaVar], iterator_reg: Reg, ctx: &PatternContext<'_>) -> bool {
+    let is_next = match op {
+        Opcode::Call1 { fun, .. } => {
+            let name = ctx.code.functions[fun.0].name(ctx.code);
+            name.as_ref() == "next"
+        }
+        Opcode::CallMethod { field, args, .. } => {
+            // CallMethod uses a field index into the object's virtual type.
+            if let Some(obj_reg) = args.first() {
+                let obj_type = &ctx.code[ctx.func.regs[obj_reg.0 as usize]];
+                if let hlbc::types::Type::Virtual { fields } = obj_type {
+                    if let Some(obj_field) = fields.get(field.0) {
+                        let name = ctx.code.get(obj_field.name);
+                        return name.as_ref() == "next" && !uses.is_empty() && uses[0].reg == iterator_reg;
+                    }
+                }
+            }
+            false
+        }
+        _ => false,
+    };
+    is_next && !uses.is_empty() && uses[0].reg == iterator_reg
 }
 
 /// Find if-then-else patterns in the graph that can be collapsed.
@@ -442,9 +642,10 @@ pub fn find_innermost_pattern(
     region_graph: &RegionGraph,
     cfg: &Cfg,
     analysis: &CfgAnalysis,
+    ctx: Option<&PatternContext<'_>>,
 ) -> Option<Pattern> {
     // First try innermost loops
-    let loop_patterns = find_loop_patterns(region_graph, cfg, analysis);
+    let loop_patterns = find_loop_patterns(region_graph, cfg, analysis, ctx);
     if let Some(lp) = loop_patterns.into_iter().next() {
         return Some(Pattern::Loop(lp));
     }
@@ -549,7 +750,7 @@ mod tests {
         ];
 
         let (cfg, analysis, region_graph) = build_test_env(&ops);
-        let patterns = find_loop_patterns(&region_graph, &cfg, &analysis);
+        let patterns = find_loop_patterns(&region_graph, &cfg, &analysis, None);
 
         println!("Found {} loop patterns", patterns.len());
         for p in &patterns {
@@ -572,7 +773,7 @@ mod tests {
         ];
 
         let (cfg, analysis, region_graph) = build_test_env(&ops);
-        let patterns = find_loop_patterns(&region_graph, &cfg, &analysis);
+        let patterns = find_loop_patterns(&region_graph, &cfg, &analysis, None);
 
         println!("Found {} loop patterns for endless loop", patterns.len());
         if let Some(p) = patterns.first() {
@@ -592,7 +793,7 @@ mod tests {
         ];
 
         let (cfg, analysis, region_graph) = build_test_env(&ops);
-        let pattern = find_innermost_pattern(&region_graph, &cfg, &analysis);
+        let pattern = find_innermost_pattern(&region_graph, &cfg, &analysis, None);
 
         println!("Innermost pattern: {:?}", pattern.is_some());
     }
@@ -618,7 +819,8 @@ mod tests {
         ];
 
         let cfg = Cfg::from_ops(&ops);
-        let kind = detect_loop_kind(&cfg, &natural_loop);
+        let analysis = CfgAnalysis::analyze(&cfg);
+        let kind = detect_loop_kind(&cfg, &analysis, &natural_loop, None);
 
         println!("Detected loop kind: {:?}", kind);
     }

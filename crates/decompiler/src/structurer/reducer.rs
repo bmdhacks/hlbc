@@ -21,7 +21,7 @@ use crate::ast::Expr;
 use crate::lifter::Cfg;
 use crate::structurer::patterns::{
     find_if_patterns, find_loop_patterns, find_switch_patterns, IfPattern, LoopPattern,
-    SwitchPattern,
+    PatternContext, SwitchPattern,
 };
 use crate::structurer::region::{Region, SwitchCase};
 use hlbc::types::RefInt;
@@ -36,13 +36,19 @@ const MAX_ITERATIONS: usize = 1000;
 /// This is the main entry point for the new structurer architecture.
 /// It creates a RegionGraph, iteratively collapses patterns, and returns
 /// the final Region tree.
-pub fn reduce_to_region(cfg: &Cfg, analysis: &CfgAnalysis) -> Region {
+///
+/// If `ctx` is provided, enables detection of higher-level patterns like for-in loops.
+pub fn reduce_to_region(
+    cfg: &Cfg,
+    analysis: &CfgAnalysis,
+    ctx: Option<&PatternContext<'_>>,
+) -> Region {
     let mut graph = RegionGraph::from_cfg(cfg);
     let mut iterations = 0;
 
     while !graph.is_fully_reduced() && iterations < MAX_ITERATIONS {
         iterations += 1;
-        let made_progress = reduce_one_step(&mut graph, cfg, analysis);
+        let made_progress = reduce_one_step(&mut graph, cfg, analysis, ctx);
 
         if !made_progress {
             // No patterns found - try to make the graph reducible
@@ -72,10 +78,15 @@ pub fn reduce_to_region(cfg: &Cfg, analysis: &CfgAnalysis) -> Region {
 /// 4. Linear sequences
 ///
 /// Returns true if any reduction was made.
-fn reduce_one_step(graph: &mut RegionGraph, cfg: &Cfg, analysis: &CfgAnalysis) -> bool {
+fn reduce_one_step(
+    graph: &mut RegionGraph,
+    cfg: &Cfg,
+    analysis: &CfgAnalysis,
+    ctx: Option<&PatternContext<'_>>,
+) -> bool {
     // Priority 1: Collapse innermost loops first
     // This ensures nested loops are reduced from inside out
-    let loop_patterns = find_loop_patterns(graph, cfg, analysis);
+    let loop_patterns = find_loop_patterns(graph, cfg, analysis, ctx);
     if let Some(lp) = loop_patterns.into_iter().next() {
         collapse_loop(graph, cfg, &lp);
         return true;
@@ -463,7 +474,7 @@ mod tests {
         ];
 
         let (cfg, analysis) = build_test_env(&ops);
-        let region = reduce_to_region(&cfg, &analysis);
+        let region = reduce_to_region(&cfg, &analysis, None);
 
         // Should be a single block (linear code has 1 basic block)
         assert!(matches!(region, Region::Block(_)));
@@ -497,7 +508,7 @@ mod tests {
         ];
 
         let (cfg, analysis) = build_test_env(&ops);
-        let region = reduce_to_region(&cfg, &analysis);
+        let region = reduce_to_region(&cfg, &analysis, None);
 
         // Should reduce to something (not crash)
         println!("Reduced if-else to: {:?}", region);
@@ -528,7 +539,7 @@ mod tests {
         ];
 
         let (cfg, analysis) = build_test_env(&ops);
-        let region = reduce_to_region(&cfg, &analysis);
+        let region = reduce_to_region(&cfg, &analysis, None);
 
         // Should reduce to something
         println!("Reduced loop to: {:?}", region);
@@ -567,7 +578,7 @@ mod tests {
         ];
 
         let (cfg, analysis) = build_test_env(&ops);
-        let region = reduce_to_region(&cfg, &analysis);
+        let region = reduce_to_region(&cfg, &analysis, None);
 
         println!("Reduced nested if to: {:?}", region);
         assert!(!matches!(region, Region::Empty));
@@ -600,7 +611,7 @@ mod tests {
         let mut iterations = 0;
 
         while made_progress && !graph.is_fully_reduced() && iterations < 100 {
-            made_progress = reduce_one_step(&mut graph, &cfg, &analysis);
+            made_progress = reduce_one_step(&mut graph, &cfg, &analysis, None);
             iterations += 1;
         }
 
