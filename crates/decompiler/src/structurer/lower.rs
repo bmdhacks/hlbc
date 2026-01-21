@@ -315,6 +315,13 @@ fn lower_loop(
 ) -> Vec<Statement> {
     let mut stmts = Vec::new();
 
+    // Increment scope depth BEFORE processing header and body.
+    // The header is inside the loop (runs each iteration), so variables declared
+    // there should be hoisted to function scope, not declared inline.
+    ctx.structurer.scope_depth += 1;
+    let old_loop_header = ctx.structurer.current_loop_header;
+    ctx.structurer.current_loop_header = Some(header);
+
     // Lower header block (for setup code before the condition)
     let header_stmts = ctx.lower_block_opcodes(header);
 
@@ -324,11 +331,9 @@ fn lower_loop(
         ctx.extract_condition(header)
     });
 
-    // Lower body with increased scope depth
-    ctx.structurer.scope_depth += 1;
-    let old_loop_header = ctx.structurer.current_loop_header;
-    ctx.structurer.current_loop_header = Some(header);
+    // Lower body (already at increased scope depth)
     let body_stmts = lower_region(body, ctx);
+
     ctx.structurer.current_loop_header = old_loop_header;
     ctx.structurer.scope_depth -= 1;
 

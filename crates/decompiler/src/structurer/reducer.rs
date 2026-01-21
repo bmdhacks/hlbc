@@ -117,8 +117,17 @@ fn reduce_one_step(
         // Priority 2: Collapse innermost loops
         // This ensures nested loops are reduced from inside out
         let loop_patterns = find_loop_patterns(graph, cfg, analysis, ctx);
-        if let Some(lp) = loop_patterns.into_iter().next() {
-            collapse_loop(graph, cfg, &lp);
+        // Try each loop pattern until one makes progress
+        let loop_progress = loop_patterns
+            .into_iter()
+            .find_map(|lp| {
+                if collapse_loop(graph, cfg, &lp) {
+                    Some(true)
+                } else {
+                    None
+                }
+            });
+        if loop_progress.is_some() {
             made_progress = true;
         } else {
             // Priority 3: Collapse remaining if-then-else patterns (including loop headers)
@@ -189,8 +198,8 @@ fn compute_reachable_nodes(graph: &RegionGraph) -> HashSet<NodeIndex> {
     reachable
 }
 
-/// Collapse a loop pattern into a Region::Loop node.
-fn collapse_loop(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &LoopPattern) {
+/// Collapse a loop pattern. Returns true if progress was made (nodes were reduced).
+fn collapse_loop(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &LoopPattern) -> bool {
     // Get the header's region node
     let header_region_node = graph.get_region_node(pattern.header);
 
@@ -224,8 +233,13 @@ fn collapse_loop(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &LoopPattern) {
     // Don't include the exit node - it's where we exit TO, not part of the loop
     nodes_to_collapse.remove(&graph.get_region_node(pattern.exit).unwrap_or(NodeIndex::new(0)));
 
-    if !nodes_to_collapse.is_empty() {
+    // Only collapse if we have 2+ nodes (otherwise no net reduction)
+    if nodes_to_collapse.len() >= 2 {
         graph.collapse(&nodes_to_collapse, loop_region);
+        true
+    } else {
+        // Would not reduce node count - skip this collapse
+        false
     }
 }
 
