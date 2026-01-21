@@ -265,12 +265,19 @@ fn collapse_if(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &IfPattern) {
         "collapse_if: no nodes to collapse"
     );
 
-    // INVARIANT: Merge node should not be in collapse set
-    debug_assert!(
-        !nodes_to_collapse.contains(&pattern.merge),
-        "collapse_if: merge node {:?} should not be collapsed",
-        pattern.merge
-    );
+    // INVARIANT: Merge node should not be in collapse set.
+    // Exception: when both branches terminate (both-terminate case), the "merge" is
+    // actually a dummy merge that IS one of the branches, so it will be in the collapse set.
+    // We detect this by checking if merge is in then_nodes or else_nodes.
+    let merge_is_dummy = pattern.then_nodes.contains(&pattern.merge)
+        || pattern.else_nodes.contains(&pattern.merge);
+    if !merge_is_dummy {
+        debug_assert!(
+            !nodes_to_collapse.contains(&pattern.merge),
+            "collapse_if: merge node {:?} should not be collapsed",
+            pattern.merge
+        );
+    }
 
     graph.collapse(&nodes_to_collapse, if_region);
 }
@@ -833,8 +840,6 @@ mod tests {
 
         let (cfg, analysis) = build_test_env(&ops);
         let region = reduce_to_region(&cfg, &analysis, None);
-
-        println!("Ternary reduced to: {:?}", region);
 
         // Should not contain any Goto nodes
         assert!(

@@ -448,33 +448,40 @@ fn match_if_pattern(
 
     // Find merge point (immediate post-dominator)
     // If no post-dominator exists, try to handle early-return patterns
-    let merge_cfg = match analysis.ipdom(cfg_node) {
-        Some(m) => m,
+    let real_ipdom = analysis.ipdom(cfg_node);
+    let then_terminates = cfg.graph[then_target].is_exit;
+    let else_terminates = cfg.graph[else_target].is_exit;
+
+    let (merge_cfg, is_one_branch_early_return) = match real_ipdom {
+        Some(m) => (m, false),
         None => {
             // No post-dominator - check for early-return pattern.
             // Pattern: if (cond) return x; ...continuation...
             // In this case, one branch terminates and the other is the continuation.
-            let then_terminates = cfg.graph[then_target].is_exit;
-            let else_terminates = cfg.graph[else_target].is_exit;
 
             if then_terminates && !else_terminates {
                 // Then branch returns, else branch continues.
                 // The "merge" is the else target (the continuation).
-                else_target
+                (else_target, true)
             } else if else_terminates && !then_terminates {
                 // Else branch returns, then branch continues.
-                then_target
+                (then_target, true)
             } else if then_terminates && else_terminates {
                 // Both branches terminate (both return).
                 // Use then_target as a dummy merge since there's no actual merge point.
                 // The branches will be collected as terminating blocks.
-                then_target
+                // Note: is_one_branch_early_return is false here because we don't
+                // want the special early-return insertion logic to run.
+                (then_target, false)
             } else {
                 // Neither terminates and no post-dominator - can't match.
                 return None;
             }
         }
     };
+
+    // Track if both branches terminate (no real merge exists)
+    let both_branches_terminate = then_terminates && else_terminates && real_ipdom.is_none();
 
     // Don't match if merge is one of the direct successors (trivial case)
     // These are handled by sequence collapsing
@@ -486,9 +493,15 @@ fn match_if_pattern(
     let then_nodes = collect_branch_nodes(cfg, analysis, then_target, merge_cfg, cfg_node);
     let else_nodes = collect_branch_nodes(cfg, analysis, else_target, merge_cfg, cfg_node);
 
-    // For early-return patterns where the terminating branch IS the merge,
-    // we need to include it in the branch nodes
-    let then_nodes = if then_target == merge_cfg && cfg.graph[then_target].is_exit {
+    // For early-return patterns where ONE branch terminates and the other
+    // continues, the continuing branch becomes the "merge". If that continuing
+    // branch (which is now merge_cfg) is also an exit block, we need to include
+    // it. This does NOT apply when both branches terminate - in that case, we
+    // use a dummy merge and shouldn't insert anything.
+    let then_nodes = if is_one_branch_early_return
+        && then_target == merge_cfg
+        && then_terminates
+    {
         let mut nodes = then_nodes;
         nodes.insert(then_target);
         nodes
@@ -496,7 +509,33 @@ fn match_if_pattern(
         then_nodes
     };
 
-    let else_nodes = if else_target == merge_cfg && cfg.graph[else_target].is_exit {
+    let else_nodes = if is_one_branch_early_return
+        && else_target == merge_cfg
+        && else_terminates
+    {
+        let mut nodes = else_nodes;
+        nodes.insert(else_target);
+        nodes
+    } else {
+        else_nodes
+    };
+
+    // When both branches terminate, we need to explicitly include them
+    // since collect_branch_nodes would skip the dummy merge (which is then_target).
+    // In this case:
+    // - then_nodes is empty because then_target == merge_cfg (the dummy merge)
+    // - else_nodes has else_target (since it's a different node)
+    // We add then_target to then_nodes so the then branch gets included.
+    // The collapse logic handles the case where merge is in a branch set.
+    let then_nodes = if both_branches_terminate && then_nodes.is_empty() {
+        let mut nodes = then_nodes;
+        nodes.insert(then_target);
+        nodes
+    } else {
+        then_nodes
+    };
+
+    let else_nodes = if both_branches_terminate && else_nodes.is_empty() {
         let mut nodes = else_nodes;
         nodes.insert(else_target);
         nodes
@@ -544,16 +583,20 @@ fn match_if_pattern(
     }
 
     // INVARIANT: merge node should not be in either branch
-    debug_assert!(
-        !then_region_nodes.contains(&merge),
-        "match_if_pattern: merge node {:?} found in then_region_nodes",
-        merge
-    );
-    debug_assert!(
-        !else_region_nodes.contains(&merge),
-        "match_if_pattern: merge node {:?} found in else_region_nodes",
-        merge
-    );
+    // Exception: when both branches terminate, merge is a dummy and one branch
+    // will contain the dummy merge (which is actually that branch's exit block)
+    if !both_branches_terminate {
+        debug_assert!(
+            !then_region_nodes.contains(&merge),
+            "match_if_pattern: merge node {:?} found in then_region_nodes",
+            merge
+        );
+        debug_assert!(
+            !else_region_nodes.contains(&merge),
+            "match_if_pattern: merge node {:?} found in else_region_nodes",
+            merge
+        );
+    }
 
     Some(IfPattern {
         condition_node: node,

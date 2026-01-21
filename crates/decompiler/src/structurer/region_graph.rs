@@ -229,6 +229,9 @@ impl RegionGraph {
             );
         }
 
+        // Check if entry is being collapsed BEFORE we start removing nodes
+        let entry_is_collapsed = nodes.contains(&self.entry);
+
         // Track edge counts for invariant checking
         #[cfg(debug_assertions)]
         let incoming_edge_count: usize = nodes
@@ -335,13 +338,18 @@ impl RegionGraph {
         }
         self.region_to_cfg.insert(new_node, all_cfg_nodes.clone());
 
+        // Track added edges to avoid duplicates
+        let mut added_incoming: HashSet<NodeIndex> = HashSet::new();
+        let mut added_outgoing: HashSet<NodeIndex> = HashSet::new();
+
         // Add incoming edges (look up current node indices)
         for (src_cfg_nodes, kind) in incoming {
             // Find the current node for this set of CFG nodes
             if let Some(&first_cfg) = src_cfg_nodes.iter().next() {
                 if let Some(&src_node) = self.cfg_to_region.get(&first_cfg) {
-                    if src_node != new_node {
+                    if src_node != new_node && !added_incoming.contains(&src_node) {
                         self.graph.add_edge(src_node, new_node, kind);
+                        added_incoming.insert(src_node);
                     }
                 }
             }
@@ -351,23 +359,17 @@ impl RegionGraph {
         for (dst_cfg_nodes, kind) in outgoing {
             if let Some(&first_cfg) = dst_cfg_nodes.iter().next() {
                 if let Some(&dst_node) = self.cfg_to_region.get(&first_cfg) {
-                    if dst_node != new_node {
+                    if dst_node != new_node && !added_outgoing.contains(&dst_node) {
                         self.graph.add_edge(new_node, dst_node, kind);
+                        added_outgoing.insert(dst_node);
                     }
                 }
             }
         }
 
-        // Update entry if it was collapsed
-        if all_cfg_nodes.iter().any(|cfg| self.cfg_to_region.get(cfg) == Some(&new_node)) {
-            // Check if entry's CFG node is now in the new collapsed node
-            // We need to find what the entry was pointing to originally
-            // Since we track by CFG nodes, find if entry CFG is in all_cfg_nodes
-        }
-
-        // If we can't find the entry anymore, update it to new_node if appropriate
-        let entry_still_valid = self.graph.node_indices().any(|n| n == self.entry);
-        if !entry_still_valid {
+        // Update entry if it was one of the collapsed nodes.
+        // We checked this BEFORE removing nodes to avoid confusion from swap-remove.
+        if entry_is_collapsed {
             self.entry = new_node;
         }
 
@@ -401,7 +403,14 @@ impl RegionGraph {
     }
 
     /// Collapse a sequence of nodes into a Sequence region.
-    /// The nodes must form a linear chain (each has exactly one successor to the next).
+    ///
+    /// # Preconditions
+    /// The nodes must form a valid linear chain where:
+    /// - Each node (except the last) has exactly one successor: the next node
+    /// - Each node (except the first) has exactly one predecessor: the previous node
+    ///
+    /// These invariants are enforced by `find_sequences()`, which should be used
+    /// to discover valid sequences before calling this method.
     pub fn collapse_sequence(&mut self, nodes: Vec<NodeIndex>) -> Option<NodeIndex> {
         if nodes.len() < 2 {
             return None;
@@ -413,6 +422,13 @@ impl RegionGraph {
             if succs.len() != 1 || succs[0] != nodes[i + 1] {
                 return None; // Not a valid sequence
             }
+
+            // Invariant: internal nodes have single predecessor (checked by find_sequences)
+            debug_assert!(
+                self.predecessors(nodes[i + 1]).iter().all(|&p| p == nodes[i]),
+                "collapse_sequence: node {:?} has external predecessors",
+                nodes[i + 1]
+            );
         }
 
         // Build the Region from the nodes
