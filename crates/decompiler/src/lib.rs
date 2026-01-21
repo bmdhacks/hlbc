@@ -226,9 +226,13 @@ pub fn decompile_code_with_options(
     // Run preprocessing for pattern suppression
     structurer.detect_internal_function_calls();
 
-    // Check if function has exception handling - use legacy path for try/catch
-    let mut stmts = if structurer.exception_analysis.has_exceptions() {
-        // Legacy path handles Trap/EndTrap regions correctly
+    // Check if function has exception handling or string switches - use legacy path
+    // String switch detection requires opcode-level pattern matching that the new
+    // reducer path doesn't support yet.
+    let has_exceptions = structurer.exception_analysis.has_exceptions();
+    let has_string_switches = !structurer.string_switches.is_empty();
+    let mut stmts = if has_exceptions || has_string_switches {
+        // Legacy path handles Trap/EndTrap and string switch patterns correctly
         structurer.structure()
     } else {
         // New reducer path with for-in detection
