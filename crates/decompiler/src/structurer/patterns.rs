@@ -511,7 +511,7 @@ pub fn find_if_patterns(
 ) -> Vec<IfPattern> {
     let mut patterns = Vec::new();
 
-    // Process nodes in reverse post-order to find innermost patterns first
+    // Process nodes in reverse post-order (visits outer nodes first)
     let nodes = region_graph.nodes_in_reverse_postorder();
 
     for node in nodes {
@@ -525,6 +525,9 @@ pub fn find_if_patterns(
         }
     }
 
+    // Reverse so innermost patterns come first - this ensures nested if-else-if
+    // chains are collapsed from the inside out
+    patterns.reverse();
     patterns
 }
 

@@ -62,8 +62,23 @@ impl<'a> Structurer<'a> {
         if self.use_raw_name_regs.contains(&var.reg) {
             return format!("r{}", var.reg.0).into();
         }
-        // If debug name exists, use it (preserve user variable names)
+        // If debug name exists, check for type conflicts before using it
         if let Some(debug_name) = self.get_debug_name(var.reg, false) {
+            // Get the type of this register
+            if let Some(&reg_type) = self.func.regs.get(var.reg.0 as usize) {
+                let mut debug_name_types = self.debug_name_types.borrow_mut();
+                if let Some(&existing_type) = debug_name_types.get(&debug_name) {
+                    // Check if types differ - if so, use SSA-versioned name to avoid conflict
+                    if existing_type != reg_type {
+                        // Type conflict: same name, different types
+                        // Use SSA-versioned name instead
+                        return format!("r{}_{}", var.reg.0, var.version).into();
+                    }
+                } else {
+                    // First use of this debug name - record its type
+                    debug_name_types.insert(debug_name.clone(), reg_type);
+                }
+            }
             return debug_name.into();
         }
         // For same-register phi destinations or sources, use non-SSA name
@@ -89,8 +104,21 @@ impl<'a> Structurer<'a> {
         if self.use_raw_name_regs.contains(&var.reg) {
             return format!("r{}", var.reg.0).into();
         }
-        // If debug name exists, use it (preserve user variable names)
+        // If debug name exists, check for type conflicts before using it
         if let Some(debug_name) = self.get_debug_name_at(var.reg, at_op, true) {
+            // Get the type of this register
+            if let Some(&reg_type) = self.func.regs.get(var.reg.0 as usize) {
+                let debug_name_types = self.debug_name_types.borrow();
+                if let Some(&existing_type) = debug_name_types.get(&debug_name) {
+                    // Check if types differ - if so, use SSA-versioned name to avoid conflict
+                    if existing_type != reg_type {
+                        // Type conflict: same name, different types
+                        // Use SSA-versioned name instead
+                        return format!("r{}_{}", var.reg.0, var.version).into();
+                    }
+                }
+                // No conflict or first use - use debug name
+            }
             return debug_name.into();
         }
         // For same-register phi results or sources, use non-SSA name

@@ -117,6 +117,11 @@ pub struct Structurer<'a> {
     pub(crate) needs_dynamic_type: HashSet<Str>,
     /// Hoisted vars -> their types (for type hints in declarations)
     pub(crate) hoisted_var_types: HashMap<Str, RefType>,
+    /// Debug name -> type mapping to detect type conflicts
+    /// When the same debug name (e.g., "v") is used for registers of different types,
+    /// we force raw names to avoid Haxe type errors
+    /// Uses RefCell for interior mutability (updated during structuring)
+    pub(crate) debug_name_types: RefCell<HashMap<String, RefType>>,
     /// Array bytes tracking: maps bytes register -> array expression
     /// Used to reconstruct arr[i] from bytes[shifted_i] pattern
     /// We store the Expr (not Reg) to capture the correct SSA version at field access time
@@ -265,6 +270,7 @@ impl<'a> Structurer<'a> {
             hoisted_vars: HashSet::new(),
             needs_dynamic_type: HashSet::new(),
             hoisted_var_types: HashMap::new(),
+            debug_name_types: RefCell::new(HashMap::new()),
             array_bytes_source: HashMap::new(),
             shifted_indices: HashMap::new(),
             enum_global_map: Self::build_enum_global_map(code),
