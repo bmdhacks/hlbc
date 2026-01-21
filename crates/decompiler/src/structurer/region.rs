@@ -86,7 +86,14 @@ pub enum Region {
     /// An if-then-else control flow region.
     IfThenElse {
         /// The condition expression (from the conditional branch).
+        /// This is a placeholder; the actual condition is extracted during lowering
+        /// from cond_block's terminating conditional jump.
         cond: Expr,
+
+        /// The CFG block containing the conditional jump.
+        /// Used during lowering to extract the actual condition and emit
+        /// any preamble statements before the if-statement.
+        cond_block: Option<NodeIndex>,
 
         /// The "then" branch region (executed when cond is true).
         then_region: Box<Region>,
@@ -200,10 +207,14 @@ impl Region {
                 }
             }
             Region::IfThenElse {
+                cond_block,
                 then_region,
                 else_region,
                 ..
             } => {
+                if let Some(block) = cond_block {
+                    nodes.insert(*block);
+                }
                 then_region.collect_nodes(nodes);
                 if let Some(else_r) = else_region {
                     else_r.collect_nodes(nodes);
@@ -272,12 +283,14 @@ impl Region {
     /// Creates an if-then-else region.
     pub fn if_then_else(
         cond: Expr,
+        cond_block: Option<NodeIndex>,
         then_region: Region,
         else_region: Option<Region>,
         merge: NodeIndex,
     ) -> Region {
         Region::IfThenElse {
             cond,
+            cond_block,
             then_region: Box::new(then_region),
             else_region: else_region.map(Box::new),
             merge,
@@ -377,9 +390,11 @@ mod tests {
         let n0 = NodeIndex::new(0);
         let n1 = NodeIndex::new(1);
         let n2 = NodeIndex::new(2);
+        let cond_block = NodeIndex::new(3);
 
         let region = Region::if_then_else(
             Expr::Constant(Constant::Bool(true)),
+            Some(cond_block),
             Region::Block(n0),
             Some(Region::Block(n1)),
             n2,
@@ -391,7 +406,8 @@ mod tests {
         let nodes = region.contained_nodes();
         assert!(nodes.contains(&n0));
         assert!(nodes.contains(&n1));
-        assert_eq!(nodes.len(), 2);
+        assert!(nodes.contains(&cond_block));
+        assert_eq!(nodes.len(), 3);
     }
 
     #[test]

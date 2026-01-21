@@ -443,8 +443,38 @@ fn match_if_pattern(
         return None;
     }
 
+    // Identify then and else branches
+    let (then_target, else_target, negated) = identify_branches(&cfg_succs)?;
+
     // Find merge point (immediate post-dominator)
-    let merge_cfg = analysis.ipdom(cfg_node)?;
+    // If no post-dominator exists, try to handle early-return patterns
+    let merge_cfg = match analysis.ipdom(cfg_node) {
+        Some(m) => m,
+        None => {
+            // No post-dominator - check for early-return pattern.
+            // Pattern: if (cond) return x; ...continuation...
+            // In this case, one branch terminates and the other is the continuation.
+            let then_terminates = cfg.graph[then_target].is_exit;
+            let else_terminates = cfg.graph[else_target].is_exit;
+
+            if then_terminates && !else_terminates {
+                // Then branch returns, else branch continues.
+                // The "merge" is the else target (the continuation).
+                else_target
+            } else if else_terminates && !then_terminates {
+                // Else branch returns, then branch continues.
+                then_target
+            } else if then_terminates && else_terminates {
+                // Both branches terminate (both return).
+                // Use then_target as a dummy merge since there's no actual merge point.
+                // The branches will be collected as terminating blocks.
+                then_target
+            } else {
+                // Neither terminates and no post-dominator - can't match.
+                return None;
+            }
+        }
+    };
 
     // Don't match if merge is one of the direct successors (trivial case)
     // These are handled by sequence collapsing
@@ -452,12 +482,27 @@ fn match_if_pattern(
         return None;
     }
 
-    // Identify then and else branches
-    let (then_target, else_target, negated) = identify_branches(&cfg_succs)?;
-
     // Collect nodes in each branch
     let then_nodes = collect_branch_nodes(cfg, analysis, then_target, merge_cfg, cfg_node);
     let else_nodes = collect_branch_nodes(cfg, analysis, else_target, merge_cfg, cfg_node);
+
+    // For early-return patterns where the terminating branch IS the merge,
+    // we need to include it in the branch nodes
+    let then_nodes = if then_target == merge_cfg && cfg.graph[then_target].is_exit {
+        let mut nodes = then_nodes;
+        nodes.insert(then_target);
+        nodes
+    } else {
+        then_nodes
+    };
+
+    let else_nodes = if else_target == merge_cfg && cfg.graph[else_target].is_exit {
+        let mut nodes = else_nodes;
+        nodes.insert(else_target);
+        nodes
+    } else {
+        else_nodes
+    };
 
     // Convert to region graph nodes
     let then_region_nodes: HashSet<_> = then_nodes
@@ -472,6 +517,43 @@ fn match_if_pattern(
 
     // Get merge point in region graph
     let merge = region_graph.get_region_node(merge_cfg)?;
+
+    // INVARIANT: The condition node should not appear in either branch
+    debug_assert!(
+        !then_region_nodes.contains(&node),
+        "match_if_pattern: condition node {:?} found in then_region_nodes",
+        node
+    );
+    debug_assert!(
+        !else_region_nodes.contains(&node),
+        "match_if_pattern: condition node {:?} found in else_region_nodes",
+        node
+    );
+
+    // INVARIANT: then and else should not overlap
+    #[cfg(debug_assertions)]
+    {
+        let overlap: HashSet<_> = then_region_nodes
+            .intersection(&else_region_nodes)
+            .collect();
+        debug_assert!(
+            overlap.is_empty(),
+            "match_if_pattern: then and else branches overlap at {:?}",
+            overlap
+        );
+    }
+
+    // INVARIANT: merge node should not be in either branch
+    debug_assert!(
+        !then_region_nodes.contains(&merge),
+        "match_if_pattern: merge node {:?} found in then_region_nodes",
+        merge
+    );
+    debug_assert!(
+        !else_region_nodes.contains(&merge),
+        "match_if_pattern: merge node {:?} found in else_region_nodes",
+        merge
+    );
 
     Some(IfPattern {
         condition_node: node,
@@ -523,11 +605,16 @@ fn collect_branch_nodes(
         }
         visited.insert(node);
 
-        // Check this node is dominated by condition and post-dominated by merge
+        // Check this node is dominated by condition
         if !analysis.dominates(condition, node) {
             continue;
         }
-        if !analysis.post_dominates(merge, node) {
+
+        // For non-terminating blocks, check post-dominance by merge.
+        // For terminating blocks (exit nodes like return/throw), they don't reach
+        // the merge so post-dominance doesn't apply - include them anyway.
+        let is_exit = cfg.graph[node].is_exit;
+        if !is_exit && !analysis.post_dominates(merge, node) {
             continue;
         }
 
@@ -823,5 +910,253 @@ mod tests {
         let kind = detect_loop_kind(&cfg, &analysis, &natural_loop, None);
 
         println!("Detected loop kind: {:?}", kind);
+    }
+
+    // =========================================================================
+    // Unit tests for collect_branch_nodes
+    // =========================================================================
+
+    #[test]
+    fn test_collect_branch_nodes_simple_if_else() {
+        // Structure: cond -> then, cond -> else, then -> merge, else -> merge
+        // if (cond) { a } else { b }
+        let ops = vec![
+            // Block 0: condition
+            Opcode::Int { dst: Reg(0), ptr: RefInt(0) },
+            Opcode::JNull { reg: Reg(0), offset: 2 },
+            // Block 1: then branch
+            Opcode::Int { dst: Reg(1), ptr: RefInt(1) },
+            Opcode::JAlways { offset: 1 },
+            // Block 2: else branch
+            Opcode::Int { dst: Reg(2), ptr: RefInt(2) },
+            // Block 3: merge + return
+            Opcode::Ret { ret: Reg(0) },
+        ];
+
+        let cfg = Cfg::from_ops(&ops);
+        let analysis = CfgAnalysis::analyze(&cfg);
+
+        println!("CFG structure:");
+        for node in cfg.graph.node_indices() {
+            let block = &cfg.graph[node];
+            println!(
+                "  Block {:?}: ops {}..{}, is_exit={}",
+                node, block.start, block.end, block.is_exit
+            );
+            println!("    succs: {:?}", cfg.successors(node));
+        }
+
+        // Find the condition block (should be the entry)
+        let cond = cfg.entry;
+        let succs = cfg.successors_with_edges(cond);
+        assert_eq!(succs.len(), 2, "Condition should have 2 successors");
+
+        // Find merge (ipdom of cond)
+        let merge = analysis.ipdom(cond).expect("Should have a merge point");
+        println!("Merge point: {:?}", merge);
+
+        // Identify branches
+        let (then_target, else_target, _) = identify_branches(&succs).expect("Should identify branches");
+        println!("Then: {:?}, Else: {:?}", then_target, else_target);
+
+        // Collect branch nodes
+        let then_nodes = collect_branch_nodes(&cfg, &analysis, then_target, merge, cond);
+        let else_nodes = collect_branch_nodes(&cfg, &analysis, else_target, merge, cond);
+
+        println!("Then nodes: {:?}", then_nodes);
+        println!("Else nodes: {:?}", else_nodes);
+
+        // Verify branches don't overlap
+        let overlap: HashSet<_> = then_nodes.intersection(&else_nodes).collect();
+        assert!(overlap.is_empty(), "Then and else should not overlap: {:?}", overlap);
+
+        // Verify merge is not in either branch
+        assert!(!then_nodes.contains(&merge), "Merge should not be in then branch");
+        assert!(!else_nodes.contains(&merge), "Merge should not be in else branch");
+
+        // Verify condition is not in either branch
+        assert!(!then_nodes.contains(&cond), "Condition should not be in then branch");
+        assert!(!else_nodes.contains(&cond), "Condition should not be in else branch");
+    }
+
+    #[test]
+    fn test_collect_branch_nodes_early_return() {
+        // Structure: if (n >= 0) return n; return -n;
+        // This tests the case where one branch terminates (returns)
+        // and there is no merge point.
+        let ops = vec![
+            // Block 0: check n >= 0
+            Opcode::Int { dst: Reg(0), ptr: RefInt(0) },
+            Opcode::Int { dst: Reg(1), ptr: RefInt(0) },  // 0 constant
+            Opcode::JSLt { a: Reg(0), b: Reg(1), offset: 1 },  // if n < 0, skip return
+            // Block 1: return n (early return)
+            Opcode::Ret { ret: Reg(0) },
+            // Block 2: return -n (continuation)
+            Opcode::Neg { dst: Reg(2), src: Reg(0) },
+            Opcode::Ret { ret: Reg(2) },
+        ];
+
+        let cfg = Cfg::from_ops(&ops);
+        let analysis = CfgAnalysis::analyze(&cfg);
+
+        println!("CFG structure for early return:");
+        for node in cfg.graph.node_indices() {
+            let block = &cfg.graph[node];
+            println!(
+                "  Block {:?}: ops {}..{}, is_exit={}",
+                node, block.start, block.end, block.is_exit
+            );
+            println!("    succs: {:?}", cfg.successors(node));
+        }
+
+        // Find the condition block
+        let cond = cfg.entry;
+        let succs = cfg.successors_with_edges(cond);
+
+        // Should have 2 successors
+        if succs.len() == 2 {
+            // No merge point expected (early return pattern)
+            let ipdom = analysis.ipdom(cond);
+            println!("IPDOM of condition: {:?}", ipdom);
+
+            // Check exit block detection
+            for (target, _) in &succs {
+                let is_exit = cfg.graph[*target].is_exit;
+                println!("Block {:?} is_exit: {}", target, is_exit);
+            }
+        }
+    }
+
+    #[test]
+    fn test_collect_branch_nodes_includes_exit_blocks() {
+        // Test that exit blocks (blocks ending in Ret/Throw) are properly included
+        // when they are part of a branch
+        let ops = vec![
+            // Block 0: condition
+            Opcode::Int { dst: Reg(0), ptr: RefInt(0) },
+            Opcode::JNull { reg: Reg(0), offset: 2 },
+            // Block 1: then branch (with return)
+            Opcode::Int { dst: Reg(1), ptr: RefInt(1) },
+            Opcode::Ret { ret: Reg(1) },
+            // Block 2: else branch (fallthrough to merge)
+            Opcode::Int { dst: Reg(2), ptr: RefInt(2) },
+            // Block 3: merge/return
+            Opcode::Ret { ret: Reg(2) },
+        ];
+
+        let cfg = Cfg::from_ops(&ops);
+        let analysis = CfgAnalysis::analyze(&cfg);
+
+        println!("CFG for exit block test:");
+        for node in cfg.graph.node_indices() {
+            let block = &cfg.graph[node];
+            println!(
+                "  Block {:?}: ops {}..{}, is_exit={}",
+                node, block.start, block.end, block.is_exit
+            );
+        }
+
+        let cond = cfg.entry;
+        let succs = cfg.successors_with_edges(cond);
+
+        if succs.len() == 2 {
+            let (then_target, else_target, _) = identify_branches(&succs).expect("Should identify branches");
+
+            // Check if then block is an exit
+            let then_is_exit = cfg.graph[then_target].is_exit;
+            println!("Then block {:?} is_exit: {}", then_target, then_is_exit);
+
+            // If there's a merge, collect nodes
+            if let Some(merge) = analysis.ipdom(cond) {
+                let then_nodes = collect_branch_nodes(&cfg, &analysis, then_target, merge, cond);
+                println!("Then nodes (should include exit block): {:?}", then_nodes);
+
+                // If then_target is an exit block, it should be included
+                if then_is_exit {
+                    assert!(
+                        then_nodes.contains(&then_target),
+                        "Exit block should be included in branch nodes"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_collect_branch_nodes_nested_if() {
+        // Test nested if: if (a) { if (b) { X } }
+        let ops = vec![
+            // Block 0: outer if
+            Opcode::Int { dst: Reg(0), ptr: RefInt(0) },
+            Opcode::JNull { reg: Reg(0), offset: 4 },
+            // Block 1: inner if
+            Opcode::Int { dst: Reg(1), ptr: RefInt(1) },
+            Opcode::JNull { reg: Reg(1), offset: 1 },
+            // Block 2: inner body
+            Opcode::Int { dst: Reg(2), ptr: RefInt(2) },
+            // Block 3: merge (both ifs converge here)
+            Opcode::Ret { ret: Reg(0) },
+        ];
+
+        let cfg = Cfg::from_ops(&ops);
+        let analysis = CfgAnalysis::analyze(&cfg);
+
+        println!("CFG for nested if:");
+        for node in cfg.graph.node_indices() {
+            let block = &cfg.graph[node];
+            println!(
+                "  Block {:?}: ops {}..{}, succs: {:?}",
+                node, block.start, block.end, cfg.successors(node)
+            );
+        }
+
+        // Find patterns
+        let region_graph = RegionGraph::from_cfg(&cfg);
+        let patterns = find_if_patterns(&region_graph, &cfg, &analysis);
+
+        println!("Found {} if patterns in nested structure", patterns.len());
+        for (i, p) in patterns.iter().enumerate() {
+            println!(
+                "  Pattern {}: cond={:?}, then={:?}, else={:?}, merge={:?}",
+                i, p.condition_node, p.then_nodes, p.else_nodes, p.merge
+            );
+        }
+    }
+
+    #[test]
+    fn test_if_pattern_then_else_no_overlap() {
+        // Verify that for any matched if pattern, then and else branches don't overlap
+        let test_cases = vec![
+            // Simple if-else
+            vec![
+                Opcode::Int { dst: Reg(0), ptr: RefInt(0) },
+                Opcode::JNull { reg: Reg(0), offset: 2 },
+                Opcode::Int { dst: Reg(1), ptr: RefInt(1) },
+                Opcode::JAlways { offset: 1 },
+                Opcode::Int { dst: Reg(2), ptr: RefInt(2) },
+                Opcode::Ret { ret: Reg(0) },
+            ],
+            // If without else
+            vec![
+                Opcode::Int { dst: Reg(0), ptr: RefInt(0) },
+                Opcode::JNull { reg: Reg(0), offset: 1 },
+                Opcode::Int { dst: Reg(1), ptr: RefInt(1) },
+                Opcode::Ret { ret: Reg(0) },
+            ],
+        ];
+
+        for (i, ops) in test_cases.iter().enumerate() {
+            let (cfg, analysis, region_graph) = build_test_env(ops);
+            let patterns = find_if_patterns(&region_graph, &cfg, &analysis);
+
+            for p in &patterns {
+                let overlap: HashSet<_> = p.then_nodes.intersection(&p.else_nodes).collect();
+                assert!(
+                    overlap.is_empty(),
+                    "Test case {}: then and else overlap at {:?}",
+                    i, overlap
+                );
+            }
+        }
     }
 }

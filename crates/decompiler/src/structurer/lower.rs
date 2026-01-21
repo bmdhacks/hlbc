@@ -33,10 +33,11 @@ pub fn lower_region(region: &Region, ctx: &mut LoweringContext<'_>) -> Vec<State
         Region::Sequence(regions) => lower_sequence(regions, ctx),
         Region::IfThenElse {
             cond,
+            cond_block,
             then_region,
             else_region,
             merge,
-        } => lower_if_then_else(cond, then_region, else_region.as_deref(), *merge, ctx),
+        } => lower_if_then_else(cond, *cond_block, then_region, else_region.as_deref(), *merge, ctx),
         Region::Loop {
             kind,
             header,
@@ -123,7 +124,7 @@ impl<'a> LoweringContext<'a> {
         let block = &self.structurer.cfg.graph[node];
         let last_op = &self.structurer.func.ops[block.end];
 
-        match last_op {
+        let result = match last_op {
             Opcode::JTrue { cond, .. } => self.structurer.reg_to_expr_in_block(*cond, node),
             Opcode::JFalse { cond, .. } => {
                 let expr = self.structurer.reg_to_expr_in_block(*cond, node);
@@ -195,10 +196,46 @@ impl<'a> LoweringContext<'a> {
                 Expr::Op(Operation::Lt(Box::new(a_expr), Box::new(b_expr)))
             }
             _ => {
-                // No condition found - return true (for unconditional or switch)
+                // No conditional jump found - this block ends with an unconditional
+                // jump or other terminator. Return true as a fallback.
+                // NOTE: This is expected for JAlways, Switch, Ret, Throw, etc.
+                // It's only a problem if the caller expected a real condition.
                 Expr::Constant(Constant::Bool(true))
             }
+        };
+
+        // DEBUG: Log when we return a placeholder condition from a block
+        // that looks like it should have had a real condition.
+        // This helps catch cases where we're extracting from the wrong block.
+        #[cfg(debug_assertions)]
+        if matches!(result, Expr::Constant(Constant::Bool(true))) {
+            // Check if this block actually ends with a conditional jump
+            let is_conditional = matches!(
+                last_op,
+                Opcode::JTrue { .. }
+                    | Opcode::JFalse { .. }
+                    | Opcode::JNull { .. }
+                    | Opcode::JNotNull { .. }
+                    | Opcode::JEq { .. }
+                    | Opcode::JNotEq { .. }
+                    | Opcode::JSLt { .. }
+                    | Opcode::JSGte { .. }
+                    | Opcode::JSLte { .. }
+                    | Opcode::JSGt { .. }
+                    | Opcode::JULt { .. }
+                    | Opcode::JUGte { .. }
+                    | Opcode::JNotLt { .. }
+                    | Opcode::JNotGte { .. }
+            );
+            debug_assert!(
+                !is_conditional,
+                "extract_condition returned placeholder for block {:?} which has conditional jump {:?}",
+                node,
+                last_op
+            );
         }
+
+        result
     }
 }
 
@@ -218,27 +255,36 @@ fn lower_sequence(regions: &[Region], ctx: &mut LoweringContext<'_>) -> Vec<Stat
 
 /// Lower an if-then-else region to statements.
 fn lower_if_then_else(
-    cond: &Expr,
+    _cond: &Expr,
+    cond_block: Option<NodeIndex>,
     then_region: &Region,
     else_region: Option<&Region>,
     _merge: NodeIndex,
     ctx: &mut LoweringContext<'_>,
 ) -> Vec<Statement> {
-    // Lower the condition block first (if it's a Block region with setup code)
+    // INVARIANT: cond_block should be present for well-formed if-then-else regions
+    debug_assert!(
+        cond_block.is_some(),
+        "lower_if_then_else: cond_block is None, cannot extract condition"
+    );
+
     let mut stmts = Vec::new();
 
-    // The condition might be a placeholder - try to extract from the region structure
-    let actual_cond = if matches!(cond, Expr::Constant(Constant::Bool(true))) {
-        // Placeholder condition - try to extract from then_region's entry
-        if let Some(_entry) = then_region.entry_node() {
-            // Find the predecessor that would have the conditional jump
-            // For now, use the placeholder
-            cond.clone()
-        } else {
-            cond.clone()
-        }
+    // Lower the condition block's preamble (non-control-flow opcodes) first.
+    // This ensures any setup code runs before the if-statement.
+    if let Some(block) = cond_block {
+        let preamble = ctx.lower_block_opcodes(block);
+        stmts.extend(preamble);
+    }
+
+    // Extract the actual condition from the block's terminating conditional jump.
+    // This replaces the placeholder condition from the Region.
+    let actual_cond = if let Some(block) = cond_block {
+        ctx.extract_condition(block)
     } else {
-        cond.clone()
+        // No condition block - should not happen in well-formed regions,
+        // but fall back to true if it does.
+        Expr::Constant(Constant::Bool(true))
     };
 
     // Lower branches with increased scope depth
@@ -286,20 +332,29 @@ fn lower_loop(
     ctx.structurer.current_loop_header = old_loop_header;
     ctx.structurer.scope_depth -= 1;
 
+    // Note on loop condition semantics:
+    // extract_condition() returns the condition for the TRUE branch (jump taken).
+    // For while loops, the TRUE branch typically goes to EXIT (when exit condition is true).
+    // So loop_cond is the EXIT condition, and the CONTINUE condition is !loop_cond.
+    //
+    // For `while (continue_cond) { body }`: use !exit_cond (negate to get continue condition)
+    // For `while (true) { if (exit_cond) break; body }`: use exit_cond directly
+    let continue_cond = Expr::Op(Operation::Not(Box::new(loop_cond.clone())));
+    let exit_cond = loop_cond;
+
     match kind {
         LoopKind::While => {
             if header_stmts.is_empty() {
-                // Simple while(condition) { body }
+                // Simple while(continue_condition) { body }
                 stmts.push(Statement::While {
-                    cond: loop_cond,
+                    cond: continue_cond,
                     stmts: body_stmts,
                 });
             } else {
-                // Header has setup code - use while(true) { setup; if (!cond) break; body }
-                let break_cond = Expr::Op(Operation::Not(Box::new(loop_cond)));
+                // Header has setup code - use while(true) { setup; if (exit_cond) break; body }
                 let mut loop_body = header_stmts;
                 loop_body.push(Statement::IfElse {
-                    cond: break_cond,
+                    cond: exit_cond,
                     if_: vec![Statement::Break],
                     else_: vec![],
                 });
@@ -311,12 +366,11 @@ fn lower_loop(
             }
         }
         LoopKind::DoWhile => {
-            // do { body } while (condition)
-            // For now, emit as while(true) { body; if (!cond) break; }
-            let break_cond = Expr::Op(Operation::Not(Box::new(loop_cond)));
+            // do { body } while (continue_condition)
+            // Emit as while(true) { body; if (exit_cond) break; }
             let mut loop_body = body_stmts;
             loop_body.push(Statement::IfElse {
-                cond: break_cond,
+                cond: exit_cond,
                 if_: vec![Statement::Break],
                 else_: vec![],
             });
@@ -332,14 +386,13 @@ fn lower_loop(
 
             if header_stmts.is_empty() {
                 stmts.push(Statement::While {
-                    cond: loop_cond,
+                    cond: continue_cond,
                     stmts: body_stmts,
                 });
             } else {
-                let break_cond = Expr::Op(Operation::Not(Box::new(loop_cond)));
                 let mut loop_body = header_stmts;
                 loop_body.push(Statement::IfElse {
-                    cond: break_cond,
+                    cond: exit_cond,
                     if_: vec![Statement::Break],
                     else_: vec![],
                 });
@@ -353,6 +406,10 @@ fn lower_loop(
         LoopKind::ForIn { iterator_reg, value_reg, next_op } => {
             // For-in iterator loop: `for (value in collection) { body }`
             // Currently emit as while loop with the hasNext() condition.
+            // Note: For for-in loops, the condition from hasNext() is already
+            // the CONTINUE condition (true when iteration should continue),
+            // so we don't need to negate it. We use exit_cond which is loop_cond
+            // since extract_condition for hasNext returns the continue condition.
             // TODO: Full implementation would find the collection expression
             // and emit Statement::ForIn when collection tracking is complete.
 
@@ -365,16 +422,17 @@ fn lower_loop(
             // Suppress unused variable warnings (will be used for full for-in emit)
             let _ = iterator_reg;
 
+            // For hasNext(), the condition IS the continue condition (true = continue)
+            // so we need to negate for break check
             if header_stmts.is_empty() {
                 stmts.push(Statement::While {
-                    cond: loop_cond,
+                    cond: continue_cond,
                     stmts: filtered_body,
                 });
             } else {
-                let break_cond = Expr::Op(Operation::Not(Box::new(loop_cond)));
                 let mut loop_body = header_stmts;
                 loop_body.push(Statement::IfElse {
-                    cond: break_cond,
+                    cond: exit_cond,
                     if_: vec![Statement::Break],
                     else_: vec![],
                 });
@@ -503,9 +561,11 @@ mod tests {
         let n0 = petgraph::graph::NodeIndex::new(0);
         let n1 = petgraph::graph::NodeIndex::new(1);
         let n2 = petgraph::graph::NodeIndex::new(2);
+        let cond_node = petgraph::graph::NodeIndex::new(3);
 
         let region = Region::if_then_else(
             Expr::Constant(Constant::Bool(true)),
+            Some(cond_node),
             Region::Block(n0),
             Some(Region::Block(n1)),
             n2,
@@ -513,6 +573,7 @@ mod tests {
 
         match region {
             Region::IfThenElse {
+                cond_block,
                 then_region,
                 else_region,
                 merge,
@@ -521,6 +582,7 @@ mod tests {
                 assert!(matches!(*then_region, Region::Block(_)));
                 assert!(else_region.is_some());
                 assert_eq!(merge, n2);
+                assert_eq!(cond_block, Some(cond_node));
             }
             _ => panic!("Expected IfThenElse region"),
         }

@@ -219,6 +219,37 @@ impl RegionGraph {
             panic!("Cannot collapse empty node set");
         }
 
+        // INVARIANT: All nodes to collapse should exist in the graph
+        #[cfg(debug_assertions)]
+        for &node in nodes {
+            debug_assert!(
+                self.graph.node_weight(node).is_some(),
+                "collapse: node {:?} does not exist in graph",
+                node
+            );
+        }
+
+        // Track edge counts for invariant checking
+        #[cfg(debug_assertions)]
+        let incoming_edge_count: usize = nodes
+            .iter()
+            .flat_map(|&n| {
+                self.graph
+                    .edges_directed(n, Direction::Incoming)
+                    .filter(|e| !nodes.contains(&e.source()))
+            })
+            .count();
+
+        #[cfg(debug_assertions)]
+        let outgoing_edge_count: usize = nodes
+            .iter()
+            .flat_map(|&n| {
+                self.graph
+                    .edges(n)
+                    .filter(|e| !nodes.contains(&e.target()))
+            })
+            .count();
+
         // Collect all original CFG nodes being collapsed
         let mut all_cfg_nodes = HashSet::new();
         for &node in nodes {
@@ -338,6 +369,32 @@ impl RegionGraph {
         let entry_still_valid = self.graph.node_indices().any(|n| n == self.entry);
         if !entry_still_valid {
             self.entry = new_node;
+        }
+
+        // INVARIANT: Verify that incoming/outgoing edge counts are preserved
+        // (edges between collapsed nodes are gone, but external edges should remain)
+        #[cfg(debug_assertions)]
+        {
+            let new_incoming = self
+                .graph
+                .edges_directed(new_node, Direction::Incoming)
+                .count();
+            let new_outgoing = self.graph.edges(new_node).count();
+
+            // Note: We may have fewer edges due to deduplication of parallel edges
+            // So we check that we have at least some edges if we expected some
+            if incoming_edge_count > 0 {
+                debug_assert!(
+                    new_incoming > 0,
+                    "collapse: lost all incoming edges (expected at least 1, got 0)"
+                );
+            }
+            if outgoing_edge_count > 0 {
+                debug_assert!(
+                    new_outgoing > 0,
+                    "collapse: lost all outgoing edges (expected at least 1, got 0)"
+                );
+            }
         }
 
         new_node
