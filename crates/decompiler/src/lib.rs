@@ -309,10 +309,11 @@ pub fn decompile_code_with_options(
     // Pass 10: Inline constants that are immediately returned
     post::inline_constant_returns(&mut stmts);
 
-    // Pass 11: Remove unused forward declarations
-    post::remove_unused_var_decls(&mut stmts);
+    // Note: remove_unused_var_decls is no longer needed - the structurer now
+    // uses SSA info to only emit VarDecls for variables that actually have
+    // assignments emitted, avoiding orphaned declarations.
 
-    // Pass 12: Collapse verbose trace() patterns into simple trace(message) calls
+    // Pass 11: Collapse verbose trace() patterns into simple trace(message) calls
     // This runs after inlining so the pattern is simplified
     post::collapse_trace_calls(&mut stmts);
 

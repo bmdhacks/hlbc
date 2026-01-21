@@ -102,6 +102,9 @@ impl<'a> Structurer<'a> {
 
         let is_declaration = match var_name {
             Some(ref name) => {
+                // Track that we're emitting an assignment for this var (for VarDecl filtering)
+                self.actually_used_vars.insert(name.clone());
+
                 if self.declared_vars.contains(name) {
                     // Already declared - but if assigning empty object, track for :Dynamic
                     if Self::is_empty_anonymous(&assign) {
@@ -649,6 +652,7 @@ impl<'a> Structurer<'a> {
                     // Hoist to function level so it's available outside the loop
                     self.hoisted_vars.insert(raw_name.clone());
                     self.declared_vars.insert(raw_name.clone());
+                    self.actually_used_vars.insert(raw_name.clone());
                     // Track type for hoisted var
                     if let Some(tr) = self.func.regs.get(dst.0 as usize).copied() {
                         self.hoisted_var_types.insert(raw_name, tr);
@@ -677,6 +681,7 @@ impl<'a> Structurer<'a> {
                     // Hoist to function level so it's available outside the loop
                     self.hoisted_vars.insert(raw_name.clone());
                     self.declared_vars.insert(raw_name.clone());
+                    self.actually_used_vars.insert(raw_name.clone());
                     // Track type for hoisted var
                     if let Some(tr) = self.func.regs.get(dst.0 as usize).copied() {
                         self.hoisted_var_types.insert(raw_name, tr);
@@ -1143,6 +1148,7 @@ impl<'a> Structurer<'a> {
                     // Hoist to function level so it's available outside the loop
                     self.hoisted_vars.insert(raw_name.clone());
                     self.declared_vars.insert(raw_name.clone());
+                    self.actually_used_vars.insert(raw_name.clone());
                     // Track type for hoisted var
                     if let Some(tr) = self.func.regs.get(dst.0 as usize).copied() {
                         self.hoisted_var_types.insert(raw_name, tr);

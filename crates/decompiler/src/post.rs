@@ -388,6 +388,19 @@ fn count_uses_in_stmt(stmt: &Statement, var_name: &str) -> usize {
             count += count_uses_in_stmts(else_, var_name);
             count
         }
+        Statement::ForIn { var_name: loop_var, iterable, stmts } => {
+            // Count uses in the iterable expression
+            let mut count = count_uses_in_expr(iterable, var_name);
+            // Count uses in the loop body
+            count += count_uses_in_stmts(stmts, var_name);
+            // Note: The loop variable itself (loop_var) is declared by the for-in,
+            // so we don't count it as a use unless it matches var_name
+            if loop_var.as_ref() == var_name {
+                // The loop variable is "defined" by the for-in, not "used"
+                // so we don't add to count here
+            }
+            count
+        }
         _ => 0,
     }
 }
@@ -1021,177 +1034,11 @@ pub fn merge_declarations(stmts: &mut Vec<Statement>) {
     }
 }
 
-/// Remove unused forward declarations (VarDecl statements for variables never used).
-///
-/// After inlining passes, some VarDecl statements may become orphaned if
-/// their variable is never actually used in the function.
-pub fn remove_unused_var_decls(stmts: &mut Vec<Statement>) {
-    // Collect all variable names that are actually used
-    let mut used_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
-    collect_used_vars(stmts, &mut used_vars);
-
-    // Remove VarDecl statements for variables that aren't used
-    stmts.retain(|stmt| {
-        if let Statement::VarDecl { name, .. } = stmt {
-            used_vars.contains(name.as_ref())
-        } else {
-            true
-        }
-    });
-
-    // Recurse into nested structures
-    for stmt in stmts.iter_mut() {
-        match stmt {
-            Statement::IfElse { if_, else_, .. } => {
-                remove_unused_var_decls(if_);
-                remove_unused_var_decls(else_);
-            }
-            Statement::While { stmts, .. } => {
-                remove_unused_var_decls(stmts);
-            }
-            Statement::Switch { default, cases, .. } => {
-                remove_unused_var_decls(default);
-                for (_, case_stmts) in cases {
-                    remove_unused_var_decls(case_stmts);
-                }
-            }
-            Statement::TryCatch { try_stmts, catch_stmts, .. } => {
-                remove_unused_var_decls(try_stmts);
-                remove_unused_var_decls(catch_stmts);
-            }
-            Statement::Block { stmts } | Statement::Sequence { stmts } => {
-                remove_unused_var_decls(stmts);
-            }
-            Statement::IfElseChain { branches, else_ } => {
-                for (_, branch_stmts) in branches {
-                    remove_unused_var_decls(branch_stmts);
-                }
-                remove_unused_var_decls(else_);
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Collect all variable names that are used in expressions
-fn collect_used_vars(stmts: &[Statement], used: &mut std::collections::HashSet<String>) {
-    for stmt in stmts {
-        match stmt {
-            Statement::Assign { variable, assign, .. } => {
-                collect_used_vars_in_expr(variable, used);
-                collect_used_vars_in_expr(assign, used);
-            }
-            Statement::ExprStatement(e) => {
-                collect_used_vars_in_expr(e, used);
-            }
-            Statement::Return(Some(e)) => {
-                collect_used_vars_in_expr(e, used);
-            }
-            Statement::IfElse { cond, if_, else_ } => {
-                collect_used_vars_in_expr(cond, used);
-                collect_used_vars(if_, used);
-                collect_used_vars(else_, used);
-            }
-            Statement::While { cond, stmts } => {
-                collect_used_vars_in_expr(cond, used);
-                collect_used_vars(stmts, used);
-            }
-            Statement::Switch { arg, default, cases, .. } => {
-                collect_used_vars_in_expr(arg, used);
-                collect_used_vars(default, used);
-                for (_, case_stmts) in cases {
-                    collect_used_vars(case_stmts, used);
-                }
-            }
-            Statement::TryCatch { try_stmts, catch_stmts, .. } => {
-                collect_used_vars(try_stmts, used);
-                collect_used_vars(catch_stmts, used);
-            }
-            Statement::Block { stmts } | Statement::Sequence { stmts } => {
-                collect_used_vars(stmts, used);
-            }
-            Statement::IfElseChain { branches, else_ } => {
-                for (cond, branch_stmts) in branches {
-                    collect_used_vars_in_expr(cond, used);
-                    collect_used_vars(branch_stmts, used);
-                }
-                collect_used_vars(else_, used);
-            }
-            Statement::Throw(e) => {
-                collect_used_vars_in_expr(e, used);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn collect_used_vars_in_expr(expr: &Expr, used: &mut std::collections::HashSet<String>) {
-    match expr {
-        Expr::Variable(_, Some(name)) => {
-            used.insert(name.to_string());
-        }
-        Expr::Field(inner, _) => collect_used_vars_in_expr(inner, used),
-        Expr::Array(arr, idx) => {
-            collect_used_vars_in_expr(arr, used);
-            collect_used_vars_in_expr(idx, used);
-        }
-        Expr::Call(call) => {
-            collect_used_vars_in_expr(&call.fun, used);
-            for arg in &call.args {
-                collect_used_vars_in_expr(arg, used);
-            }
-        }
-        Expr::Op(op) => {
-            match op {
-                Operation::Add(l, r) | Operation::Sub(l, r) | Operation::Mul(l, r) |
-                Operation::Div(l, r) | Operation::Mod(l, r) | Operation::Shl(l, r) |
-                Operation::Shr(l, r) | Operation::And(l, r) | Operation::Or(l, r) |
-                Operation::LogicalAnd(l, r) | Operation::LogicalOr(l, r) |
-                Operation::Xor(l, r) | Operation::Eq(l, r) | Operation::NotEq(l, r) |
-                Operation::Gt(l, r) | Operation::Gte(l, r) | Operation::Lt(l, r) |
-                Operation::Lte(l, r) => {
-                    collect_used_vars_in_expr(l, used);
-                    collect_used_vars_in_expr(r, used);
-                }
-                Operation::Neg(e) | Operation::Not(e) | Operation::Incr(e) | Operation::Decr(e) => {
-                    collect_used_vars_in_expr(e, used);
-                }
-            }
-        }
-        Expr::IfElse { cond, if_, else_ } => {
-            collect_used_vars_in_expr(cond, used);
-            collect_used_vars(if_, used);
-            collect_used_vars(else_, used);
-        }
-        Expr::Constructor(ctor) => {
-            for arg in &ctor.args {
-                collect_used_vars_in_expr(arg, used);
-            }
-        }
-        Expr::ArrayLiteral(elems) => {
-            for e in elems {
-                collect_used_vars_in_expr(e, used);
-            }
-        }
-        Expr::Anonymous(_, fields) => {
-            for e in fields.values() {
-                collect_used_vars_in_expr(e, used);
-            }
-        }
-        Expr::EnumConstr(_, _, args) => {
-            for arg in args {
-                collect_used_vars_in_expr(arg, used);
-            }
-        }
-        Expr::Closure(_, stmts) => {
-            collect_used_vars(stmts, used);
-        }
-        Expr::Cast(inner, _) => {
-            collect_used_vars_in_expr(inner, used);
-        }
-        _ => {}
-    }
-}
+// Note: remove_unused_var_decls and collect_used_vars functions have been removed.
+// The structurer now uses SSA info to track which variables actually have assignments
+// emitted, and only emits VarDecls for those. This avoids the fragile approach of
+// post-processing to remove orphaned declarations, which was broken for ForIn loops
+// and would need to be updated for every new Statement variant.
 
 /// Inline constants that are immediately used in the next statement.
 ///

@@ -319,6 +319,7 @@ impl<'a> Structurer<'a> {
                     if !self.declared_vars.contains(&var_name) {
                         self.declared_vars.insert(var_name.clone());
                         self.hoisted_vars.insert(var_name.clone());
+                        self.actually_used_vars.insert(var_name.clone());
                         // Track type for hoisted var
                         if let Some(tr) = self.func.regs.get(ssa_var.reg.0 as usize).copied() {
                             self.hoisted_var_types.insert(var_name, tr);

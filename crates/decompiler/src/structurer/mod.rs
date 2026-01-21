@@ -167,6 +167,10 @@ pub struct Structurer<'a> {
     /// When set, EnumField opcodes matching these keys emit the param name
     /// instead of Type.enumParameters(...). Used to generate cleaner switch case patterns.
     pub(crate) enum_param_bindings: HashMap<(Reg, usize, usize), String>,
+    /// Variables that actually had assignments emitted (for filtering hoisted VarDecls).
+    /// This allows us to skip emitting VarDecls for variables that were hoisted but never
+    /// actually assigned (e.g., because the assignment was dead and skipped).
+    pub(crate) actually_used_vars: HashSet<Str>,
 }
 
 impl<'a> Structurer<'a> {
@@ -275,6 +279,7 @@ impl<'a> Structurer<'a> {
             inline_exprs: RefCell::new(HashMap::new()),
             suppressed_ops: HashSet::new(),
             enum_param_bindings: HashMap::new(),
+            actually_used_vars: HashSet::new(),
         }
     }
 
@@ -321,10 +326,16 @@ impl<'a> Structurer<'a> {
         };
 
         // Prepend hoisted variable declarations (for vars first assigned inside scopes)
+        // Only emit VarDecls for variables that actually had assignments emitted.
+        // This prevents orphaned VarDecls for dead variables that were hoisted but skipped.
         let mut result = Vec::new();
         let current_class = self.get_current_class_name();
         let current_class_str = current_class.as_ref().map(|s| s.as_ref());
         for name in &self.hoisted_vars {
+            // Skip VarDecls for variables that never had assignments emitted
+            if !self.actually_used_vars.contains(name) {
+                continue;
+            }
             let type_hint = if self.needs_dynamic_type.contains(name) {
                 // for vars that will hold empty anonymous objects
                 Some("Dynamic".into())
