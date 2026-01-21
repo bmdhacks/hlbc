@@ -1103,7 +1103,7 @@ mod tests {
         let succs = cfg.successors_with_edges(cond);
 
         if succs.len() == 2 {
-            let (then_target, else_target, _) = identify_branches(&succs).expect("Should identify branches");
+            let (then_target, _else_target, _) = identify_branches(&succs).expect("Should identify branches");
 
             // Check if then block is an exit
             let then_is_exit = cfg.graph[then_target].is_exit;

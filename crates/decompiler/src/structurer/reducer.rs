@@ -87,27 +87,49 @@ fn reduce_one_step(
     let node_count_before = graph.node_count();
     let made_progress;
 
-    // Priority 1: Collapse innermost loops first
-    // This ensures nested loops are reduced from inside out
-    let loop_patterns = find_loop_patterns(graph, cfg, analysis, ctx);
-    if let Some(lp) = loop_patterns.into_iter().next() {
-        collapse_loop(graph, cfg, &lp);
+    // Collect loop headers to avoid collapsing them as if-else patterns
+    let loop_headers: HashSet<NodeIndex> = analysis.loops.iter().map(|l| l.header).collect();
+
+    // Priority 1: Collapse if-then-else patterns that are INSIDE loops first
+    // This ensures nested if-else structures are reduced before their containing loops.
+    // Skip patterns whose condition is a loop header (those are loop conditions, not inner if-else).
+    let if_patterns = find_if_patterns(graph, cfg, analysis);
+    if let Some(ip) = if_patterns
+        .into_iter()
+        .find(|p| {
+            // Skip if the condition node is a loop header
+            if let Some(cfg_node) = graph.get_node(p.condition_node).and_then(|n| n.as_block()) {
+                !loop_headers.contains(&cfg_node)
+            } else {
+                true // Collapsed nodes are fine to process
+            }
+        })
+    {
+        collapse_if(graph, cfg, &ip);
         made_progress = true;
     } else {
-        // Priority 2: Collapse if-then-else patterns
-        let if_patterns = find_if_patterns(graph, cfg, analysis);
-        if let Some(ip) = if_patterns.into_iter().next() {
-            collapse_if(graph, cfg, &ip);
+        // Priority 2: Collapse innermost loops
+        // This ensures nested loops are reduced from inside out
+        let loop_patterns = find_loop_patterns(graph, cfg, analysis, ctx);
+        if let Some(lp) = loop_patterns.into_iter().next() {
+            collapse_loop(graph, cfg, &lp);
             made_progress = true;
         } else {
-            // Priority 3: Collapse switch patterns
-            let switch_patterns = find_switch_patterns(graph, cfg, analysis);
-            if let Some(sp) = switch_patterns.into_iter().next() {
-                collapse_switch(graph, cfg, &sp);
+            // Priority 3: Collapse remaining if-then-else patterns (including loop headers)
+            let if_patterns = find_if_patterns(graph, cfg, analysis);
+            if let Some(ip) = if_patterns.into_iter().next() {
+                collapse_if(graph, cfg, &ip);
                 made_progress = true;
             } else {
-                // Priority 4: Collapse linear sequences
-                made_progress = collapse_sequences(graph);
+                // Priority 4: Collapse switch patterns
+                let switch_patterns = find_switch_patterns(graph, cfg, analysis);
+                if let Some(sp) = switch_patterns.into_iter().next() {
+                    collapse_switch(graph, cfg, &sp);
+                    made_progress = true;
+                } else {
+                    // Priority 5: Collapse linear sequences
+                    made_progress = collapse_sequences(graph);
+                }
             }
         }
     }
@@ -159,8 +181,20 @@ fn compute_reachable_nodes(graph: &RegionGraph) -> HashSet<NodeIndex> {
 
 /// Collapse a loop pattern into a Region::Loop node.
 fn collapse_loop(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &LoopPattern) {
-    // Build the loop body region from the body nodes
-    let body_region = build_region_from_nodes(graph, &pattern.body_nodes, pattern.header);
+    // Get the header's region node
+    let header_region_node = graph.get_region_node(pattern.header);
+
+    // Build the loop body region EXCLUDING the header.
+    // The header is processed separately during lowering for:
+    // 1. Extracting the loop condition from its terminating jump
+    // 2. Emitting any preamble statements
+    let body_nodes_without_header: HashSet<NodeIndex> = pattern.body_nodes
+        .iter()
+        .filter(|&&n| Some(n) != header_region_node)
+        .copied()
+        .collect();
+
+    let body_region = build_region_from_nodes(graph, &body_nodes_without_header, pattern.header);
 
     // Create the loop region
     // Use None for condition - it will be extracted from the header block during lowering.
