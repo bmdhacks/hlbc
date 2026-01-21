@@ -188,20 +188,27 @@ fn match_loop_pattern(
 }
 
 /// Find the primary exit node for a loop.
+///
+/// For while loops, the primary exit is typically via the header's condition.
+/// We check the header first to prefer this exit over break-induced exits.
 fn find_loop_exit(cfg: &Cfg, natural_loop: &NaturalLoop) -> Option<NodeIndex> {
-    // Look for edges leaving the loop from exit nodes
+    // Check header first for exit edges (this is the primary exit for while loops)
+    // The header's exit edge represents the normal loop termination condition.
+    for succ in cfg.successors(natural_loop.header) {
+        if !natural_loop.body.contains(&succ) {
+            return Some(succ);
+        }
+    }
+
+    // Also check other exit nodes (for loops with multiple exits like break)
     for &exit_node in &natural_loop.exit_nodes {
+        if exit_node == natural_loop.header {
+            continue; // Already checked
+        }
         for succ in cfg.successors(exit_node) {
             if !natural_loop.body.contains(&succ) {
                 return Some(succ);
             }
-        }
-    }
-
-    // Also check header for exit edges (common in while loops)
-    for succ in cfg.successors(natural_loop.header) {
-        if !natural_loop.body.contains(&succ) {
-            return Some(succ);
         }
     }
 
@@ -750,8 +757,11 @@ fn collect_branch_nodes(
         // For non-terminating blocks, check post-dominance by merge.
         // For terminating blocks (exit nodes like return/throw), they don't reach
         // the merge so post-dominance doesn't apply - include them anyway.
+        // When merge == condition, this is a "dummy merge" for switches where all
+        // cases terminate - skip post-dominance check since there's no real merge.
         let is_exit = cfg.graph[node].is_exit;
-        if !is_exit && !analysis.post_dominates(merge, node) {
+        let is_dummy_merge = merge == condition;
+        if !is_exit && !is_dummy_merge && !analysis.post_dominates(merge, node) {
             continue;
         }
 
@@ -803,16 +813,45 @@ fn match_switch_pattern(
     node: NodeIndex,
     ctx: Option<&PatternContext<'_>>,
 ) -> Option<SwitchPattern> {
-    let cfg_node = region_graph.get_node(node)?.as_block()?;
+    let region_node = region_graph.get_node(node)?;
+    let cfg_node = region_node.as_block()?;
 
     // Must have 3+ successors for a switch
     let cfg_succs = cfg.successors(cfg_node);
+
+    if std::env::var("HLBC_DEBUG_SWITCH").is_ok() {
+        eprintln!("DEBUG match_switch: node={:?} cfg={:?} succs={}", node, cfg_node, cfg_succs.len());
+    }
+
     if cfg_succs.len() < 3 {
         return None;
     }
 
+    // Check if the block ends with a Switch opcode
+    let block = &cfg.graph[cfg_node];
+    let is_switch_block = ctx
+        .map(|c| matches!(c.func.ops.get(block.end), Some(hlbc::opcodes::Opcode::Switch { .. })))
+        .unwrap_or(false);
+
     // Find merge point
-    let merge_cfg = analysis.ipdom(cfg_node)?;
+    // For switches where all cases terminate (return), there's no merge point.
+    // In that case, we still want to match the pattern.
+    let merge_cfg = analysis.ipdom(cfg_node);
+    if std::env::var("HLBC_DEBUG_SWITCH").is_ok() {
+        eprintln!("DEBUG match_switch: ipdom={:?} is_switch_block={}", merge_cfg, is_switch_block);
+    }
+
+    // If no merge point, check if we can still match
+    let merge_cfg = match merge_cfg {
+        Some(m) => m,
+        None if is_switch_block => {
+            // This is a switch with no merge (all cases likely terminate).
+            // Use the selector node itself as a dummy merge - this signals
+            // that there's no real merge point.
+            cfg_node
+        }
+        None => return None,
+    };
 
     // Collect case nodes and body
     let mut case_nodes_set = HashSet::new();

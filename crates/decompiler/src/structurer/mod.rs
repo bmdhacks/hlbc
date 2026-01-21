@@ -312,8 +312,7 @@ impl<'a> Structurer<'a> {
     /// Structure the entire function into statements
     pub fn structure(&mut self) -> Vec<Statement> {
 
-        // preprosess: detect patterns for suppression
-        self.detect_enum_switch_patterns();
+        // preprocess: detect patterns for suppression
         self.detect_internal_function_calls();
 
         let stmts = if self.exception_analysis.has_exceptions() {

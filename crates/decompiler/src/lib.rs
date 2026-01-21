@@ -224,7 +224,6 @@ pub fn decompile_code_with_options(
     );
 
     // Run preprocessing for pattern suppression
-    structurer.detect_enum_switch_patterns();
     structurer.detect_internal_function_calls();
 
     // Check if function has exception handling - use legacy path for try/catch

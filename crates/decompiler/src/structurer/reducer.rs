@@ -90,6 +90,10 @@ fn reduce_one_step(
     // Collect loop headers to avoid collapsing them as if-else patterns
     let loop_headers: HashSet<NodeIndex> = analysis.loops.iter().map(|l| l.header).collect();
 
+    if std::env::var("HLBC_DEBUG_REDUCE").is_ok() {
+        eprintln!("DEBUG reduce_one_step: node_count={}", node_count_before);
+    }
+
     // Priority 1: Collapse if-then-else patterns that are INSIDE loops first
     // This ensures nested if-else structures are reduced before their containing loops.
     // Skip patterns whose condition is a loop header (those are loop conditions, not inner if-else).
@@ -142,6 +146,13 @@ fn reduce_one_step(
             } else {
                 // Priority 4: Collapse switch patterns
                 let switch_patterns = find_switch_patterns(graph, cfg, analysis, ctx);
+                if std::env::var("HLBC_DEBUG_REDUCE").is_ok() {
+                    eprintln!("DEBUG: found {} switch-patterns", switch_patterns.len());
+                    for sp in &switch_patterns {
+                        eprintln!("  switch: selector={:?} cases={:?} default={:?}",
+                            sp.selector_node, sp.case_nodes, sp.default_node);
+                    }
+                }
                 if let Some(sp) = switch_patterns.into_iter().next() {
                     collapse_switch(graph, cfg, &sp, ctx);
                     made_progress = true;

@@ -1762,15 +1762,14 @@ impl<'a> Structurer<'a> {
 
             Opcode::EnumIndex { dst, value } => {
                 // Get the constructor index of an enum value (for switch statements)
-                // This is used internally by switch on enum, typically followed by Switch opcode
-                // We emit the assignment so the switch can use it
-                let var = self.reg_to_expr_dst(*dst);
+                // This is typically used immediately by a Switch opcode, so we try to inline it
                 let val_expr = self.reg_to_expr(*value);
                 // Use Type.enumIndex(val) which gets the constructor ordinal
                 let type_expr = Expr::Ident("Type".into());
                 let method_expr = Expr::Field(Box::new(type_expr), "enumIndex".into());
                 let expr = Expr::Call(Box::new(Call::new(method_expr, vec![val_expr])));
-                Some(self.make_assign(var, expr))
+                // Use try_inline_or_assign so the expression can be inlined into the switch
+                self.try_inline_or_assign(*dst, expr)
             }
 
             Opcode::SetEnumField { value, field, src } => {

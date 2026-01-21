@@ -22,38 +22,6 @@ use crate::ssa::get_dst_reg as get_opcode_dst;
 use super::{StringSwitchCase, StringSwitchRegion, Structurer};
 
 impl<'a> Structurer<'a> {
-    /// Detect EnumIndex → Switch patterns and mark EnumIndex for suppression.
-    /// Pattern:
-    ///   EnumIndex dst = value
-    ///   ... (0 or more ops)
-    ///   Switch dst
-    /// When detected, the EnumIndex opcode is suppressed and the switch uses the original enum.
-    pub fn detect_enum_switch_patterns(&mut self) {
-        let ops = &self.func.ops;
-
-        for (i, op) in ops.iter().enumerate() {
-            if let Opcode::EnumIndex { dst, value: _ } = op {
-                // Look for a Switch that uses this dst register
-                // Search forward (within reasonable distance)
-                for j in (i + 1)..ops.len().min(i + 20) {
-                    if let Opcode::Switch { reg, .. } = &ops[j] {
-                        if reg == dst {
-                            // Found EnumIndex → Switch pattern
-                            self.suppressed_ops.insert(i);
-                            break;
-                        }
-                    }
-                    // Stop if dst is overwritten
-                    if let Some(def_dst) = get_opcode_dst(&ops[j]) {
-                        if def_dst == *dst {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     /// Detect internal function calls (__expand, __construct, __constructor__) and suppress them.
     /// These are runtime implementation details that shouldn't appear in decompiled output.
     pub fn detect_internal_function_calls(&mut self) {

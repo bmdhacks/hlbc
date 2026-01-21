@@ -16,7 +16,7 @@
 use petgraph::graph::NodeIndex;
 
 use hlbc::opcodes::Opcode;
-use hlbc::types::Reg;
+use hlbc::types::{Reg, Type};
 
 use crate::ast::{Constant, Expr, Operation, Statement};
 use crate::structurer::region::{LoopKind, Region};
@@ -241,8 +241,45 @@ impl<'a> LoweringContext<'a> {
 }
 
 /// Lower a basic block to statements.
+///
+/// This handles normal opcodes via `lower_block_opcodes`, but also detects
+/// break and continue statements by checking if the block ends with a JAlways
+/// that jumps to the loop exit (break) or loop header (continue).
 fn lower_block(node: NodeIndex, ctx: &mut LoweringContext<'_>) -> Vec<Statement> {
-    ctx.lower_block_opcodes(node)
+    let mut stmts = ctx.lower_block_opcodes(node);
+
+    // Check if this block ends with a JAlways that represents break/continue
+    if let Some(header) = ctx.structurer.current_loop_header {
+        let block = &ctx.structurer.cfg.graph[node];
+        let last_op = &ctx.structurer.func.ops[block.end];
+
+        if let Opcode::JAlways { offset } = last_op {
+            // Compute target address
+            let target_addr = (block.end as i64 + *offset as i64 + 1) as usize;
+
+            // Find the target CFG node
+            if let Some(&target_node) = ctx.structurer.cfg.op_to_block.get(&target_addr) {
+                // Check if target is the loop header → continue
+                if target_node == header {
+                    stmts.push(Statement::Continue);
+                }
+                // Check if target is outside the loop → break
+                else if let Some(loop_info) = ctx
+                    .structurer
+                    .analysis
+                    .loops
+                    .iter()
+                    .find(|l| l.header == header)
+                {
+                    if !loop_info.body.contains(&target_node) {
+                        stmts.push(Statement::Break);
+                    }
+                }
+            }
+        }
+    }
+
+    stmts
 }
 
 /// Lower a sequence of regions to statements.
@@ -558,7 +595,23 @@ fn lower_switch(
         .collect();
 
     // Lower default case
-    let default_stmts = lower_region(default, ctx);
+    let mut default_stmts = lower_region(default, ctx);
+
+    // If default is empty and all cases terminate (return/throw), add a synthetic
+    // default return to satisfy Haxe's type checker for exhaustive switches.
+    if default_stmts.is_empty() && !lowered_cases.is_empty() {
+        let all_cases_terminate = lowered_cases.iter().all(|(_, stmts)| {
+            stmts.last().map_or(false, |s| {
+                matches!(s, Statement::Return(_) | Statement::Throw(_))
+            })
+        });
+        if all_cases_terminate {
+            // Get function return type and create appropriate default
+            let ret_type = ctx.structurer.func.ty(ctx.structurer.code).ret;
+            let default_expr = default_for_type(ret_type, ctx.structurer.code);
+            default_stmts.push(Statement::Return(Some(default_expr)));
+        }
+    }
 
     ctx.structurer.scope_depth -= 1;
 
@@ -644,6 +697,19 @@ fn extract_collection_expr(init_op_idx: usize, ctx: &mut LoweringContext<'_>) ->
             ))))
         }
         _ => None,
+    }
+}
+
+/// Return a default expression for a given type.
+/// Used for synthetic default cases in exhaustive switches.
+fn default_for_type(type_ref: hlbc::types::RefType, code: &hlbc::Bytecode) -> Expr {
+    match code.types.get(type_ref.0) {
+        Some(Type::I32) | Some(Type::I64) | Some(Type::UI8) | Some(Type::UI16) => {
+            Expr::Constant(Constant::InlineInt(0))
+        }
+        Some(Type::F32) | Some(Type::F64) => Expr::Constant(Constant::Float(hlbc::types::RefFloat(0))),
+        Some(Type::Bool) => Expr::Constant(Constant::Bool(false)),
+        _ => Expr::Constant(Constant::Null),
     }
 }
 
