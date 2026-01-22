@@ -114,6 +114,9 @@ pub struct Structurer<'a> {
     pub(crate) processed: HashSet<NodeIndex>,
     /// Use-def info for inlining decisions (ILSpy-style)
     pub(crate) use_info: HashMap<SsaVar, UseDefInfo>,
+    /// Dead phi destinations - phis whose results are never used
+    /// Used to exclude dead phis from "same-register phi source" checks
+    pub(crate) dead_phis: HashSet<SsaVar>,
     /// Variable names that have been declared (for declaration tracking)
     pub(crate) declared_vars: HashSet<Str>,
     /// Current opcode index being processed (for debug name lookup)
@@ -230,7 +233,7 @@ impl<'a> Structurer<'a> {
         is_this_bound_closure: bool,
     ) -> Self {
         // (needs func for purity info)
-        let use_info = ssa.compute_use_counts(func);
+        let (use_info, dead_phis) = ssa.compute_use_counts(func);
 
         let method_info = Self::build_method_info(code);
 
@@ -279,6 +282,7 @@ impl<'a> Structurer<'a> {
             is_this_bound_closure,
             processed: HashSet::new(),
             use_info,
+            dead_phis,
             exception_analysis,
             declared_vars,
             current_op: 0,

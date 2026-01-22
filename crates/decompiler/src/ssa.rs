@@ -50,12 +50,11 @@ impl UseDefInfo {
     ///         (Checked separately in structurer since it has debug info access)
     /// Guard 3 (Phi Node Barrier): Can't inline across block boundaries.
     ///         Variables used by φ-functions are not inlinable.
-    ///
-    /// NOTE: Constants are NOT always inlinable - if they have phi_use_count > 0,
-    /// they shouldn't be inlined because that would lose the variable's identity
-    /// at the loop header.
     pub fn can_inline(&self) -> bool {
         // Guard 3: Can't inline if used by phi function (cross-block boundary)
+        // This applies to ALL variables including constants, because if a constant
+        // flows to a phi that's actually used (e.g., loop counter initialization),
+        // we need to emit the assignment so the phi has a source variable.
         if self.phi_use_count > 0 {
             return false;
         }
@@ -418,8 +417,10 @@ impl SsaCfg {
     }
 
     /// Compute use counts for all SSA variables.
-    /// Returns a map from SsaVar to UseDefInfo including purity information.
-    pub fn compute_use_counts(&self, f: &Function) -> HashMap<SsaVar, UseDefInfo> {
+    /// Returns a tuple of:
+    /// - Map from SsaVar to UseDefInfo including purity information
+    /// - Set of dead phi destinations (phis whose results are never used)
+    pub fn compute_use_counts(&self, f: &Function) -> (HashMap<SsaVar, UseDefInfo>, HashSet<SsaVar>) {
         let mut info: HashMap<SsaVar, UseDefInfo> = HashMap::new();
 
         // First, record all definitions and their purity
@@ -474,7 +475,45 @@ impl SsaCfg {
             }
         }
 
-        info
+        // Phase 3: Iterative dead phi detection
+        // A phi is "dead" if its result has use_count=0 AND phi_use_count=0
+        // When we find a dead phi, decrement phi_use_count for its sources
+        // This may make other phis dead (chained dead phis), so iterate until fixpoint
+        let mut processed_dead_phis: HashSet<SsaVar> = HashSet::new();
+        loop {
+            let mut changed = false;
+            for block in self.blocks.values() {
+                for phi in &block.phis {
+                    if let SsaInstr::Phi { dst, sources } = phi {
+                        // Skip if already processed as dead
+                        if processed_dead_phis.contains(dst) {
+                            continue;
+                        }
+                        if let Some(phi_info) = info.get(dst) {
+                            let is_dead = phi_info.use_count == 0 && phi_info.phi_use_count == 0;
+                            if is_dead {
+                                processed_dead_phis.insert(*dst);
+                                for (_, src_var) in sources {
+                                    if src_var.version > 0 {
+                                        if let Some(src_info) = info.get_mut(src_var) {
+                                            if src_info.phi_use_count > 0 {
+                                                src_info.phi_use_count -= 1;
+                                                changed = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        (info, processed_dead_phis)
     }
 
     /// Get the SsaInstr for a given opcode index.
@@ -531,6 +570,31 @@ impl SsaCfg {
         for block in self.blocks.values() {
             for phi in &block.phis {
                 if let SsaInstr::Phi { dst, sources } = phi {
+                    // Check if all sources are the same register as destination (same-register phi)
+                    let is_same_reg_phi = sources.iter().all(|(_, src)| src.reg == dst.reg);
+                    if is_same_reg_phi {
+                        // Check if var is one of the sources
+                        if sources.iter().any(|(_, src)| *src == var) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Like is_same_register_phi_source, but excludes phis that are dead.
+    /// A dead phi's sources shouldn't trigger non-SSA naming since the phi
+    /// result is never used - we can use SSA-versioned names for correctness.
+    pub fn is_same_register_phi_source_live(&self, var: SsaVar, dead_phis: &HashSet<SsaVar>) -> bool {
+        for block in self.blocks.values() {
+            for phi in &block.phis {
+                if let SsaInstr::Phi { dst, sources } = phi {
+                    // Skip dead phis - their sources don't need non-SSA naming
+                    if dead_phis.contains(dst) {
+                        continue;
+                    }
                     // Check if all sources are the same register as destination (same-register phi)
                     let is_same_reg_phi = sources.iter().all(|(_, src)| src.reg == dst.reg);
                     if is_same_reg_phi {

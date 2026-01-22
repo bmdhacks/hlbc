@@ -211,6 +211,17 @@ impl<'a> PatternMatcher<'a> {
         let mut then_region_nodes = then_nodes.clone();
         let mut else_region_nodes = else_nodes.clone();
 
+        // Handle short-circuit && patterns: if both branches can reach the same nodes
+        // (e.g., `if (a && b) {} else { body }` where failing either condition goes to body),
+        // the branches may overlap. In this case, assign overlapping nodes to only one branch.
+        // Rule: nodes reachable from BOTH branches belong to whichever branch reaches them
+        // more directly. Since then_target is the direct jump target, give priority to then_nodes.
+        for node in then_region_nodes.iter() {
+            else_region_nodes.remove(node);
+        }
+        // Also exclude the then_target from else_nodes (it's the then branch's entry point)
+        else_region_nodes.remove(&then_target);
+
         // If a branch is empty but the target is a collapsed region, include it
         if then_region_nodes.is_empty() {
             if then_target != merge && self.region_graph.get_node(then_target)

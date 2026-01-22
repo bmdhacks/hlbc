@@ -14,7 +14,7 @@ use hlbc::opcodes::Opcode;
 use hlbc::types::{Reg, RefField, Type};
 use hlbc::Str;
 
-use crate::ast::{Constant, Expr, Statement};
+use crate::ast::{Expr, Statement};
 use crate::ssa::{SsaVar, get_dst_reg as get_opcode_dst};
 
 use super::{MemoryDep, Structurer};
@@ -83,7 +83,8 @@ impl<'a> Structurer<'a> {
         }
         // For same-register phi destinations or sources, use non-SSA name
         // This allows the value to flow through if/else branches without explicit phi assignments
-        if self.ssa.is_same_register_phi(var) || self.ssa.is_same_register_phi_source(var) {
+        // BUT exclude dead phis - their sources should use SSA-versioned names since the phi is unused
+        if self.ssa.is_same_register_phi(var) || self.ssa.is_same_register_phi_source_live(var, &self.dead_phis) {
             return format!("r{}", var.reg.0).into();
         }
         // No debug name → use SSA-versioned name
@@ -123,7 +124,8 @@ impl<'a> Structurer<'a> {
         }
         // For same-register phi results or sources, use non-SSA name
         // This ensures consistency with phi destinations (allows value flow-through)
-        if self.ssa.is_same_register_phi(var) || self.ssa.is_same_register_phi_source(var) {
+        // BUT exclude dead phis - their sources should use SSA-versioned names since the phi is unused
+        if self.ssa.is_same_register_phi(var) || self.ssa.is_same_register_phi_source_live(var, &self.dead_phis) {
             return format!("r{}", var.reg.0).into();
         }
         // No debug name → use SSA-versioned name
@@ -542,6 +544,41 @@ impl<'a> Structurer<'a> {
         false
     }
 
+    /// Get debug name for a register at a specific definition point.
+    /// Returns the debug name only if there's an assigns entry that defines
+    /// this register at exactly the given opcode.
+    pub(super) fn get_debug_name_for_def(&self, reg: Reg, def_op: usize) -> Option<String> {
+        if let Some(assigns) = &self.func.assigns {
+            for (str_ref, op_idx) in assigns {
+                // Skip assigns at op_idx 0 - these are parameter names
+                if *op_idx == 0 {
+                    continue;
+                }
+
+                // The definition is at the previous opcode
+                let assign_def = op_idx.saturating_sub(1);
+
+                // Check if this assign matches the definition point
+                if assign_def != def_op {
+                    continue;
+                }
+
+                if def_op < self.func.ops.len() {
+                    if let Some(dst_reg) = get_opcode_dst(&self.func.ops[def_op]) {
+                        if dst_reg == reg {
+                            if let Some(name) = self.code.strings.get(str_ref.0) {
+                                if self.is_valid_identifier(name) && !self.name_conflicts_with_param(name) {
+                                    return Some(name.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Get field name from type information.
     pub(super) fn get_field_name(&self, obj_reg: Reg, field: RefField) -> Str {
         // Try to look up field name from type
@@ -644,43 +681,18 @@ impl<'a> Structurer<'a> {
         if let Some((_dst, uses)) = self.ssa.get_instr_for_op(blk.end) {
             for ssa_var in uses {
                 if ssa_var.reg == reg {
-                    // IMPORTANT: Check if this variable has an inlined expression first.
+                    // Check if this variable has an inlined expression.
                     // If the variable was marked for inlining, its defining statement was
                     // suppressed, so we must return the stored expression, not a variable name.
                     if let Some(inline_expr) = self.try_get_inline_expr(*ssa_var) {
                         return inline_expr;
                     }
 
-                    // Found the SSA variable for this register at block end
-                    // Now find its definition to see if it's a constant
-                    let def = self.ssa.find_def(*ssa_var);
-                    if let Some(def_op_idx) = def {
-                        match &self.func.ops[def_op_idx] {
-                            Opcode::Int { ptr, .. } => {
-                                return Expr::Constant(Constant::Int(*ptr));
-                            }
-                            Opcode::Float { ptr, .. } => {
-                                return Expr::Constant(Constant::Float(*ptr));
-                            }
-                            Opcode::Bool { value, .. } => {
-                                return Expr::Constant(Constant::Bool(*value));
-                            }
-                            Opcode::String { ptr, .. } => {
-                                return Expr::Constant(Constant::String(*ptr));
-                            }
-                            Opcode::Null { .. } => {
-                                return Expr::Constant(Constant::Null);
-                            }
-                            _ => {
-                                // Not a constant - return as variable with SSA-versioned name
-                                // Use block.end as the position for debug name lookup
-                                let name = self.ssa_var_name_src_at(*ssa_var, blk.end);
-                                return Expr::Variable(reg, Some(name));
-                            }
-                        }
-                    }
-                    // No def found (phi function) - use SSA-versioned name
-                    // Use block.end as the position for debug name lookup
+                    // No inlined expression available - use SSA-versioned name.
+                    // NOTE: We intentionally do NOT do direct constant lookup here.
+                    // If a constant wasn't stored for inlining, it means its assignment
+                    // statement was emitted (e.g., because it flows to a phi function),
+                    // so we must reference the variable, not inline the constant again.
                     let name = self.ssa_var_name_src_at(*ssa_var, blk.end);
                     return Expr::Variable(reg, Some(name));
                 }
@@ -736,7 +748,8 @@ impl<'a> Structurer<'a> {
                     }
 
                     // Found the SSA variable for this register
-                    let is_phi_involved = self.ssa.is_same_register_phi(*ssa_var) || self.ssa.is_same_register_phi_source(*ssa_var);
+                    // Check if phi-involved, but exclude dead phis
+                    let is_phi_involved = self.ssa.is_same_register_phi(*ssa_var) || self.ssa.is_same_register_phi_source_live(*ssa_var, &self.dead_phis);
 
                     let name: Str = if is_phi_involved {
                         // For phi-involved variables (loop counters), use debug name if available
@@ -751,7 +764,12 @@ impl<'a> Structurer<'a> {
                         // Debug names from different branches can be misleading
                         // (e.g., bounds check failure path assigns "last" to default value).
                         //
-                        // EXCEPTION: Function parameters (version 0) are always safe since
+                        // HOWEVER: if the debug name's definition point matches the SSA
+                        // variable's definition, the name is valid and should be used.
+                        // This handles the case where dead phi detection removes a phi but
+                        // the variable still has a valid debug name from its definition.
+                        //
+                        // Also safe: Function parameters (version 0) are always safe since
                         // they're defined at function entry before any branches.
                         if ssa_var.version == 0 {
                             // Check if this is a function parameter
@@ -761,7 +779,16 @@ impl<'a> Structurer<'a> {
                                 format!("r{}_{}", reg.0, ssa_var.version).into()
                             }
                         } else {
-                            // Non-parameter, non-phi: use raw SSA-versioned name
+                            // Non-parameter, non-phi: check if we have a debug name that matches
+                            // the SSA definition point
+                            if let Some(def_op) = self.ssa.find_def(*ssa_var) {
+                                // Check if there's a debug name defined at this op
+                                // The debug name's def_idx should equal the SSA def_op
+                                if let Some(debug_name) = self.get_debug_name_for_def(reg, def_op) {
+                                    return Expr::Variable(reg, Some(debug_name.into()));
+                                }
+                            }
+                            // Fall back to raw SSA-versioned name
                             format!("r{}_{}", reg.0, ssa_var.version).into()
                         }
                     };
