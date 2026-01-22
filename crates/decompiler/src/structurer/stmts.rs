@@ -13,7 +13,7 @@ use hlbc::opcodes::Opcode;
 use hlbc::types::{Reg, RefFun, RefType, Type};
 use hlbc::{Resolve, Str};
 
-use crate::ast::{Call, Constant, ConstructorCall, Expr, Operation, Statement};
+use crate::ast::{not, Call, Constant, ConstructorCall, Expr, Operation, Statement};
 use crate::fmt::extract_nested_type_simple_name;
 
 use super::Structurer;
@@ -1403,7 +1403,8 @@ impl<'a> Structurer<'a> {
 
             Opcode::Not { dst, src } => {
                 let var = self.reg_to_expr_dst(*dst);
-                let expr = Expr::Op(Operation::Not(Box::new(self.reg_to_expr(*src))));
+                let inner = self.reg_to_expr(*src);
+                let expr = not(inner); // Apply simplification at creation
                 Some(self.make_assign(var, expr))
             }
 

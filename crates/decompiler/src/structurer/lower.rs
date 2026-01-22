@@ -18,7 +18,7 @@ use petgraph::graph::NodeIndex;
 use hlbc::opcodes::Opcode;
 use hlbc::types::{Reg, Type};
 
-use crate::ast::{Constant, Expr, Operation, Statement};
+use crate::ast::{not, Constant, Expr, Operation, Statement};
 use crate::structurer::region::{LoopKind, Region};
 use crate::structurer::Structurer;
 
@@ -166,7 +166,7 @@ impl<'a> LoweringContext<'a> {
             Opcode::JTrue { cond, .. } => self.structurer.reg_to_expr_in_block(*cond, node),
             Opcode::JFalse { cond, .. } => {
                 let expr = self.structurer.reg_to_expr_in_block(*cond, node);
-                Expr::Op(Operation::Not(Box::new(expr)))
+                not(expr)
             }
             Opcode::JNull { reg, .. } => {
                 let expr = self.structurer.reg_to_expr_in_block(*reg, node);
@@ -434,7 +434,7 @@ fn lower_if_then_else(
     // If the branches were swapped during structuring (empty-then normalization),
     // negate the condition to maintain correct semantics.
     if negated {
-        actual_cond = Expr::Op(Operation::Not(Box::new(actual_cond)));
+        actual_cond = not(actual_cond);
     }
 
     // Lower branches with increased scope depth
@@ -494,7 +494,7 @@ fn lower_loop(
     //
     // For `while (continue_cond) { body }`: use !exit_cond (negate to get continue condition)
     // For `while (true) { if (exit_cond) break; body }`: use exit_cond directly
-    let continue_cond = Expr::Op(Operation::Not(Box::new(loop_cond.clone())));
+    let continue_cond = not(loop_cond.clone());
     let exit_cond = loop_cond;
 
     match kind {
