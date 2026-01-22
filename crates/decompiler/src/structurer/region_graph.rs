@@ -396,9 +396,6 @@ impl RegionGraph {
             if let Some(&first_cfg) = src_cfg_nodes.iter().next() {
                 if let Some(&src_node) = self.cfg_to_region.get(&first_cfg) {
                     if src_node != new_node && !added_incoming.contains(&src_node) {
-                        if std::env::var("HLBC_DEBUG_COLLAPSE_EDGE").is_ok() {
-                            eprintln!("  COLLAPSE: adding incoming edge {:?} -> {:?} (kind={:?})", src_node, new_node, kind);
-                        }
                         self.graph.add_edge(src_node, new_node, kind);
                         added_incoming.insert(src_node);
                     }
@@ -411,9 +408,6 @@ impl RegionGraph {
             if let Some(&first_cfg) = dst_cfg_nodes.iter().next() {
                 if let Some(&dst_node) = self.cfg_to_region.get(&first_cfg) {
                     if dst_node != new_node && !added_outgoing.contains(&dst_node) {
-                        if std::env::var("HLBC_DEBUG_COLLAPSE_EDGE").is_ok() {
-                            eprintln!("  COLLAPSE: adding outgoing edge {:?} -> {:?} (kind={:?})", new_node, dst_node, kind);
-                        }
                         self.graph.add_edge(new_node, dst_node, kind);
                         added_outgoing.insert(dst_node);
                     }

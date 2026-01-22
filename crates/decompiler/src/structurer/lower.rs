@@ -108,13 +108,6 @@ impl<'a> LoweringContext<'a> {
         let block = &self.structurer.cfg.graph[node];
         let mut stmts = Vec::new();
 
-        if std::env::var("HLBC_DEBUG_LOWER").is_ok() {
-            eprintln!("DEBUG lower_block_opcodes: node={:?}, ops {}..={}", node, block.start, block.end);
-            for op_idx in block.start..=block.end {
-                eprintln!("  op {}: {:?}", op_idx, self.structurer.func.ops[op_idx]);
-            }
-        }
-
         for op_idx in block.start..=block.end {
             self.structurer.current_op = op_idx;
 
@@ -409,7 +402,7 @@ fn lower_if_then_else(
     cond_block: Option<NodeIndex>,
     then_region: &Region,
     else_region: Option<&Region>,
-    merge: NodeIndex,
+    _merge: NodeIndex,
     negated: bool,
     ctx: &mut LoweringContext<'_>,
 ) -> Vec<Statement> {
@@ -419,20 +412,12 @@ fn lower_if_then_else(
         "lower_if_then_else: cond_block is None, cannot extract condition"
     );
 
-    if std::env::var("HLBC_DEBUG_LOWER").is_ok() {
-        eprintln!("DEBUG lower_if_then_else: cond_block={:?}, merge={:?}, negated={}",
-            cond_block, merge, negated);
-    }
-
     let mut stmts = Vec::new();
 
     // Lower the condition block's preamble (non-control-flow opcodes) first.
     // This ensures any setup code runs before the if-statement.
     if let Some(block) = cond_block {
         let preamble = ctx.lower_block_opcodes(block);
-        if std::env::var("HLBC_DEBUG_LOWER").is_ok() && !preamble.is_empty() {
-            eprintln!("  preamble has {} statements", preamble.len());
-        }
         stmts.extend(preamble);
     }
 
@@ -900,24 +885,12 @@ fn lower_opcode_range(
     try_regions: &[TryRegion],
     ctx: &mut LoweringContext<'_>,
 ) -> Vec<Statement> {
-    let debug = std::env::var("HLBC_DEBUG_LOWER_EXC").is_ok();
-
-    if debug {
-        eprintln!("DEBUG lower_opcode_range: start={} end={} try_regions={}",
-            start, end, try_regions.len());
-    }
-
     let mut stmts = Vec::new();
     let mut op_idx = start;
 
     while op_idx < end {
         // Check if this opcode starts an exception region
         if let Some(region) = try_regions.iter().find(|r| r.trap_op == op_idx) {
-            if debug {
-                eprintln!("  Found exception region at op {}: trap_op={}, end_trap_op={}, handler_op={}",
-                    op_idx, region.trap_op, region.end_trap_op, region.handler_op);
-            }
-
             let try_catch = lower_exception_region(
                 region,
                 end,
@@ -928,9 +901,6 @@ fn lower_opcode_range(
 
             // Skip past the entire try-catch region (including catch body)
             op_idx = find_catch_end(region, end, try_regions);
-            if debug {
-                eprintln!("  After try-catch, op_idx={}", op_idx);
-            }
             continue;
         }
 
@@ -941,10 +911,6 @@ fn lower_opcode_range(
             // Lower this block's opcodes (from op_idx to block.end)
             // Only lower opcodes within our range
             let block_end = block.end.min(end - 1);
-
-            if debug {
-                eprintln!("  Lowering block opcodes {}..={} (block {:?})", op_idx, block_end, cfg_node);
-            }
 
             for block_op_idx in op_idx..=block_end {
                 // Skip if this starts a nested exception region
@@ -1008,17 +974,10 @@ fn lower_exception_region(
     all_try_regions: &[TryRegion],
     ctx: &mut LoweringContext<'_>,
 ) -> Statement {
-    let debug = std::env::var("HLBC_DEBUG_LOWER_EXC").is_ok();
-
     // Get variable name for exception register
     // Use raw names to prevent SSA versioning mismatches
     ctx.structurer.use_raw_name_regs.insert(region.exc_reg);
     let catch_var = ctx.structurer.reg_name(region.exc_reg).to_string();
-
-    if debug {
-        eprintln!("  lower_exception_region: try_body {}..{}, handler starts at {}",
-            region.trap_op + 1, region.end_trap_op, region.handler_op);
-    }
 
     // Try body: from trap+1 to end_trap (excluding EndTrap opcode)
     ctx.structurer.scope_depth += 1;
@@ -1032,10 +991,6 @@ fn lower_exception_region(
 
     // Catch body: from handler_op to catch_end
     let catch_end = find_catch_end(region, outer_end, all_try_regions);
-
-    if debug {
-        eprintln!("  Catch body: {}..{}", region.handler_op, catch_end);
-    }
 
     ctx.structurer.scope_depth += 1;
     let catch_stmts = lower_opcode_range(

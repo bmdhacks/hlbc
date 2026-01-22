@@ -169,16 +169,6 @@ impl<'a> PatternMatcher<'a> {
         let then_target = self.region_graph.cfg_owner(then_cfg_target)?;
         let else_target = self.region_graph.cfg_owner(else_cfg_target)?;
 
-        let is_debug = std::env::var("HLBC_DEBUG_PATTERN").is_ok();
-
-        if is_debug {
-            let block = &self.cfg.graph[cfg_node];
-            eprintln!("DEBUG match_if_pattern_region: region_node={:?}, cfg_node={:?}, ops {}..={}",
-                node, cfg_node, block.start, block.end);
-            eprintln!("  then_cfg_target={:?} -> region {:?}", then_cfg_target, then_target);
-            eprintln!("  else_cfg_target={:?} -> region {:?}", else_cfg_target, else_target);
-        }
-
         // Check termination using RegionGraph nodes
         let then_terminates = self.region_graph.get_node(then_target)
             .map_or(false, |n| n.terminates(self.cfg));
@@ -189,11 +179,6 @@ impl<'a> PatternMatcher<'a> {
         self.ensure_dominance();
         let dominators = self.region_dominators.as_ref().unwrap();
         let real_ipdom = dominators.ipdom(node);
-
-        if is_debug {
-            eprintln!("  then_terminates={}, else_terminates={}, ipdom={:?}",
-                then_terminates, else_terminates, real_ipdom);
-        }
 
         let (merge, is_one_branch_early_return) = match real_ipdom {
             Some(m) => (m, false),
@@ -221,11 +206,6 @@ impl<'a> PatternMatcher<'a> {
         // Collect nodes in each branch using REGION GRAPH TRAVERSAL
         let then_nodes = self.collect_branch_region(then_target, merge, node);
         let else_nodes = self.collect_branch_region(else_target, merge, node);
-
-        if is_debug {
-            eprintln!("  then_nodes={:?}, else_nodes={:?}, merge={:?}",
-                then_nodes, else_nodes, merge);
-        }
 
         // Handle collapsed targets
         let mut then_region_nodes = then_nodes.clone();
@@ -262,11 +242,6 @@ impl<'a> PatternMatcher<'a> {
         } else {
             None
         };
-
-        if is_debug {
-            eprintln!("  => pattern found: merge={:?}, then_nodes={:?}, else_nodes={:?}, then_exit_target={:?}",
-                merge, then_region_nodes, else_region_nodes, then_exit_target);
-        }
 
         Some(IfPattern {
             condition_node: node,
@@ -888,10 +863,6 @@ fn match_switch_pattern(
     // Exception edges would make a try { if/else } look like a switch
     let cfg_succs = cfg.successors_no_exceptions(cfg_node);
 
-    if std::env::var("HLBC_DEBUG_SWITCH").is_ok() {
-        eprintln!("DEBUG match_switch: node={:?} cfg={:?} succs={}", node, cfg_node, cfg_succs.len());
-    }
-
     if cfg_succs.len() < 3 {
         return None;
     }
@@ -906,9 +877,6 @@ fn match_switch_pattern(
     // For switches where all cases terminate (return), there's no merge point.
     // In that case, we still want to match the pattern.
     let merge_cfg = analysis.ipdom(cfg_node);
-    if std::env::var("HLBC_DEBUG_SWITCH").is_ok() {
-        eprintln!("DEBUG match_switch: ipdom={:?} is_switch_block={}", merge_cfg, is_switch_block);
-    }
 
     // If no merge point, check if we can still match
     let merge_cfg = match merge_cfg {
@@ -1117,13 +1085,6 @@ fn match_try_catch_pattern(
     try_region: &crate::exception_analysis::TryRegion,
     all_trap_cfg_nodes: &HashSet<NodeIndex>,
 ) -> Option<TryCatchPattern> {
-    let debug = std::env::var("HLBC_DEBUG_REDUCE").is_ok();
-
-    if debug {
-        eprintln!("DEBUG match_try_catch: trap_op={}, end_trap_op={}, handler_op={}, exc_reg={:?}",
-            try_region.trap_op, try_region.end_trap_op, try_region.handler_op, try_region.exc_reg);
-    }
-
     // Find the CFG node containing the Trap opcode
     let trap_cfg_node = cfg.op_to_block.get(&try_region.trap_op)?;
     let trap_region_node = region_graph.get_region_node(*trap_cfg_node)?;
@@ -1132,17 +1093,9 @@ fn match_try_catch_pattern(
     let handler_cfg_node = cfg.op_to_block.get(&try_region.handler_op)?;
     let handler_region_node = region_graph.get_region_node(*handler_cfg_node)?;
 
-    if debug {
-        eprintln!("  trap_cfg_node={:?} -> trap_region_node={:?}", trap_cfg_node, trap_region_node);
-        eprintln!("  handler_cfg_node={:?} -> handler_region_node={:?}", handler_cfg_node, handler_region_node);
-    }
-
     // If trap and handler are already in the same region node, this try-catch
     // has already been collapsed. Skip it to avoid infinite loops.
     if trap_region_node == handler_region_node {
-        if debug {
-            eprintln!("  SKIP: trap and handler already in same region node");
-        }
         return None;
     }
 
@@ -1162,13 +1115,6 @@ fn match_try_catch_pattern(
         && all_trap_cfg_nodes.contains(handler_cfg_node)
         && handler_cfg_node != trap_cfg_node;
 
-    if debug && handler_is_mixed {
-        eprintln!("  handler_cfg_node {:?} is MIXED (contains another Trap)", handler_cfg_node);
-    }
-    if debug && handler_is_collapsed {
-        eprintln!("  handler_region_node {:?} is COLLAPSED (not mixed)", handler_region_node);
-    }
-
     // Collect try body nodes: ALL opcodes from trap_op through end_trap_op (inclusive)
     // This includes:
     // - The trap block itself
@@ -1187,10 +1133,6 @@ fn match_try_catch_pattern(
         }
     }
 
-    if debug {
-        eprintln!("  try range: {}..={}", try_region.trap_op, try_region.end_trap_op);
-    }
-
     // Collect catch body nodes
     // If the handler node is mixed (contains another Trap), don't include it
     // in catch_nodes - the other try-catch will handle that code.
@@ -1199,9 +1141,6 @@ fn match_try_catch_pattern(
     // (sequential) try-catch (not nested), don't include it. A subsequent
     // try-catch starts AFTER this try's end_trap_op.
     let catch_nodes = if handler_is_mixed {
-        if debug {
-            eprintln!("  catch_nodes empty because handler is mixed");
-        }
         HashSet::new()
     } else if handler_is_collapsed {
         // Check if the collapsed region contains a subsequent try-catch
@@ -1228,9 +1167,6 @@ fn match_try_catch_pattern(
         });
 
         if handler_contains_subsequent_try {
-            if debug {
-                eprintln!("  catch_nodes empty because handler contains subsequent try-catch");
-            }
             HashSet::new()
         } else {
             let mut nodes = HashSet::new();
@@ -1242,11 +1178,6 @@ fn match_try_catch_pattern(
         nodes.insert(handler_region_node);
         nodes
     };
-
-    if debug {
-        eprintln!("  try_nodes={:?}", try_nodes);
-        eprintln!("  catch_nodes={:?}", catch_nodes);
-    }
 
     // Find the merge point: for now, use None and let subsequent reduction handle it
     // The actual merge point depends on where try and catch flows reconverge
