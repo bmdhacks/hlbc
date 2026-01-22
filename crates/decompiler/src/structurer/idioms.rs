@@ -347,6 +347,8 @@ impl<'a> Structurer<'a> {
     /// Try to extract a string comparison pattern from two register references.
     /// Returns Some((switch_arg, string_constant)) if reg_result was defined by
     /// string_compare(bytes, string_literal, len) and reg_zero was defined as 0.
+    /// Used by legacy structurer - to be implemented in new path for string switch support.
+    #[allow(dead_code)]
     pub(super) fn try_extract_string_compare_pattern(&self, reg_result: Reg, reg_zero: Reg) -> Option<(Expr, Expr)> {
         // Find SSA variables for these registers
         let result_var = self.find_ssa_use(reg_result)?;
@@ -393,6 +395,7 @@ impl<'a> Structurer<'a> {
     }
 
     /// Check if a function reference is for string_compare
+    #[allow(dead_code)]
     pub(super) fn is_string_compare_function(&self, fun: RefFun) -> bool {
         use hlbc::types::FunPtr;
         if let FunPtr::Native(native) = self.code.get(fun) {
@@ -407,6 +410,7 @@ impl<'a> Structurer<'a> {
 
     /// Find the string literal that was passed to string_compare.
     /// Searches backwards from call_idx to find the String opcode that defined bytes_reg.
+    #[allow(dead_code)]
     pub(super) fn find_string_literal_for_bytes(&self, bytes_reg: Reg, call_idx: usize) -> Option<RefString> {
         // Search backwards from the call to find where bytes_reg was defined
         for i in (0..call_idx).rev() {
@@ -451,6 +455,7 @@ impl<'a> Structurer<'a> {
     /// Also check if switch_reg was produced by EnumIndex opcode
     /// Returns (unwrapped_arg, optional_enum_type, optional_enum_value_reg)
     /// The enum_value_reg is the register holding the actual enum value (for pattern binding)
+    #[allow(dead_code)]
     pub(super) fn unwrap_enum_index_switch(
         &mut self,
         switch_arg: Expr,
@@ -519,6 +524,7 @@ impl<'a> Structurer<'a> {
 
     /// Scan opcodes in a case body to find which enum fields are accessed.
     /// Returns a set of (construct_idx, field_idx) pairs.
+    #[allow(dead_code)]
     pub(super) fn scan_enum_field_accesses(
         &self,
         enum_value_reg: Reg,
@@ -540,6 +546,7 @@ impl<'a> Structurer<'a> {
     }
 
     /// Try to get the enum type from an expression
+    #[allow(dead_code)]
     pub(super) fn get_enum_type_from_expr(&self, expr: &Expr) -> Option<RefType> {
         match expr {
             Expr::Variable(reg, _) => self.get_enum_type_for_reg(*reg),

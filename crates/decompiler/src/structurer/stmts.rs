@@ -180,6 +180,7 @@ impl<'a> Structurer<'a> {
     }
 
     /// Check if an SSA variable is dead (defined but never used)
+    #[allow(dead_code)]
     pub(super) fn is_dead_var(&self, var: crate::ssa::SsaVar) -> bool {
         self.use_info.get(&var).map_or(false, |info| info.is_dead())
     }
