@@ -1036,14 +1036,32 @@ impl<'a> Display for OperationDisplay<'a> {
                 }
                 Ok(())
             }
-            // Shift and bitwise always wrapped in parens (low precedence)
-            Shl(e1, e2) => write!(fmt, "({} << {})", disp(e1), disp(e2)),
-            Shr(e1, e2) => write!(fmt, "({} >> {})", disp(e1), disp(e2)),
-            And(e1, e2) => write!(fmt, "({} & {})", disp(e1), disp(e2)),
-            Or(e1, e2) => write!(fmt, "({} | {})", disp(e1), disp(e2)),
-            LogicalAnd(e1, e2) => write!(fmt, "({} && {})", disp(e1), disp(e2)),
-            LogicalOr(e1, e2) => write!(fmt, "({} || {})", disp(e1), disp(e2)),
-            Xor(e1, e2) => write!(fmt, "({} ^ {})", disp(e1), disp(e2)),
+            // Shift, bitwise, and logical operators - use precedence-aware parens
+            Shl(e1, e2) | Shr(e1, e2) | And(e1, e2) | Or(e1, e2) | Xor(e1, e2)
+            | LogicalAnd(e1, e2) | LogicalOr(e1, e2) => {
+                let op_str = match self.op {
+                    Shl(_, _) => "<<",
+                    Shr(_, _) => ">>",
+                    And(_, _) => "&",
+                    Or(_, _) => "|",
+                    Xor(_, _) => "^",
+                    LogicalAnd(_, _) => "&&",
+                    LogicalOr(_, _) => "||",
+                    _ => unreachable!(),
+                };
+                if needs_parens(e1, prec, false) {
+                    write!(fmt, "({})", disp(e1))?;
+                } else {
+                    write!(fmt, "{}", disp(e1))?;
+                }
+                write!(fmt, " {} ", op_str)?;
+                if needs_parens(e2, prec, true) {
+                    write!(fmt, "({})", disp(e2))?;
+                } else {
+                    write!(fmt, "{}", disp(e2))?;
+                }
+                Ok(())
+            }
             // Unary
             Neg(expr) => write!(fmt, "-{}", disp(expr)),
             Not(inner) => {

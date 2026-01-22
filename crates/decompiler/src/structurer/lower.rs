@@ -80,6 +80,12 @@ fn lower_region_inner(region: &Region, ctx: &mut LoweringContext<'_>) -> Vec<Sta
             exc_reg,
             merge,
         } => lower_try_catch(try_body, catch_body, *exc_reg, *merge, ctx),
+        Region::OrChain {
+            condition_blocks,
+            then_region,
+            continuation,
+            last_condition_inverted,
+        } => lower_or_chain(condition_blocks, then_region, *continuation, *last_condition_inverted, ctx),
         Region::Goto { target } => lower_goto(*target, ctx),
         Region::Empty => Vec::new(),
     }
@@ -783,6 +789,64 @@ fn lower_try_catch(
         catch_var,
         catch_stmts,
     }]
+}
+
+/// Lower an OR chain region to statements.
+///
+/// OR chains like `if (a || b || c || d) throw X` are converted to a single if statement
+/// with a compound OR condition.
+fn lower_or_chain(
+    condition_blocks: &[NodeIndex],
+    then_region: &Region,
+    _continuation: NodeIndex,
+    last_condition_inverted: bool,
+    ctx: &mut LoweringContext<'_>,
+) -> Vec<Statement> {
+    let mut stmts = Vec::new();
+
+    // Collect preamble statements and conditions from each condition block
+    let mut conditions: Vec<Expr> = Vec::new();
+    let num_conditions = condition_blocks.len();
+
+    for (i, &block_node) in condition_blocks.iter().enumerate() {
+        // Lower any preamble statements (before the conditional jump)
+        // This uses lower_block_opcodes which properly sets up SSA context
+        // and tracks inline expressions
+        let preamble = ctx.lower_block_opcodes(block_node);
+        stmts.extend(preamble);
+
+        // Extract condition from the terminating conditional jump
+        let mut cond = ctx.extract_condition(block_node);
+
+        // If this is the last condition and it's inverted, negate it
+        // (e.g., `JSGte` jumping to success means `!(x >= 0)` = `x < 0`)
+        if last_condition_inverted && i == num_conditions - 1 {
+            cond = not(cond);
+        }
+
+        conditions.push(cond);
+    }
+
+    // Build compound OR condition: cond0 || cond1 || cond2 || ...
+    let compound_cond = if conditions.is_empty() {
+        Expr::Constant(crate::ast::Constant::Bool(true))
+    } else {
+        conditions.into_iter().reduce(|acc, cond| {
+            Expr::Op(crate::ast::Operation::LogicalOr(Box::new(acc), Box::new(cond)))
+        }).unwrap()
+    };
+
+    // Lower the then region
+    let then_stmts = lower_region_inner(then_region, ctx);
+
+    // Create the if statement
+    stmts.push(Statement::IfElse {
+        cond: compound_cond,
+        if_: then_stmts,
+        else_: Vec::new(),
+    });
+
+    stmts
 }
 
 /// Lower a goto region to statements.

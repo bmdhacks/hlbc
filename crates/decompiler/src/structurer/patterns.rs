@@ -374,6 +374,38 @@ pub struct TryCatchPattern {
     pub merge: Option<NodeIndex>,
 }
 
+/// A detected OR chain pattern ready for collapse.
+///
+/// OR chains occur when multiple consecutive condition blocks all jump to the same
+/// "true" target while chaining their "false" targets. For example:
+/// `if (a || b || c || d) throw X;` compiles to:
+/// ```text
+/// Block 0: if a jump to THROW else Block 1
+/// Block 1: if b jump to THROW else Block 2
+/// Block 2: if c jump to THROW else Block 3
+/// Block 3: if !d jump to CONTINUE else THROW  (last condition is inverted)
+/// THROW: throw X
+/// CONTINUE: ...
+/// ```
+#[derive(Debug, Clone)]
+pub struct OrChainPattern {
+    /// All condition nodes in the chain (in order).
+    pub condition_nodes: Vec<NodeIndex>,
+
+    /// The shared "true" target (e.g., the throw block).
+    pub shared_target: NodeIndex,
+
+    /// The continuation after the OR chain (the "false" path of the last condition).
+    pub continuation: NodeIndex,
+
+    /// Whether the shared target terminates (throw/return).
+    pub shared_target_terminates: bool,
+
+    /// Whether the last condition is inverted (jumps to continuation on true).
+    /// When true, the last condition should be negated in the compound OR.
+    pub last_condition_inverted: bool,
+}
+
 /// Find loop patterns in the graph that can be collapsed.
 ///
 /// Uses the NaturalLoop information from the analyzer. We look for loops
@@ -831,6 +863,162 @@ fn identify_branches(succs: &[(NodeIndex, EdgeKind)]) -> Option<(NodeIndex, Node
     }
 }
 
+/// Find OR chain patterns in the graph.
+///
+/// OR chains occur when multiple consecutive condition blocks all share the same
+/// "true" target (e.g., a throw block) while chaining their "false" targets.
+///
+/// Pattern: `if (a || b || c) throw X;` compiles to:
+/// ```text
+/// Block 0: if a jump to THROW else Block 1
+/// Block 1: if b jump to THROW else Block 2
+/// Block 2: if c jump to THROW else CONTINUE
+/// THROW: throw X
+/// CONTINUE: ...
+/// ```
+///
+/// Returns patterns with the most condition nodes first (longest chains).
+pub fn find_or_chain_patterns(
+    region_graph: &RegionGraph,
+    cfg: &Cfg,
+    _analysis: &CfgAnalysis,
+) -> Vec<OrChainPattern> {
+    let mut patterns = Vec::new();
+    let mut used_nodes: HashSet<NodeIndex> = HashSet::new();
+
+    // Iterate through nodes looking for potential chain starts
+    for start_node in region_graph.node_indices() {
+        // Skip already-collapsed or already-used nodes
+        if region_graph.get_node(start_node).map_or(true, |n| n.is_collapsed()) {
+            continue;
+        }
+        if used_nodes.contains(&start_node) {
+            continue;
+        }
+
+        // Try to build an OR chain starting from this node
+        if let Some(pattern) = try_build_or_chain(region_graph, cfg, start_node, &used_nodes) {
+            // Only accept chains with 2+ conditions (otherwise regular if pattern handles it)
+            if pattern.condition_nodes.len() >= 2 {
+                // Mark all condition nodes as used
+                for &node in &pattern.condition_nodes {
+                    used_nodes.insert(node);
+                }
+                patterns.push(pattern);
+            }
+        }
+    }
+
+    // Sort by chain length (longest first) for priority
+    patterns.sort_by(|a, b| b.condition_nodes.len().cmp(&a.condition_nodes.len()));
+    patterns
+}
+
+/// Try to build an OR chain starting from a given node.
+fn try_build_or_chain(
+    region_graph: &RegionGraph,
+    cfg: &Cfg,
+    start_node: NodeIndex,
+    used_nodes: &HashSet<NodeIndex>,
+) -> Option<OrChainPattern> {
+    // Get the CFG node
+    let start_cfg_node = region_graph.get_node(start_node)?.as_block()?;
+
+    // Must have exactly 2 successors (conditional)
+    let succs = cfg.successors_with_edges(start_cfg_node);
+    if succs.len() != 2 {
+        return None;
+    }
+
+    // Identify true/false branches
+    let (true_target, false_target, _) = identify_branches(&succs)?;
+
+    // The true_target is our shared target candidate
+    let shared_target_cfg = true_target;
+
+    // Check if shared target terminates (throw/return) - this is typical for OR chains
+    let shared_target_terminates = cfg.graph.node_weight(shared_target_cfg)
+        .map(|block| block.is_exit)
+        .unwrap_or(false);
+
+    // Build the chain: follow false_targets as long as they share the same true_target
+    let mut condition_nodes = vec![start_node];
+    let mut current_false_target = false_target;
+    let mut last_condition_inverted = false;
+
+    loop {
+        // Get the region node for the current false target
+        let current_region_node = region_graph.get_region_node(current_false_target)?;
+
+        // Skip if already used or collapsed
+        if used_nodes.contains(&current_region_node) {
+            break;
+        }
+        if region_graph.get_node(current_region_node).map_or(true, |n| n.is_collapsed()) {
+            break;
+        }
+
+        // Check if this node continues the OR chain
+        let next_succs = cfg.successors_with_edges(current_false_target);
+        if next_succs.len() != 2 {
+            // Not a conditional - this is our continuation point
+            break;
+        }
+
+        let (next_true_target, next_false_target, _) = match identify_branches(&next_succs) {
+            Some(b) => b,
+            None => break,
+        };
+
+        // Check if this continues the chain (same shared target)
+        if next_true_target == shared_target_cfg {
+            // Same shared target - extend the chain
+            condition_nodes.push(current_region_node);
+            current_false_target = next_false_target;
+            last_condition_inverted = false;
+        } else {
+            // Different true target - chain ends here
+            // But check for the inverted last condition pattern:
+            // Last condition might be `if (x >= 0) jump to CONTINUE else THROW`
+            // which is `if !(x < 0)` - still part of the OR chain
+            if next_false_target == shared_target_cfg {
+                // The last condition is inverted - include it
+                condition_nodes.push(current_region_node);
+                current_false_target = next_true_target; // Continuation is true target
+                last_condition_inverted = true;
+            }
+            break;
+        }
+    }
+
+    // Need at least 2 conditions for an OR chain
+    if condition_nodes.len() < 2 {
+        return None;
+    }
+
+    // IMPORTANT: Only match OR chains where the shared target terminates (throw/return).
+    // This distinguishes OR chains (if (a || b) throw X) from AND chains (if (a && b) return X).
+    // AND chains have a similar CFG structure but their shared target is the "skip" path,
+    // not a terminating action.
+    if !shared_target_terminates {
+        return None;
+    }
+
+    // Get region node for shared target
+    let shared_target = region_graph.get_region_node(shared_target_cfg)?;
+
+    // Get region node for continuation
+    let continuation = region_graph.get_region_node(current_false_target)?;
+
+    Some(OrChainPattern {
+        condition_nodes,
+        shared_target,
+        continuation,
+        shared_target_terminates,
+        last_condition_inverted,
+    })
+}
+
 /// Find switch patterns in the graph.
 ///
 /// A switch pattern is detected when:
@@ -1216,6 +1404,7 @@ pub enum Pattern {
     If(IfPattern),
     Switch(SwitchPattern),
     TryCatch(TryCatchPattern),
+    OrChain(OrChainPattern),
 }
 
 impl Pattern {
@@ -1242,6 +1431,12 @@ impl Pattern {
                 nodes.extend(tcp.try_nodes.iter());
                 nodes.insert(tcp.handler_node);
                 nodes.extend(tcp.catch_nodes.iter());
+                nodes
+            }
+            Pattern::OrChain(ocp) => {
+                let mut nodes = HashSet::new();
+                nodes.extend(ocp.condition_nodes.iter().copied());
+                nodes.insert(ocp.shared_target);
                 nodes
             }
         }

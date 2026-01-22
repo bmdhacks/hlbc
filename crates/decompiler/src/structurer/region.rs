@@ -164,6 +164,23 @@ pub enum Region {
         merge: Option<NodeIndex>,
     },
 
+    /// An OR chain region: `if (a || b || c || d) { then }`
+    ///
+    /// This captures multiple consecutive condition blocks that all share the same
+    /// "true" target. During lowering, we extract conditions from each block and
+    /// build a compound OR expression.
+    OrChain {
+        /// CFG blocks containing the conditions (in order).
+        /// Each block ends with a conditional jump to the shared target.
+        condition_blocks: Vec<NodeIndex>,
+        /// The region executed when any condition is true.
+        then_region: Box<Region>,
+        /// Where control goes when all conditions are false.
+        continuation: NodeIndex,
+        /// Whether the last condition is inverted (needs negation in compound OR).
+        last_condition_inverted: bool,
+    },
+
     /// A goto to handle irreducible control flow.
     /// This is the fallback when proper structuring isn't possible.
     /// During lowering, this emits a labeled statement and goto.
@@ -193,6 +210,7 @@ impl Region {
                     .or_else(|| default.entry_node())
             }
             Region::TryCatch { try_body, .. } => try_body.entry_node(),
+            Region::OrChain { condition_blocks, .. } => condition_blocks.first().copied(),
             Region::Goto { target } => Some(*target),
             Region::Empty => None,
         }
@@ -210,6 +228,7 @@ impl Region {
             Region::TryCatch { merge, catch_body, .. } => {
                 merge.or_else(|| catch_body.exit_node())
             }
+            Region::OrChain { continuation, .. } => Some(*continuation),
             Region::Goto { target } => Some(*target),
             Region::Empty => None,
         }
@@ -259,6 +278,11 @@ impl Region {
             Region::TryCatch { try_body, catch_body, .. } => {
                 // Try-catch terminates if BOTH branches terminate
                 try_body.terminates(cfg) && catch_body.terminates(cfg)
+            }
+            Region::OrChain { then_region, .. } => {
+                // OR chain terminates if the then_region terminates (e.g., throw)
+                // and we know all conditions can be true
+                then_region.terminates(cfg)
             }
             Region::Goto { .. } => false,
             Region::Empty => false,
@@ -310,6 +334,10 @@ impl Region {
                 try_body.collect_nodes(nodes);
                 catch_body.collect_nodes(nodes);
             }
+            Region::OrChain { condition_blocks, then_region, .. } => {
+                nodes.extend(condition_blocks.iter().copied());
+                then_region.collect_nodes(nodes);
+            }
             Region::Goto { .. } | Region::Empty => {}
         }
     }
@@ -345,6 +373,9 @@ impl Region {
             }
             Region::TryCatch { try_body, catch_body, .. } => {
                 try_body.block_count() + catch_body.block_count()
+            }
+            Region::OrChain { condition_blocks, then_region, .. } => {
+                condition_blocks.len() + then_region.block_count()
             }
             Region::Goto { .. } | Region::Empty => 0,
         }

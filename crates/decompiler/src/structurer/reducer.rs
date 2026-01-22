@@ -21,8 +21,8 @@ use crate::ast::{Constant, Expr};
 use crate::exception_analysis::ExceptionAnalysis;
 use crate::lifter::Cfg;
 use crate::structurer::patterns::{
-    find_if_patterns, find_loop_patterns, find_switch_patterns,
-    IfPattern, LoopPattern, PatternContext, SwitchPattern,
+    find_if_patterns, find_loop_patterns, find_or_chain_patterns, find_switch_patterns,
+    IfPattern, LoopPattern, OrChainPattern, PatternContext, SwitchPattern,
 };
 use crate::structurer::region::{Region, SwitchCase};
 use crate::structurer::StringSwitchCfgMapping;
@@ -106,10 +106,12 @@ pub fn reduce_to_region_with_exceptions(
 ///
 /// Tries patterns in priority order:
 /// 0. Try-catch patterns (highest priority - exception edges confuse other patterns)
-/// 1. Innermost loops (smallest body first)
-/// 2. If-then-else patterns
-/// 3. Switch patterns
-/// 4. Linear sequences
+/// 1. OR chain patterns (multiple conditions sharing a target)
+/// 2. If-then-else patterns inside loops
+/// 3. Innermost loops (smallest body first)
+/// 4. Remaining if-then-else patterns
+/// 5. Switch patterns
+/// 6. Linear sequences
 ///
 /// Returns true if any reduction was made.
 fn reduce_one_step(
@@ -137,67 +139,74 @@ fn reduce_one_step(
     // - Or split CFG blocks at exception boundaries before pattern matching
     let _ = exception_analysis; // Silence unused warning
 
-    // Priority 1: Collapse if-then-else patterns that are INSIDE loops first
-    // This ensures nested if-else structures are reduced before their containing loops.
-    // Skip patterns whose condition is a loop header (those are loop conditions, not inner if-else).
-    // Also skip patterns with empty branches (no nodes to collapse beyond condition).
-    let if_patterns = find_if_patterns(graph, cfg, analysis);
-    if let Some(ip) = if_patterns
-        .into_iter()
-        .find(|p| {
-            // Skip if the condition node is a loop header
-            let is_loop_header = graph
-                .get_node(p.condition_node)
-                .and_then(|n| n.as_block())
-                .map(|cfg_node| loop_headers.contains(&cfg_node))
-                .unwrap_or(false);
-
-            // Skip if both branches are empty (collapsing would not reduce node count)
-            // Exception: early-return patterns have then_exit_target set even when then_nodes is empty
-            let has_branch_nodes = !p.then_nodes.is_empty() || !p.else_nodes.is_empty();
-            let is_early_return = p.then_exit_target.is_some();
-
-            !is_loop_header && (has_branch_nodes || is_early_return)
-        })
-    {
-        collapse_if(graph, cfg, &ip);
-        made_progress = true;
+    // Priority 1: OR chain patterns (e.g., `if (a || b || c) throw X`)
+    // These need to be detected BEFORE regular if patterns because each individual
+    // condition block in an OR chain can't be collapsed alone (the shared target
+    // isn't dominated by any single condition).
+    let or_chain_patterns = find_or_chain_patterns(graph, cfg, analysis);
+    if let Some(ocp) = or_chain_patterns.into_iter().next() {
+        made_progress = collapse_or_chain(graph, cfg, &ocp);
     } else {
-        // Priority 2: Collapse innermost loops
-        // This ensures nested loops are reduced from inside out
-        let loop_patterns = find_loop_patterns(graph, cfg, analysis, ctx);
-        // Try each loop pattern until one makes progress
-        let loop_progress = loop_patterns
+        // Priority 2: Collapse if-then-else patterns that are INSIDE loops first
+        // This ensures nested if-else structures are reduced before their containing loops.
+        // Skip patterns whose condition is a loop header (those are loop conditions, not inner if-else).
+        // Also skip patterns with empty branches (no nodes to collapse beyond condition).
+        let if_patterns = find_if_patterns(graph, cfg, analysis);
+        if let Some(ip) = if_patterns
             .into_iter()
-            .find_map(|lp| {
-                if collapse_loop(graph, cfg, &lp) {
-                    Some(true)
-                } else {
-                    None
-                }
-            });
-        if loop_progress.is_some() {
-            made_progress = true;
-        } else {
-            // Priority 3: Collapse remaining if-then-else patterns (including loop headers)
-            // Still skip patterns with empty branches (would not reduce node count)
-            // Exception: early-return patterns are valid even with empty then_nodes
-            let if_patterns = find_if_patterns(graph, cfg, analysis);
-            if let Some(ip) = if_patterns.into_iter().find(|p| {
-                !p.then_nodes.is_empty() || !p.else_nodes.is_empty() || p.then_exit_target.is_some()
+            .find(|p| {
+                // Skip if the condition node is a loop header
+                let is_loop_header = graph
+                    .get_node(p.condition_node)
+                    .and_then(|n| n.as_block())
+                    .map(|cfg_node| loop_headers.contains(&cfg_node))
+                    .unwrap_or(false);
+
+                // Skip if both branches are empty (collapsing would not reduce node count)
+                // Exception: early-return patterns have then_exit_target set even when then_nodes is empty
+                let has_branch_nodes = !p.then_nodes.is_empty() || !p.else_nodes.is_empty();
+                let is_early_return = p.then_exit_target.is_some();
+
+                !is_loop_header && (has_branch_nodes || is_early_return)
             })
-            {
-                collapse_if(graph, cfg, &ip);
+        {
+            made_progress = collapse_if(graph, cfg, &ip);
+        } else {
+            // Priority 3: Collapse innermost loops
+            // This ensures nested loops are reduced from inside out
+            let loop_patterns = find_loop_patterns(graph, cfg, analysis, ctx);
+            // Try each loop pattern until one makes progress
+            let loop_progress = loop_patterns
+                .into_iter()
+                .find_map(|lp| {
+                    if collapse_loop(graph, cfg, &lp) {
+                        Some(true)
+                    } else {
+                        None
+                    }
+                });
+            if loop_progress.is_some() {
                 made_progress = true;
             } else {
-                // Priority 4: Collapse switch patterns
-                let switch_patterns = find_switch_patterns(graph, cfg, analysis, ctx);
-                if let Some(sp) = switch_patterns.into_iter().next() {
-                    collapse_switch(graph, cfg, &sp, ctx);
-                    made_progress = true;
+                // Priority 4: Collapse remaining if-then-else patterns (including loop headers)
+                // Still skip patterns with empty branches (would not reduce node count)
+                // Exception: early-return patterns are valid even with empty then_nodes
+                let if_patterns = find_if_patterns(graph, cfg, analysis);
+                if let Some(ip) = if_patterns.into_iter().find(|p| {
+                    !p.then_nodes.is_empty() || !p.else_nodes.is_empty() || p.then_exit_target.is_some()
+                })
+                {
+                    made_progress = collapse_if(graph, cfg, &ip);
                 } else {
-                    // Priority 5: Collapse linear sequences
-                    made_progress = collapse_sequences(graph);
+                    // Priority 5: Collapse switch patterns
+                    let switch_patterns = find_switch_patterns(graph, cfg, analysis, ctx);
+                    if let Some(sp) = switch_patterns.into_iter().next() {
+                        collapse_switch(graph, cfg, &sp, ctx);
+                        made_progress = true;
+                    } else {
+                        // Priority 6: Collapse linear sequences
+                        made_progress = collapse_sequences(graph);
+                    }
                 }
             }
         }
@@ -294,7 +303,8 @@ fn collapse_loop(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &LoopPattern) -> 
 }
 
 /// Collapse an if-then-else pattern into a Region::IfThenElse node.
-fn collapse_if(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &IfPattern) {
+/// Returns true if progress was made (nodes were reduced).
+fn collapse_if(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &IfPattern) -> bool {
     // INVARIANT: then and else nodes should not overlap
     #[cfg(debug_assertions)]
     {
@@ -405,7 +415,60 @@ fn collapse_if(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &IfPattern) {
         );
     }
 
-    graph.collapse(&nodes_to_collapse, if_region);
+    // Only collapse if we have 2+ nodes (otherwise no net reduction)
+    if nodes_to_collapse.len() >= 2 {
+        graph.collapse(&nodes_to_collapse, if_region);
+        true
+    } else {
+        // Would not reduce node count - skip this collapse
+        false
+    }
+}
+
+/// Collapse an OR chain pattern into a Region::IfThenElse with compound condition.
+///
+/// OR chains like `if (a || b || c || d) throw X` compile to multiple condition blocks
+/// that all share the same true target. We collapse them into a single IfThenElse with
+/// the shared target as the then branch.
+///
+/// Returns true if progress was made (nodes were reduced).
+fn collapse_or_chain(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &OrChainPattern) -> bool {
+    // Build the then region from the shared target
+    let then_region = if let Some(node) = graph.get_node(pattern.shared_target) {
+        match node {
+            RegionNode::Block(cfg_idx) => Region::Block(*cfg_idx),
+            RegionNode::Collapsed(r) => r.clone(),
+        }
+    } else {
+        Region::Empty
+    };
+
+    // Build a special region that captures all the condition nodes for compound OR generation
+    // We encode this as a Sequence of the condition blocks, which will be processed during lowering
+    let condition_cfg_nodes: Vec<NodeIndex> = pattern.condition_nodes.iter()
+        .filter_map(|&node| graph.get_node(node).and_then(|n| n.as_block()))
+        .collect();
+
+    let if_region = Region::OrChain {
+        condition_blocks: condition_cfg_nodes,
+        then_region: Box::new(then_region),
+        continuation: pattern.continuation,
+        last_condition_inverted: pattern.last_condition_inverted,
+    };
+
+    // Collect all nodes to collapse: all condition nodes + shared target
+    let mut nodes_to_collapse = HashSet::new();
+    nodes_to_collapse.extend(pattern.condition_nodes.iter().copied());
+    nodes_to_collapse.insert(pattern.shared_target);
+    // Don't include continuation - that's where control goes after the OR chain
+
+    // Only collapse if we have 2+ nodes
+    if nodes_to_collapse.len() >= 2 {
+        graph.collapse(&nodes_to_collapse, if_region);
+        true
+    } else {
+        false
+    }
 }
 
 /// Collapse a switch pattern into a Region::Switch node.
