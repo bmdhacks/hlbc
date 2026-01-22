@@ -17,13 +17,14 @@ use petgraph::graph::NodeIndex;
 use std::collections::HashSet;
 
 use crate::analyzer::CfgAnalysis;
-use crate::ast::Expr;
+use crate::ast::{Constant, Expr};
 use crate::lifter::Cfg;
 use crate::structurer::patterns::{
     find_if_patterns, find_loop_patterns, find_switch_patterns, IfPattern, LoopPattern,
     PatternContext, SwitchPattern,
 };
 use crate::structurer::region::{Region, SwitchCase};
+use crate::structurer::StringSwitchCfgMapping;
 use hlbc::types::RefInt;
 use crate::structurer::region_graph::{RegionGraph, RegionNode};
 
@@ -38,13 +39,33 @@ const MAX_ITERATIONS: usize = 1000;
 /// the final Region tree.
 ///
 /// If `ctx` is provided, enables detection of higher-level patterns like for-in loops.
+/// If `string_switches` is provided, pre-collapses string switch patterns before the main loop.
 pub fn reduce_to_region(
     cfg: &Cfg,
     analysis: &CfgAnalysis,
     ctx: Option<&PatternContext<'_>>,
 ) -> Region {
+    reduce_to_region_with_string_switches(cfg, analysis, ctx, &[])
+}
+
+/// Reduce a CFG to a single Region, with support for pre-collapsing string switches.
+pub fn reduce_to_region_with_string_switches(
+    cfg: &Cfg,
+    analysis: &CfgAnalysis,
+    ctx: Option<&PatternContext<'_>>,
+    string_switches: &[StringSwitchCfgMapping],
+) -> Region {
     let mut graph = RegionGraph::from_cfg(cfg);
     let mut iterations = 0;
+
+    // Phase 0: Pre-collapse string switches before the main reduction loop
+    for ss in string_switches {
+        if std::env::var("HLBC_DEBUG_REDUCE").is_ok() {
+            eprintln!("DEBUG: Pre-collapsing string switch with {} cases, pattern_nodes={:?}",
+                ss.handler_nodes.len(), ss.pattern_nodes);
+        }
+        collapse_string_switch(&mut graph, cfg, ss);
+    }
 
     while !graph.is_fully_reduced() && iterations < MAX_ITERATIONS {
         iterations += 1;
@@ -530,6 +551,96 @@ fn collapse_switch(
     nodes_to_collapse.extend(pattern.body_nodes.iter().copied());
 
     if !nodes_to_collapse.is_empty() {
+        graph.collapse(&nodes_to_collapse, switch_region);
+    }
+}
+
+/// Collapse a string switch pattern into a Region::Switch node.
+///
+/// String switches are a special pattern in HashLink bytecode that uses
+/// multiple 9-opcode sequences to compare strings, rather than a single
+/// Switch opcode. This function collapses all the pattern-checking nodes
+/// AND handler nodes into a Switch region.
+fn collapse_string_switch(graph: &mut RegionGraph, _cfg: &Cfg, ss: &StringSwitchCfgMapping) {
+    // Get region nodes for pattern nodes
+    let pattern_region_nodes: HashSet<NodeIndex> = ss.pattern_nodes
+        .iter()
+        .filter_map(|&cfg_node| graph.get_region_node(cfg_node))
+        .collect();
+
+    if pattern_region_nodes.is_empty() {
+        return; // Nothing to collapse
+    }
+
+    // Build SwitchCase for each case (string literal -> handler region)
+    let cases: Vec<SwitchCase> = ss.handler_nodes
+        .iter()
+        .filter_map(|(string_ref, handler_cfg_node)| {
+            let handler_region_node = graph.get_region_node(*handler_cfg_node)?;
+            let body = match graph.get_node(handler_region_node) {
+                Some(RegionNode::Block(idx)) => Region::Block(*idx),
+                Some(RegionNode::Collapsed(r)) => r.clone(),
+                None => Region::Empty,
+            };
+            Some(SwitchCase {
+                patterns: vec![Constant::String(*string_ref)],
+                body,
+            })
+        })
+        .collect();
+
+    // Build the default case region
+    let default = if let Some(default_region_node) = graph.get_region_node(ss.default_node) {
+        match graph.get_node(default_region_node) {
+            Some(RegionNode::Block(idx)) => Region::Block(*idx),
+            Some(RegionNode::Collapsed(r)) => r.clone(),
+            None => Region::Empty,
+        }
+    } else {
+        Region::Empty
+    };
+
+    // Find merge point: the node that all handlers and default can reach
+    // For now, use the default node as the merge point (common for string switches)
+    let merge = ss.default_node;
+
+    // Find a selector block for variable name resolution during lowering.
+    // Use the first pattern node as context - it has access to the switch argument register.
+    let selector_block = ss.pattern_nodes.iter().min().copied();
+
+    // Build the Switch region
+    // Use the switch_arg_reg for the selector expression
+    let switch_region = Region::Switch {
+        selector: Expr::Variable(ss.switch_arg_reg, None),
+        selector_block,  // Use first pattern block for variable resolution
+        cases,
+        default: Box::new(default),
+        merge,
+    };
+
+    // Collect ALL nodes to collapse: pattern nodes + handler nodes + default node
+    // This ensures the handlers don't appear twice (once in switch, once as standalone blocks)
+    let mut nodes_to_collapse = pattern_region_nodes.clone();
+
+    // Add handler nodes to collapse set
+    for (_, handler_cfg_node) in &ss.handler_nodes {
+        if let Some(handler_region_node) = graph.get_region_node(*handler_cfg_node) {
+            nodes_to_collapse.insert(handler_region_node);
+        }
+    }
+
+    // Add default node to collapse set
+    if let Some(default_region_node) = graph.get_region_node(ss.default_node) {
+        nodes_to_collapse.insert(default_region_node);
+    }
+
+    // Collapse all nodes
+    if !nodes_to_collapse.is_empty() {
+        if std::env::var("HLBC_DEBUG_REDUCE").is_ok() {
+            eprintln!("DEBUG collapse_string_switch: collapsing {} total nodes ({} pattern + {} handler), {} cases",
+                nodes_to_collapse.len(), pattern_region_nodes.len(),
+                ss.handler_nodes.len() + 1, ss.handler_nodes.len());
+        }
         graph.collapse(&nodes_to_collapse, switch_region);
     }
 }

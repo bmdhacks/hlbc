@@ -35,7 +35,7 @@ use crate::exception_analysis::ExceptionAnalysis;
 // Re-exports for new reducer-based structuring (used by lib.rs)
 pub use lower::{lower_region, LoweringContext};
 pub use patterns::PatternContext;
-pub use reducer::reduce_to_region;
+pub use reducer::{reduce_to_region, reduce_to_region_with_string_switches};
 
 pub use stmts::simplify_statements; // external export
 
@@ -58,8 +58,7 @@ pub(crate) enum MemoryDep {
     AnyMemory,
 }
 
-/// A detected string switch case (used for string switch detection, to be implemented in new path)
-#[allow(dead_code)]
+/// A detected string switch case (used for string switch detection)
 #[derive(Debug, Clone)]
 pub(crate) struct StringSwitchCase {
     /// The string literal for this case
@@ -69,7 +68,6 @@ pub(crate) struct StringSwitchCase {
 }
 
 /// A detected string switch region in bytecode (used for string switch detection, to be implemented in new path)
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct StringSwitchRegion {
     /// First opcode of the switch (the first JNull)
@@ -82,6 +80,19 @@ pub(crate) struct StringSwitchRegion {
     pub(crate) cases: Vec<StringSwitchCase>,
     /// Opcode index of the default case handler
     pub(crate) default_op: usize,
+}
+
+/// CFG-level mapping for a string switch region
+#[derive(Debug, Clone)]
+pub struct StringSwitchCfgMapping {
+    /// CFG nodes that contain string switch pattern opcodes (the 9-opcode checks per case)
+    pub pattern_nodes: HashSet<NodeIndex>,
+    /// Case handlers: (string literal ref, handler CFG node)
+    pub handler_nodes: Vec<(RefString, NodeIndex)>,
+    /// Default case CFG node
+    pub default_node: NodeIndex,
+    /// Register holding the string being switched on
+    pub switch_arg_reg: Reg,
 }
 
 pub struct Structurer<'a> {
@@ -156,9 +167,12 @@ pub struct Structurer<'a> {
     /// Current SSA source variables (set when processing each opcode)
     /// Used for SSA-versioned naming of source operands
     pub(crate) current_ssa_uses: Vec<SsaVar>,
-    /// Detected string switch regions (from bytecode pattern analysis) - to be implemented in new path
-    #[allow(dead_code)]
+    /// Detected string switch regions (from bytecode pattern analysis)
     pub(crate) string_switches: Vec<StringSwitchRegion>,
+    /// CFG-level mappings for string switches
+    pub(crate) string_switch_cfg_mappings: Vec<StringSwitchCfgMapping>,
+    /// Opcodes that are part of string switch patterns (to suppress during block lowering)
+    pub(crate) string_switch_opcodes: HashSet<usize>,
     /// Current loop header (if any) - used to distinguish continue from switch fall-through
     pub(crate) current_loop_header: Option<NodeIndex>,
     /// Expressions available for inlining (SSA var -> (expression, memory dependency))
@@ -284,6 +298,8 @@ impl<'a> Structurer<'a> {
             current_ssa_dst: None,
             current_ssa_uses: Vec::new(),
             string_switches: Self::detect_string_switches(code, func),
+            string_switch_cfg_mappings: Vec::new(),  // Populated by build_string_switch_cfg_mappings after CFG is available
+            string_switch_opcodes: HashSet::new(),  // Populated by build_string_switch_cfg_mappings
             current_loop_header: None,
             inline_exprs: RefCell::new(HashMap::new()),
             suppressed_ops: HashSet::new(),
@@ -341,6 +357,56 @@ impl<'a> Structurer<'a> {
     pub(crate) fn compute_target(&self, op_idx: usize, offset: i32) -> Option<NodeIndex> {
         let target_idx = (op_idx as i64 + offset as i64 + 1) as usize;
         self.cfg.block_for_op(target_idx)
+    }
+
+    /// Build CFG-level mappings for detected string switch regions.
+    /// This converts opcode-based StringSwitchRegion to CFG node indices.
+    /// Must be called after Structurer has access to the CFG.
+    pub fn build_string_switch_cfg_mappings(&mut self) {
+        let mut mappings = Vec::new();
+        let mut all_pattern_opcodes = HashSet::new();
+
+        for ss in &self.string_switches {
+            if let Some(mapping) = self.map_string_switch_to_cfg(ss) {
+                // Collect all pattern opcodes for suppression
+                for op_idx in ss.start_op..=ss.end_op {
+                    all_pattern_opcodes.insert(op_idx);
+                }
+                mappings.push(mapping);
+            }
+        }
+
+        self.string_switch_cfg_mappings = mappings;
+        self.string_switch_opcodes = all_pattern_opcodes;
+    }
+
+    /// Map a single StringSwitchRegion to CFG nodes.
+    fn map_string_switch_to_cfg(&self, ss: &StringSwitchRegion) -> Option<StringSwitchCfgMapping> {
+        // Find all CFG nodes whose opcodes fall within the pattern range (start_op..=end_op)
+        let mut pattern_nodes = HashSet::new();
+        for op_idx in ss.start_op..=ss.end_op {
+            if let Some(&cfg_node) = self.cfg.op_to_block.get(&op_idx) {
+                pattern_nodes.insert(cfg_node);
+            }
+        }
+
+        // Map each case handler_op to its CFG node
+        let mut handler_nodes = Vec::new();
+        for case in &ss.cases {
+            if let Some(&handler_node) = self.cfg.op_to_block.get(&case.handler_op) {
+                handler_nodes.push((case.string_ref, handler_node));
+            }
+        }
+
+        // Map default_op to its CFG node
+        let default_node = self.cfg.op_to_block.get(&ss.default_op).copied()?;
+
+        Some(StringSwitchCfgMapping {
+            pattern_nodes,
+            handler_nodes,
+            default_node,
+            switch_arg_reg: ss.switch_arg_reg,
+        })
     }
 }
 

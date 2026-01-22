@@ -100,6 +100,11 @@ impl<'a> LoweringContext<'a> {
                 self.structurer.current_ssa_uses.clear();
             }
 
+            // Skip string switch pattern opcodes - they're handled by the Switch region
+            if self.structurer.string_switch_opcodes.contains(&op_idx) {
+                continue;
+            }
+
             // Skip control flow opcodes - they're implicit in the Region structure
             if self.structurer.is_control_flow_op(op_idx) {
                 continue;
@@ -667,8 +672,24 @@ fn lower_switch(
             // Build proper expression using reg_to_expr
             ctx.structurer.reg_to_expr(*reg)
         } else {
-            // Fallback to the stored selector if Switch opcode not found
-            selector.clone()
+            // No Switch opcode - this could be a string switch.
+            // Try to resolve the variable from the selector expression
+            match selector {
+                Expr::Variable(reg, _) => {
+                    // Set up SSA context for the block's first op for name resolution
+                    ctx.structurer.current_op = block.start;
+                    if let Some((ssa_dst, ssa_uses)) = ctx.structurer.ssa.get_instr_for_op(block.start) {
+                        ctx.structurer.current_ssa_dst = ssa_dst;
+                        ctx.structurer.current_ssa_uses = ssa_uses.clone();
+                    } else {
+                        ctx.structurer.current_ssa_dst = None;
+                        ctx.structurer.current_ssa_uses.clear();
+                    }
+                    // Resolve the variable name
+                    ctx.structurer.reg_to_expr(*reg)
+                }
+                _ => selector.clone()
+            }
         }
     } else {
         // No block info, use stored selector

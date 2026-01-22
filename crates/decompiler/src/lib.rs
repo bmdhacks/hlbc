@@ -192,7 +192,7 @@ pub fn decompile_code_with_options(
     use crate::ssa::SsaCfg;
     use crate::type_prop::TypePropagator;
     use crate::structurer::{
-        Structurer, PatternContext, reduce_to_region, LoweringContext, lower_region,
+        Structurer, PatternContext, reduce_to_region_with_string_switches, LoweringContext, lower_region,
         simplify_statements,
     };
 
@@ -226,6 +226,9 @@ pub fn decompile_code_with_options(
     // Run preprocessing for pattern suppression
     structurer.detect_internal_function_calls();
 
+    // Build string switch CFG mappings (must be done after CFG is available)
+    structurer.build_string_switch_cfg_mappings();
+
     // Use the new reducer path for all functions
     let pattern_ctx = PatternContext {
         code,
@@ -233,7 +236,10 @@ pub fn decompile_code_with_options(
         ssa: &ssa,
         type_info: &type_info,
     };
-    let region = reduce_to_region(&cfg, &analysis, Some(&pattern_ctx));
+
+    // Get string switch mappings for pre-collapse
+    let string_switch_mappings = &structurer.string_switch_cfg_mappings;
+    let region = reduce_to_region_with_string_switches(&cfg, &analysis, Some(&pattern_ctx), string_switch_mappings);
 
     // Lower the region tree to statements
     let mut lowering_ctx = LoweringContext::new(&mut structurer);
