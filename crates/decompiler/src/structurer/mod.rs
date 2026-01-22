@@ -11,6 +11,7 @@ pub mod lower;
 pub mod patterns;
 pub mod reducer;
 pub mod region;
+pub mod region_dominance;
 pub mod region_graph;
 pub mod sese;
 pub mod stmts;

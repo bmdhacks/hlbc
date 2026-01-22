@@ -108,6 +108,11 @@ pub enum Region {
         /// The merge point where control flow reconverges.
         /// This is the immediate post-dominator of the condition node.
         merge: NodeIndex,
+
+        /// Whether the condition should be negated during lowering.
+        /// Set to true when we swap empty-then with non-empty-else to produce
+        /// cleaner output: `if (c) {} else { body }` becomes `if (!c) { body }`.
+        negated: bool,
     },
 
     /// A loop region (while, do-while, for, or endless).
@@ -191,6 +196,52 @@ impl Region {
             Region::Switch { merge, .. } => Some(*merge),
             Region::Goto { target } => Some(*target),
             Region::Empty => None,
+        }
+    }
+
+    /// Check if this region terminates (no control flow exits to a merge point).
+    /// A region terminates if all paths through it end with a return/throw/etc.
+    pub fn terminates(&self, cfg: &crate::lifter::Cfg) -> bool {
+        match self {
+            Region::Block(node) => cfg.graph[*node].is_exit,
+            Region::Sequence(regions) => {
+                // A sequence terminates if its last region terminates
+                regions.last().map_or(false, |r| r.terminates(cfg))
+            }
+            Region::IfThenElse {
+                then_region,
+                else_region,
+                merge,
+                ..
+            } => {
+                // If-then-else terminates if BOTH branches terminate
+                let then_terminates = then_region.terminates(cfg);
+                let else_terminates = else_region
+                    .as_ref()
+                    .map_or(false, |r| r.terminates(cfg));
+                if then_terminates && else_terminates {
+                    return true;
+                }
+                // Also terminates if the then branch terminates and merge is an exit
+                // (for early-return patterns: if (cond) return; followed by exit merge)
+                if then_terminates && else_region.is_none() && cfg.graph[*merge].is_exit {
+                    return true;
+                }
+                false
+            }
+            Region::Loop { .. } => {
+                // Loops don't terminate by definition (they loop)
+                // Break/return inside a loop is handled at a lower level
+                false
+            }
+            Region::Switch { cases, default, .. } => {
+                // Switch terminates if ALL cases (including default) terminate
+                let all_cases_terminate = cases.iter().all(|c| c.body.terminates(cfg));
+                let default_terminates = default.terminates(cfg);
+                all_cases_terminate && default_terminates
+            }
+            Region::Goto { .. } => false,
+            Region::Empty => false,
         }
     }
 
@@ -300,6 +351,7 @@ impl Region {
             then_region: Box::new(then_region),
             else_region: else_region.map(Box::new),
             merge,
+            negated: false,
         }
     }
 

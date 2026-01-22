@@ -48,14 +48,66 @@ pub fn reduce_to_region(
 
     while !graph.is_fully_reduced() && iterations < MAX_ITERATIONS {
         iterations += 1;
+        let node_count_before = graph.node_count();
+
+        // Debug: show nodes BEFORE reduce_one_step when close to done
+        if std::env::var("HLBC_DEBUG_REDUCE").is_ok() && node_count_before <= 4 {
+            eprintln!("DEBUG main loop: nodes BEFORE reduce (count={})", node_count_before);
+            for idx in graph.node_indices() {
+                if let Some(node) = graph.get_node(idx) {
+                    let succs = graph.successors(idx);
+                    let preds = graph.predecessors(idx);
+                    let desc = match node {
+                        RegionNode::Block(cfg_idx) => format!("Block({:?})", cfg_idx),
+                        RegionNode::Collapsed(r) => {
+                            // Show a bit more detail about collapsed regions
+                            match r {
+                                Region::Block(b) => format!("Collapsed(Block({:?}))", b),
+                                Region::Sequence(s) => format!("Collapsed(Seq[{}])", s.len()),
+                                Region::IfThenElse { cond_block, merge, .. } => {
+                                    format!("Collapsed(If(cond={:?}, merge={:?}))", cond_block, merge)
+                                }
+                                _ => "Collapsed(other)".to_string(),
+                            }
+                        }
+                    };
+                    eprintln!("    {:?}: {} preds={:?} succs={:?}", idx, desc, preds, succs);
+                }
+            }
+        }
+
         let made_progress = reduce_one_step(&mut graph, cfg, analysis, ctx);
+        let node_count_after = graph.node_count();
+
+        if std::env::var("HLBC_DEBUG_REDUCE").is_ok() && node_count_before <= 5 {
+            eprintln!("DEBUG main loop: before={}, after={}, made_progress={}",
+                node_count_before, node_count_after, made_progress);
+        }
 
         if !made_progress {
             // No patterns found - try to make the graph reducible
             if graph.node_count() > 1 {
+                if std::env::var("HLBC_DEBUG_REDUCE").is_ok() {
+                    eprintln!("DEBUG: no progress, trying virtualize_edge. Remaining nodes:");
+                    for idx in graph.node_indices() {
+                        if let Some(node) = graph.get_node(idx) {
+                            eprintln!("  node {:?}: {:?}", idx, node);
+                        }
+                    }
+                }
                 virtualize_edge(&mut graph);
             } else {
                 break;
+            }
+        }
+    }
+
+    if std::env::var("HLBC_DEBUG_REDUCE").is_ok() {
+        eprintln!("DEBUG: reduction loop exited. iterations={}, node_count={}, is_fully_reduced={}",
+            iterations, graph.node_count(), graph.is_fully_reduced());
+        for idx in graph.node_indices() {
+            if let Some(node) = graph.get_node(idx) {
+                eprintln!("  final node {:?}: {:?}", idx, node);
             }
         }
     }
@@ -110,9 +162,11 @@ fn reduce_one_step(
                 .unwrap_or(false);
 
             // Skip if both branches are empty (collapsing would not reduce node count)
+            // Exception: early-return patterns have then_exit_target set even when then_nodes is empty
             let has_branch_nodes = !p.then_nodes.is_empty() || !p.else_nodes.is_empty();
+            let is_early_return = p.then_exit_target.is_some();
 
-            !is_loop_header && has_branch_nodes
+            !is_loop_header && (has_branch_nodes || is_early_return)
         })
     {
         collapse_if(graph, cfg, &ip);
@@ -136,10 +190,11 @@ fn reduce_one_step(
         } else {
             // Priority 3: Collapse remaining if-then-else patterns (including loop headers)
             // Still skip patterns with empty branches (would not reduce node count)
+            // Exception: early-return patterns are valid even with empty then_nodes
             let if_patterns = find_if_patterns(graph, cfg, analysis);
-            if let Some(ip) = if_patterns
-                .into_iter()
-                .find(|p| !p.then_nodes.is_empty() || !p.else_nodes.is_empty())
+            if let Some(ip) = if_patterns.into_iter().find(|p| {
+                !p.then_nodes.is_empty() || !p.else_nodes.is_empty() || p.then_exit_target.is_some()
+            })
             {
                 collapse_if(graph, cfg, &ip);
                 made_progress = true;
@@ -256,6 +311,10 @@ fn collapse_loop(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &LoopPattern) -> 
 
 /// Collapse an if-then-else pattern into a Region::IfThenElse node.
 fn collapse_if(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &IfPattern) {
+    if std::env::var("HLBC_DEBUG_COLLAPSE").is_ok() {
+        eprintln!("DEBUG collapse_if: cond={:?}, then={:?}, else={:?}, merge={:?}",
+            pattern.condition_node, pattern.then_nodes, pattern.else_nodes, pattern.merge);
+    }
     // INVARIANT: then and else nodes should not overlap
     #[cfg(debug_assertions)]
     {
@@ -283,14 +342,21 @@ fn collapse_if(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &IfPattern) {
     );
 
     // Build then branch region
-    let then_region = if pattern.then_nodes.is_empty() {
-        Region::Empty
+    let mut then_region = if pattern.then_nodes.is_empty() {
+        // For early-return patterns: if then_nodes is empty but we have an exit target,
+        // create a Block region pointing to the exit. This handles cases where the exit
+        // block is shared (not dominated) but we still need to emit the early return.
+        if let Some(exit_target) = pattern.then_exit_target {
+            Region::Block(exit_target)
+        } else {
+            Region::Empty
+        }
     } else {
         build_region_from_nodes(graph, &pattern.then_nodes, NodeIndex::new(0))
     };
 
     // Build else branch region (if present)
-    let else_region = if pattern.else_nodes.is_empty() {
+    let mut else_region = if pattern.else_nodes.is_empty() {
         None
     } else {
         Some(build_region_from_nodes(
@@ -299,6 +365,38 @@ fn collapse_if(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &IfPattern) {
             NodeIndex::new(0),
         ))
     };
+
+    // Normalize: if then is empty but else is not, swap them and negate the condition.
+    // This produces cleaner output: `if (c) {} else { body }` → `if (!c) { body }`
+    let negated = matches!(then_region, Region::Empty) && else_region.is_some();
+
+    // DEBUG: Log pattern info for debugging
+    if std::env::var("HLBC_DEBUG_COLLAPSE").is_ok() {
+        let cfg_block = if let Some(RegionNode::Block(cfg_idx)) = graph.get_node(pattern.condition_node) {
+            Some(*cfg_idx)
+        } else {
+            None
+        };
+        eprintln!(
+            "DEBUG collapse_if: cond={:?} (cfg={:?}), then_nodes={:?}, else_nodes={:?}, merge={:?}",
+            pattern.condition_node, cfg_block, pattern.then_nodes, pattern.else_nodes, pattern.merge
+        );
+        eprintln!("  then_region={:?}", then_region);
+        if let Some(ref er) = else_region {
+            eprintln!("  else_region={:?}", er);
+        }
+        eprintln!(
+            "  then_region is_empty={}, else_region is_some={}, negated={}",
+            matches!(then_region, Region::Empty),
+            else_region.is_some(),
+            negated
+        );
+    }
+    if negated {
+        // Swap: else becomes then, then (Empty) becomes else (None)
+        then_region = else_region.take().unwrap();
+        else_region = None;
+    }
 
     // Get the CFG node from the condition region node.
     // This is used during lowering to extract the actual condition and emit preamble.
@@ -319,6 +417,7 @@ fn collapse_if(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &IfPattern) {
         then_region: Box::new(then_region),
         else_region: else_region.map(Box::new),
         merge: pattern.merge,
+        negated,
     };
 
     // Collect all nodes to collapse (condition + branches)
@@ -327,6 +426,16 @@ fn collapse_if(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &IfPattern) {
     nodes_to_collapse.extend(pattern.then_nodes.iter().copied());
     nodes_to_collapse.extend(pattern.else_nodes.iter().copied());
     // Don't include merge - it's where control reconverges
+
+    if std::env::var("HLBC_DEBUG_COLLAPSE").is_ok() {
+        eprintln!("  nodes_to_collapse={:?}, merge={:?}", nodes_to_collapse, pattern.merge);
+        // Show edges of nodes being collapsed
+        for &n in &nodes_to_collapse {
+            let succs = graph.successors(n);
+            let preds = graph.predecessors(n);
+            eprintln!("    node {:?}: preds={:?}, succs={:?}", n, preds, succs);
+        }
+    }
 
     // INVARIANT: Must collapse at least the condition node
     debug_assert!(
@@ -457,6 +566,15 @@ fn virtualize_edge(graph: &mut RegionGraph) {
 
     // Collect node indices first to avoid borrow checker issues
     let nodes: Vec<_> = graph.node_indices().collect();
+
+    if std::env::var("HLBC_DEBUG_VIRT").is_ok() {
+        eprintln!("DEBUG virtualize_edge: {} nodes", nodes.len());
+        for &node in &nodes {
+            let preds = graph.predecessors(node);
+            let succs = graph.successors(node);
+            eprintln!("  node {:?}: preds={:?}, succs={:?}", node, preds, succs);
+        }
+    }
 
     for node in nodes {
         let preds = graph.predecessors(node);

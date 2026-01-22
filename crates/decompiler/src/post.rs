@@ -1,6 +1,6 @@
 use hlbc::{Bytecode, Str};
 
-use crate::ast::{add, not, Constant, ConstructorCall, Expr, Operation, Statement, Call};
+use crate::ast::{add, Constant, ConstructorCall, Expr, Operation, Statement, Call};
 
 /// Reconstruct array literals from alloc_bytes + SetMem + allocI32 patterns.
 ///
@@ -919,121 +919,6 @@ fn inline_single_use_vars_pass(stmts: &mut Vec<Statement>) -> bool {
     true
 }
 
-/// Merge forward declarations with their first assignment.
-///
-/// This pass finds patterns like:
-/// ```haxe
-/// var r5;
-/// var r6;
-/// // ... code that doesn't use r5 or r6 ...
-/// r5 = someValue;
-/// ```
-/// and transforms them to:
-/// ```haxe
-/// var r6;
-/// // ... code ...
-/// var r5 = someValue;
-/// ```
-///
-/// IMPORTANT: Only merges if the first assignment is at the TOP LEVEL (same scope as the VarDecl).
-/// Variables declared at function level but first assigned inside a nested scope (if/while/switch)
-/// must keep their forward declaration - that's exactly why they were hoisted.
-pub fn merge_declarations(stmts: &mut Vec<Statement>) {
-    // Collect all VarDecl names and their indices
-    let mut var_decls: Vec<(usize, String, Option<Str>)> = Vec::new(); // (idx, name, type_hint)
-
-    for (idx, stmt) in stmts.iter().enumerate() {
-        if let Statement::VarDecl { name, type_hint } = stmt {
-            var_decls.push((idx, name.to_string(), type_hint.clone()));
-        }
-    }
-
-    // For each VarDecl, try to find first assignment at top level
-    let mut to_merge: Vec<(usize, usize)> = Vec::new(); // (var_decl_idx, assign_idx)
-
-    for (decl_idx, var_name, _type_hint) in &var_decls {
-        // Look for first assignment to this variable AFTER the declaration
-        // Only consider top-level statements (not inside nested scopes)
-        let mut found_use_before_assign = false;
-
-        for (stmt_idx, stmt) in stmts.iter().enumerate().skip(*decl_idx + 1) {
-            match stmt {
-                // Found an assignment to this variable at top level
-                Statement::Assign { declaration: false, variable, .. } => {
-                    if let Some(name) = get_var_name(variable) {
-                        if &name == var_name {
-                            // Check if there were any uses before this assignment
-                            if !found_use_before_assign {
-                                to_merge.push((*decl_idx, stmt_idx));
-                            }
-                            break;
-                        }
-                    }
-                    // Check if this statement uses the variable
-                    if count_uses_in_stmt(stmt, var_name) > 0 {
-                        found_use_before_assign = true;
-                    }
-                }
-                // Any other statement - check for uses
-                _ => {
-                    if count_uses_in_stmt(stmt, var_name) > 0 {
-                        found_use_before_assign = true;
-                    }
-                }
-            }
-        }
-    }
-
-    // First pass: convert all assignments to declarations (doesn't change indices)
-    for (_decl_idx, assign_idx) in &to_merge {
-        if let Statement::Assign { variable, assign, .. } = &stmts[*assign_idx] {
-            // Create new statement with declaration: true
-            let new_stmt = Statement::Assign {
-                declaration: true,
-                variable: variable.clone(),
-                assign: assign.clone(),
-            };
-            stmts[*assign_idx] = new_stmt;
-        }
-    }
-
-    // Second pass: collect VarDecl indices to remove, sort descending, remove from back to front
-    let mut decl_indices: Vec<usize> = to_merge.iter().map(|(decl_idx, _)| *decl_idx).collect();
-    decl_indices.sort_by(|a, b| b.cmp(a));
-    decl_indices.dedup(); // In case same decl appears multiple times (shouldn't happen, but safe)
-
-    for decl_idx in decl_indices {
-        stmts.remove(decl_idx);
-    }
-
-    // Recurse into nested structures
-    for stmt in stmts.iter_mut() {
-        match stmt {
-            Statement::IfElse { if_, else_, .. } => {
-                merge_declarations(if_);
-                merge_declarations(else_);
-            }
-            Statement::While { stmts, .. } => {
-                merge_declarations(stmts);
-            }
-            Statement::Switch { default, cases, .. } => {
-                merge_declarations(default);
-                for (_, case_stmts) in cases {
-                    merge_declarations(case_stmts);
-                }
-            }
-            Statement::TryCatch { try_stmts, catch_stmts, .. } => {
-                merge_declarations(try_stmts);
-                merge_declarations(catch_stmts);
-            }
-            Statement::Block { stmts } | Statement::Sequence { stmts } => {
-                merge_declarations(stmts);
-            }
-            _ => {}
-        }
-    }
-}
-
 // Note: remove_unused_var_decls and collect_used_vars functions have been removed.
 // The structurer now uses SSA info to track which variables actually have assignments
 // emitted, and only emits VarDecls for those. This avoids the fragile approach of
@@ -1387,67 +1272,6 @@ pub fn flatten_early_returns(stmts: &mut Vec<Statement>) -> bool {
         }
 
         i += 1;
-    }
-
-    changed
-}
-
-/// Invert empty if bodies: `if (c) {} else { body }` → `if (!c) { body }`
-/// This produces cleaner output for guard-style conditionals.
-/// Returns true if any changes were made.
-pub fn invert_empty_ifs(stmts: &mut Vec<Statement>) -> bool {
-    let mut changed = false;
-
-    for stmt in stmts.iter_mut() {
-        match stmt {
-            Statement::IfElse { cond, if_, else_ } => {
-                // Recursively process nested statements first
-                if invert_empty_ifs(if_) {
-                    changed = true;
-                }
-                if invert_empty_ifs(else_) {
-                    changed = true;
-                }
-
-                // If the if-body is empty and else-body is not, invert
-                if if_.is_empty() && !else_.is_empty() {
-                    // Replace cond with its negation
-                    let old_cond = std::mem::replace(cond, Expr::Constant(Constant::Null));
-                    *cond = not(old_cond);
-                    std::mem::swap(if_, else_);
-                    changed = true;
-                }
-            }
-            Statement::While { stmts, .. } => {
-                if invert_empty_ifs(stmts) {
-                    changed = true;
-                }
-            }
-            Statement::Switch { default, cases, .. } => {
-                if invert_empty_ifs(default) {
-                    changed = true;
-                }
-                for (_, case_stmts) in cases.iter_mut() {
-                    if invert_empty_ifs(case_stmts) {
-                        changed = true;
-                    }
-                }
-            }
-            Statement::TryCatch { try_stmts, catch_stmts, .. } => {
-                if invert_empty_ifs(try_stmts) {
-                    changed = true;
-                }
-                if invert_empty_ifs(catch_stmts) {
-                    changed = true;
-                }
-            }
-            Statement::Block { stmts } | Statement::Sequence { stmts } => {
-                if invert_empty_ifs(stmts) {
-                    changed = true;
-                }
-            }
-            _ => {}
-        }
     }
 
     changed

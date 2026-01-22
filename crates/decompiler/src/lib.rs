@@ -289,9 +289,10 @@ pub fn decompile_code_with_options(
         let mut changed = false;
 
         // Invert empty if bodies: if (c) {} else { body } → if (!c) { body }
-        if post::invert_empty_ifs(&mut stmts) {
-            changed = true;
-        }
+        // DISABLED: Moving this logic into the structurer where we have branch polarity info.
+        // if post::invert_empty_ifs(&mut stmts) {
+        //     changed = true;
+        // }
 
         // Flatten early returns: if (x) { return; } else { body } → if (x) { return; } body
         if post::flatten_early_returns(&mut stmts) {
@@ -307,7 +308,12 @@ pub fn decompile_code_with_options(
     post::inline_single_use_vars(&mut stmts);
 
     // Pass 9: Merge forward declarations with first assignments
-    post::merge_declarations(&mut stmts);
+    // DISABLED: This pass incorrectly merges hoisted VarDecls with assignments that
+    // are at the wrong scope level (e.g., assignments that should be inside if blocks
+    // but ended up at top level due to region structuring issues). The hoisting in
+    // the structurer works correctly - this pass undoes it incorrectly.
+    // TODO: Move this logic into the structurer where scope information is available.
+    // post::merge_declarations(&mut stmts);
 
     // Pass 10: Inline constants that are immediately returned
     post::inline_constant_returns(&mut stmts);

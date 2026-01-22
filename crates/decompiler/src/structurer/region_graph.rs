@@ -38,6 +38,15 @@ impl RegionNode {
         matches!(self, RegionNode::Block(_))
     }
 
+    /// Check if this node represents a terminating structure.
+    /// For collapsed regions, checks if the region terminates (e.g., if-then-else where both branches return).
+    pub fn terminates(&self, cfg: &crate::lifter::Cfg) -> bool {
+        match self {
+            RegionNode::Block(cfg_node) => cfg.graph[*cfg_node].is_exit,
+            RegionNode::Collapsed(region) => region.terminates(cfg),
+        }
+    }
+
     /// Check if this is a collapsed region.
     pub fn is_collapsed(&self) -> bool {
         matches!(self, RegionNode::Collapsed(_))
@@ -77,6 +86,10 @@ pub struct RegionGraph {
 
     /// Reverse map: RegionGraph NodeIndex to set of original CFG nodes it contains.
     region_to_cfg: HashMap<NodeIndex, HashSet<NodeIndex>>,
+
+    /// Generation counter incremented on each collapse operation.
+    /// Used to detect when dominance needs recomputation.
+    generation: u64,
 }
 
 impl RegionGraph {
@@ -111,7 +124,32 @@ impl RegionGraph {
             entry,
             cfg_to_region,
             region_to_cfg,
+            generation: 0,
         }
+    }
+
+    /// Get the current generation counter.
+    /// This increments on each collapse operation, allowing external code
+    /// to detect when cached dominance data needs recomputation.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Check if a node exists in the current graph (membership firewall).
+    ///
+    /// Use this before traversing to a node to ensure it hasn't been removed
+    /// by a previous collapse operation.
+    pub fn contains(&self, node: NodeIndex) -> bool {
+        self.graph.node_weight(node).is_some()
+    }
+
+    /// Get the region node that owns a CFG block.
+    ///
+    /// This is the inverse of `as_block()` - given a CFG node index,
+    /// find which RegionGraph node currently represents it.
+    /// Returns None if the CFG node doesn't exist in the mapping.
+    pub fn cfg_owner(&self, cfg_node: NodeIndex) -> Option<NodeIndex> {
+        self.cfg_to_region.get(&cfg_node).copied()
     }
 
     /// Get the entry node.
@@ -348,6 +386,9 @@ impl RegionGraph {
             if let Some(&first_cfg) = src_cfg_nodes.iter().next() {
                 if let Some(&src_node) = self.cfg_to_region.get(&first_cfg) {
                     if src_node != new_node && !added_incoming.contains(&src_node) {
+                        if std::env::var("HLBC_DEBUG_COLLAPSE_EDGE").is_ok() {
+                            eprintln!("  COLLAPSE: adding incoming edge {:?} -> {:?} (kind={:?})", src_node, new_node, kind);
+                        }
                         self.graph.add_edge(src_node, new_node, kind);
                         added_incoming.insert(src_node);
                     }
@@ -360,6 +401,9 @@ impl RegionGraph {
             if let Some(&first_cfg) = dst_cfg_nodes.iter().next() {
                 if let Some(&dst_node) = self.cfg_to_region.get(&first_cfg) {
                     if dst_node != new_node && !added_outgoing.contains(&dst_node) {
+                        if std::env::var("HLBC_DEBUG_COLLAPSE_EDGE").is_ok() {
+                            eprintln!("  COLLAPSE: adding outgoing edge {:?} -> {:?} (kind={:?})", new_node, dst_node, kind);
+                        }
                         self.graph.add_edge(new_node, dst_node, kind);
                         added_outgoing.insert(dst_node);
                     }
@@ -398,6 +442,9 @@ impl RegionGraph {
                 );
             }
         }
+
+        // Increment generation to signal that cached data (like dominance) is stale
+        self.generation += 1;
 
         new_node
     }

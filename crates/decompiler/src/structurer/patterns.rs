@@ -20,8 +20,263 @@ use crate::analyzer::{CfgAnalysis, NaturalLoop};
 use crate::lifter::{Cfg, EdgeKind};
 use crate::ssa::{SsaCfg, SsaInstr, SsaVar};
 use crate::structurer::region::LoopKind;
+use crate::structurer::region_dominance::RegionDominators;
 use crate::structurer::region_graph::RegionGraph;
 use crate::type_prop::TypeInfo;
+
+/// Pattern matcher that uses RegionGraph as the single source of truth.
+///
+/// This struct provides methods for detecting control flow patterns while
+/// respecting collapsed regions as atomic, opaque units.
+///
+/// Key design principle: After a collapse, the RegionGraph is the source of
+/// truth for graph structure. Pattern matchers traverse the RegionGraph,
+/// not the original CFG, and use region-level dominance.
+pub struct PatternMatcher<'a> {
+    /// The current state of the region graph
+    region_graph: &'a RegionGraph,
+    /// The original CFG (for opcode lookups only, NOT for traversal)
+    cfg: &'a Cfg,
+    /// Original CFG analysis (for loop info only)
+    #[allow(dead_code)]
+    analysis: &'a CfgAnalysis,
+    /// Optional SSA/type context for advanced pattern detection
+    #[allow(dead_code)]
+    ctx: Option<&'a PatternContext<'a>>,
+    /// Cached dominance computed on RegionGraph
+    region_dominators: Option<RegionDominators>,
+}
+
+impl<'a> PatternMatcher<'a> {
+    /// Create a new pattern matcher.
+    pub fn new(
+        region_graph: &'a RegionGraph,
+        cfg: &'a Cfg,
+        analysis: &'a CfgAnalysis,
+        ctx: Option<&'a PatternContext<'a>>,
+    ) -> Self {
+        Self {
+            region_graph,
+            cfg,
+            analysis,
+            ctx,
+            region_dominators: None,
+        }
+    }
+
+    /// Ensure region dominance is computed and not stale.
+    fn ensure_dominance(&mut self) {
+        let needs_compute = self.region_dominators.as_ref()
+            .map_or(true, |d| d.is_stale(self.region_graph));
+        if needs_compute {
+            self.region_dominators = Some(RegionDominators::compute(self.region_graph));
+        }
+    }
+
+    /// Get the region dominators, computing if needed.
+    pub fn dominators(&mut self) -> &RegionDominators {
+        self.ensure_dominance();
+        self.region_dominators.as_ref().unwrap()
+    }
+
+    /// Collect nodes in a branch using RegionGraph traversal.
+    ///
+    /// This is the core fix for the pattern matching bug. Instead of traversing
+    /// the original CFG, we traverse the RegionGraph directly:
+    /// - Collapsed regions are atomic (we don't traverse INTO them)
+    /// - We use region-level dominance, not CFG dominance
+    /// - The membership firewall prevents traversing to removed nodes
+    ///
+    /// # Arguments
+    /// * `start` - The RegionGraph node where the branch starts
+    /// * `merge` - The merge point (stop traversal here)
+    /// * `condition` - The condition node (don't traverse back to it)
+    pub fn collect_branch_region(
+        &mut self,
+        start: NodeIndex,
+        merge: NodeIndex,
+        condition: NodeIndex,
+    ) -> HashSet<NodeIndex> {
+        self.ensure_dominance();
+        let dominators = self.region_dominators.as_ref().unwrap();
+
+        let mut nodes = HashSet::new();
+        let mut worklist = vec![start];
+        let mut visited = HashSet::new();
+
+        while let Some(node) = worklist.pop() {
+            // MEMBERSHIP FIREWALL: check node exists in current graph
+            if !self.region_graph.contains(node) {
+                continue;
+            }
+
+            if visited.contains(&node) || node == merge || node == condition {
+                continue;
+            }
+            visited.insert(node);
+
+            // Check dominance using region-level dominators
+            // The condition must dominate this node for it to be part of the branch
+            if !dominators.dominates(condition, node) {
+                continue;
+            }
+
+            // For non-terminating blocks, check post-dominance by merge.
+            // Terminating nodes (exits) don't need this check.
+            let is_terminating = self.region_graph.get_node(node)
+                .map_or(false, |n| n.terminates(self.cfg));
+            let is_dummy_merge = merge == condition;
+            let jumps_to_merge = self.region_graph.successors(node).contains(&merge);
+
+            if !is_terminating && !is_dummy_merge && !jumps_to_merge
+                && !dominators.post_dominates(merge, node)
+            {
+                continue;
+            }
+
+            nodes.insert(node);
+
+            // KEY CHANGE: Traverse REGION GRAPH successors (not CFG!)
+            // This respects collapsed regions as atomic units
+            for succ in self.region_graph.successors(node) {
+                if !visited.contains(&succ) {
+                    worklist.push(succ);
+                }
+            }
+        }
+
+        nodes
+    }
+
+    /// Match an if pattern at a given node using RegionGraph traversal.
+    ///
+    /// This is the region-aware version of `match_if_pattern`.
+    pub fn match_if_pattern_region(&mut self, node: NodeIndex) -> Option<IfPattern> {
+        // Get the corresponding CFG node (for opcode lookup only)
+        let cfg_node = self.region_graph.get_node(node)?.as_block()?;
+
+        // Must have exactly 2 successors in the CFG
+        let cfg_succs = self.cfg.successors_with_edges(cfg_node);
+        if cfg_succs.len() != 2 {
+            return None;
+        }
+
+        // Identify then and else branches
+        let (then_cfg_target, else_cfg_target, negated) = identify_branches(&cfg_succs)?;
+
+        // Map CFG targets to RegionGraph nodes
+        let then_target = self.region_graph.cfg_owner(then_cfg_target)?;
+        let else_target = self.region_graph.cfg_owner(else_cfg_target)?;
+
+        let is_debug = std::env::var("HLBC_DEBUG_PATTERN").is_ok();
+
+        if is_debug {
+            let block = &self.cfg.graph[cfg_node];
+            eprintln!("DEBUG match_if_pattern_region: region_node={:?}, cfg_node={:?}, ops {}..={}",
+                node, cfg_node, block.start, block.end);
+            eprintln!("  then_cfg_target={:?} -> region {:?}", then_cfg_target, then_target);
+            eprintln!("  else_cfg_target={:?} -> region {:?}", else_cfg_target, else_target);
+        }
+
+        // Check termination using RegionGraph nodes
+        let then_terminates = self.region_graph.get_node(then_target)
+            .map_or(false, |n| n.terminates(self.cfg));
+        let else_terminates = self.region_graph.get_node(else_target)
+            .map_or(false, |n| n.terminates(self.cfg));
+
+        // Find merge point using REGION-LEVEL post-dominance
+        self.ensure_dominance();
+        let dominators = self.region_dominators.as_ref().unwrap();
+        let real_ipdom = dominators.ipdom(node);
+
+        if is_debug {
+            eprintln!("  then_terminates={}, else_terminates={}, ipdom={:?}",
+                then_terminates, else_terminates, real_ipdom);
+        }
+
+        let (merge, is_one_branch_early_return) = match real_ipdom {
+            Some(m) => (m, false),
+            None => {
+                // No post-dominator - check for early-return pattern
+                if then_terminates && !else_terminates {
+                    (else_target, true)
+                } else if else_terminates && !then_terminates {
+                    (then_target, true)
+                } else if then_terminates && else_terminates {
+                    // Both branches terminate - use then_target as dummy merge
+                    (then_target, false)
+                } else {
+                    // Neither terminates and no post-dominator
+                    (then_target, false)
+                }
+            }
+        };
+
+        // Don't match if merge is one of the direct successors (trivial case)
+        if then_target == merge && else_target == merge {
+            return None;
+        }
+
+        // Collect nodes in each branch using REGION GRAPH TRAVERSAL
+        let then_nodes = self.collect_branch_region(then_target, merge, node);
+        let else_nodes = self.collect_branch_region(else_target, merge, node);
+
+        if is_debug {
+            eprintln!("  then_nodes={:?}, else_nodes={:?}, merge={:?}",
+                then_nodes, else_nodes, merge);
+        }
+
+        // Handle collapsed targets
+        let mut then_region_nodes = then_nodes.clone();
+        let mut else_region_nodes = else_nodes.clone();
+
+        // If a branch is empty but the target is a collapsed region, include it
+        if then_region_nodes.is_empty() {
+            if then_target != merge && self.region_graph.get_node(then_target)
+                .map_or(false, |n| n.is_collapsed())
+            {
+                then_region_nodes.insert(then_target);
+            }
+        }
+        if else_region_nodes.is_empty() {
+            if else_target != merge && self.region_graph.get_node(else_target)
+                .map_or(false, |n| n.is_collapsed())
+            {
+                else_region_nodes.insert(else_target);
+            }
+        }
+
+        // Filter out merge node from branches
+        then_region_nodes.remove(&merge);
+        else_region_nodes.remove(&merge);
+
+        let _both_branches_terminate = then_terminates && else_terminates && real_ipdom.is_none();
+
+        // For early-return patterns
+        let then_exit_target = if then_region_nodes.is_empty()
+            && then_terminates
+            && is_one_branch_early_return
+        {
+            Some(then_cfg_target)
+        } else {
+            None
+        };
+
+        if is_debug {
+            eprintln!("  => pattern found: merge={:?}, then_nodes={:?}, else_nodes={:?}, then_exit_target={:?}",
+                merge, then_region_nodes, else_region_nodes, then_exit_target);
+        }
+
+        Some(IfPattern {
+            condition_node: node,
+            then_nodes: then_region_nodes,
+            else_nodes: else_region_nodes,
+            merge,
+            negated,
+            then_exit_target,
+        })
+    }
+}
 
 /// Context for pattern matching with access to SSA and type information.
 /// This allows pattern matchers to look at the SSA definitions to detect
@@ -72,6 +327,12 @@ pub struct IfPattern {
 
     /// Whether this is a negated condition (jump-on-true vs jump-on-false).
     pub negated: bool,
+
+    /// For early-return patterns: the exit node that the then branch jumps to.
+    /// This is set when then_nodes is empty but then_target is an exit block
+    /// (not dominated by condition due to being a shared exit).
+    /// The collapse logic can use this to generate: if (cond) { goto exit; }
+    pub then_exit_target: Option<NodeIndex>,
 }
 
 /// A detected switch pattern ready for collapse.
@@ -504,11 +765,17 @@ fn is_next_call(op: &Opcode, uses: &[SsaVar], iterator_reg: Reg, ctx: &PatternCo
 /// 1. A node has exactly 2 successors (conditional branch)
 /// 2. The node has an immediate post-dominator (merge point)
 /// 3. All nodes between condition and merge are part of the if structure
+///
+/// This function now uses `PatternMatcher` internally which provides:
+/// - RegionGraph-based traversal (not original CFG)
+/// - Region-level dominance (recomputed after collapses)
+/// - Membership firewall to prevent stale node access
 pub fn find_if_patterns(
     region_graph: &RegionGraph,
     cfg: &Cfg,
     analysis: &CfgAnalysis,
 ) -> Vec<IfPattern> {
+    let mut matcher = PatternMatcher::new(region_graph, cfg, analysis, None);
     let mut patterns = Vec::new();
 
     // Process nodes in reverse post-order (visits outer nodes first)
@@ -520,7 +787,8 @@ pub fn find_if_patterns(
             continue;
         }
 
-        if let Some(pattern) = match_if_pattern(region_graph, cfg, analysis, node) {
+        // Use the new region-aware pattern matching
+        if let Some(pattern) = matcher.match_if_pattern_region(node) {
             patterns.push(pattern);
         }
     }
@@ -529,186 +797,6 @@ pub fn find_if_patterns(
     // chains are collapsed from the inside out
     patterns.reverse();
     patterns
-}
-
-/// Try to match a single node as the start of an if pattern.
-fn match_if_pattern(
-    region_graph: &RegionGraph,
-    cfg: &Cfg,
-    analysis: &CfgAnalysis,
-    node: NodeIndex,
-) -> Option<IfPattern> {
-    // Get the corresponding CFG node
-    let cfg_node = region_graph.get_node(node)?.as_block()?;
-
-    // Must have exactly 2 successors in the CFG
-    let cfg_succs = cfg.successors_with_edges(cfg_node);
-    if cfg_succs.len() != 2 {
-        return None;
-    }
-
-    // Identify then and else branches
-    let (then_target, else_target, negated) = identify_branches(&cfg_succs)?;
-
-    // Find merge point (immediate post-dominator)
-    // If no post-dominator exists, try to handle early-return patterns
-    let real_ipdom = analysis.ipdom(cfg_node);
-    let then_terminates = cfg.graph[then_target].is_exit;
-    let else_terminates = cfg.graph[else_target].is_exit;
-
-    let (merge_cfg, is_one_branch_early_return) = match real_ipdom {
-        Some(m) => (m, false),
-        None => {
-            // No post-dominator - check for early-return pattern.
-            // Pattern: if (cond) return x; ...continuation...
-            // In this case, one branch terminates and the other is the continuation.
-
-            if then_terminates && !else_terminates {
-                // Then branch returns, else branch continues.
-                // The "merge" is the else target (the continuation).
-                (else_target, true)
-            } else if else_terminates && !then_terminates {
-                // Else branch returns, then branch continues.
-                (then_target, true)
-            } else if then_terminates && else_terminates {
-                // Both branches terminate (both return).
-                // Use then_target as a dummy merge since there's no actual merge point.
-                // The branches will be collected as terminating blocks.
-                // Note: is_one_branch_early_return is false here because we don't
-                // want the special early-return insertion logic to run.
-                (then_target, false)
-            } else {
-                // Neither terminates and no post-dominator - can't match.
-                return None;
-            }
-        }
-    };
-
-    // Track if both branches terminate (no real merge exists)
-    let both_branches_terminate = then_terminates && else_terminates && real_ipdom.is_none();
-
-    // Don't match if merge is one of the direct successors (trivial case)
-    // These are handled by sequence collapsing
-    if cfg_succs.iter().all(|(s, _)| *s == merge_cfg) {
-        return None;
-    }
-
-    // Collect nodes in each branch
-    let then_nodes = collect_branch_nodes(cfg, analysis, then_target, merge_cfg, cfg_node);
-    let else_nodes = collect_branch_nodes(cfg, analysis, else_target, merge_cfg, cfg_node);
-
-    // For early-return patterns where ONE branch terminates and the other
-    // continues, the continuing branch becomes the "merge". If that continuing
-    // branch (which is now merge_cfg) is also an exit block, we need to include
-    // it. This does NOT apply when both branches terminate - in that case, we
-    // use a dummy merge and shouldn't insert anything.
-    let then_nodes = if is_one_branch_early_return
-        && then_target == merge_cfg
-        && then_terminates
-    {
-        let mut nodes = then_nodes;
-        nodes.insert(then_target);
-        nodes
-    } else {
-        then_nodes
-    };
-
-    let else_nodes = if is_one_branch_early_return
-        && else_target == merge_cfg
-        && else_terminates
-    {
-        let mut nodes = else_nodes;
-        nodes.insert(else_target);
-        nodes
-    } else {
-        else_nodes
-    };
-
-    // When both branches terminate, we need to explicitly include them
-    // since collect_branch_nodes would skip the dummy merge (which is then_target).
-    // In this case:
-    // - then_nodes is empty because then_target == merge_cfg (the dummy merge)
-    // - else_nodes has else_target (since it's a different node)
-    // We add then_target to then_nodes so the then branch gets included.
-    // The collapse logic handles the case where merge is in a branch set.
-    let then_nodes = if both_branches_terminate && then_nodes.is_empty() {
-        let mut nodes = then_nodes;
-        nodes.insert(then_target);
-        nodes
-    } else {
-        then_nodes
-    };
-
-    let else_nodes = if both_branches_terminate && else_nodes.is_empty() {
-        let mut nodes = else_nodes;
-        nodes.insert(else_target);
-        nodes
-    } else {
-        else_nodes
-    };
-
-    // Convert to region graph nodes
-    let then_region_nodes: HashSet<_> = then_nodes
-        .iter()
-        .filter_map(|&n| region_graph.get_region_node(n))
-        .collect();
-
-    let else_region_nodes: HashSet<_> = else_nodes
-        .iter()
-        .filter_map(|&n| region_graph.get_region_node(n))
-        .collect();
-
-    // Get merge point in region graph
-    let merge = region_graph.get_region_node(merge_cfg)?;
-
-    // INVARIANT: The condition node should not appear in either branch
-    debug_assert!(
-        !then_region_nodes.contains(&node),
-        "match_if_pattern: condition node {:?} found in then_region_nodes",
-        node
-    );
-    debug_assert!(
-        !else_region_nodes.contains(&node),
-        "match_if_pattern: condition node {:?} found in else_region_nodes",
-        node
-    );
-
-    // INVARIANT: then and else should not overlap
-    #[cfg(debug_assertions)]
-    {
-        let overlap: HashSet<_> = then_region_nodes
-            .intersection(&else_region_nodes)
-            .collect();
-        debug_assert!(
-            overlap.is_empty(),
-            "match_if_pattern: then and else branches overlap at {:?}",
-            overlap
-        );
-    }
-
-    // INVARIANT: merge node should not be in either branch
-    // Exception: when both branches terminate, merge is a dummy and one branch
-    // will contain the dummy merge (which is actually that branch's exit block)
-    if !both_branches_terminate {
-        debug_assert!(
-            !then_region_nodes.contains(&merge),
-            "match_if_pattern: merge node {:?} found in then_region_nodes",
-            merge
-        );
-        debug_assert!(
-            !else_region_nodes.contains(&merge),
-            "match_if_pattern: merge node {:?} found in else_region_nodes",
-            merge
-        );
-    }
-
-    Some(IfPattern {
-        condition_node: node,
-        then_nodes: then_region_nodes,
-        else_nodes: else_region_nodes,
-        merge,
-        negated,
-    })
 }
 
 /// Identify which successor is the then branch and which is else.
@@ -732,52 +820,6 @@ fn identify_branches(succs: &[(NodeIndex, EdgeKind)]) -> Option<(NodeIndex, Node
         }
         _ => None,
     }
-}
-
-/// Collect all nodes in a branch between start and merge.
-fn collect_branch_nodes(
-    cfg: &Cfg,
-    analysis: &CfgAnalysis,
-    start: NodeIndex,
-    merge: NodeIndex,
-    condition: NodeIndex,
-) -> HashSet<NodeIndex> {
-    let mut nodes = HashSet::new();
-    let mut worklist = vec![start];
-    let mut visited = HashSet::new();
-
-    while let Some(node) = worklist.pop() {
-        if visited.contains(&node) || node == merge || node == condition {
-            continue;
-        }
-        visited.insert(node);
-
-        // Check this node is dominated by condition
-        if !analysis.dominates(condition, node) {
-            continue;
-        }
-
-        // For non-terminating blocks, check post-dominance by merge.
-        // For terminating blocks (exit nodes like return/throw), they don't reach
-        // the merge so post-dominance doesn't apply - include them anyway.
-        // When merge == condition, this is a "dummy merge" for switches where all
-        // cases terminate - skip post-dominance check since there's no real merge.
-        let is_exit = cfg.graph[node].is_exit;
-        let is_dummy_merge = merge == condition;
-        if !is_exit && !is_dummy_merge && !analysis.post_dominates(merge, node) {
-            continue;
-        }
-
-        nodes.insert(node);
-
-        for succ in cfg.successors(node) {
-            if !visited.contains(&succ) {
-                worklist.push(succ);
-            }
-        }
-    }
-
-    nodes
 }
 
 /// Find switch patterns in the graph.
@@ -878,9 +920,9 @@ fn match_switch_pattern(
             }
         }
 
-        // Collect all nodes in this case branch
-        let branch_nodes = collect_branch_nodes(cfg, analysis, target, merge_cfg, cfg_node);
-        body_nodes.extend(branch_nodes);
+        // For switch patterns, just add the direct target - switch body nodes are
+        // simpler to collect since switches are typically detected early
+        body_nodes.insert(target);
     }
 
     // Convert to region graph indices

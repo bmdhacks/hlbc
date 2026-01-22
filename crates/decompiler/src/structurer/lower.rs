@@ -37,7 +37,8 @@ pub fn lower_region(region: &Region, ctx: &mut LoweringContext<'_>) -> Vec<State
             then_region,
             else_region,
             merge,
-        } => lower_if_then_else(cond, *cond_block, then_region, else_region.as_deref(), *merge, ctx),
+            negated,
+        } => lower_if_then_else(cond, *cond_block, then_region, else_region.as_deref(), *merge, *negated, ctx),
         Region::Loop {
             kind,
             header,
@@ -80,6 +81,13 @@ impl<'a> LoweringContext<'a> {
         let block = &self.structurer.cfg.graph[node];
         let mut stmts = Vec::new();
 
+        if std::env::var("HLBC_DEBUG_LOWER").is_ok() {
+            eprintln!("DEBUG lower_block_opcodes: node={:?}, ops {}..={}", node, block.start, block.end);
+            for op_idx in block.start..=block.end {
+                eprintln!("  op {}: {:?}", op_idx, self.structurer.func.ops[op_idx]);
+            }
+        }
+
         for op_idx in block.start..=block.end {
             self.structurer.current_op = op_idx;
 
@@ -117,6 +125,10 @@ impl<'a> LoweringContext<'a> {
         stmts
     }
 
+    /// Extract the condition expression from a conditional block.
+    ///
+    /// Looks at the block's terminating jump instruction and builds
+    /// the appropriate condition expression.
     /// Extract the condition expression from a conditional block.
     ///
     /// Looks at the block's terminating jump instruction and builds
@@ -288,7 +300,75 @@ fn lower_sequence(regions: &[Region], ctx: &mut LoweringContext<'_>) -> Vec<Stat
     for region in regions {
         stmts.extend(lower_region(region, ctx));
     }
+
+    // Check if we need to emit a fallthrough for the last element's merge.
+    // This handles the case where multiple if-then-else patterns share an exit block:
+    // - The exit block might be emitted INSIDE one pattern's then_region
+    // - But when other patterns' conditions fail, they should fall through to that exit
+    // - If the last pattern's merge is an exit block, emit it as a fallthrough
+    if let Some(last) = regions.last() {
+        if let Some(merge_block) = find_innermost_exit_merge(last, ctx) {
+            // Check if this merge block is already emitted as a standalone Block in the sequence
+            let already_standalone = regions.iter().any(|r| {
+                matches!(r, Region::Block(b) if *b == merge_block)
+            });
+
+            if !already_standalone {
+                // Check if the last statement already returns (avoid double return)
+                let last_stmt_returns = stmts.last().map_or(false, |s| {
+                    matches!(s, Statement::Return(_))
+                });
+
+                if !last_stmt_returns {
+                    // Emit the merge block as a fallthrough
+                    let merge_stmts = lower_block(merge_block, ctx);
+                    stmts.extend(merge_stmts);
+                }
+            }
+        }
+    }
+
     stmts
+}
+
+/// Find the innermost merge point of an IfThenElse that's an exit block.
+/// Returns None if no such merge exists.
+fn find_innermost_exit_merge(region: &Region, ctx: &LoweringContext<'_>) -> Option<NodeIndex> {
+    match region {
+        Region::IfThenElse {
+            then_region,
+            else_region,
+            merge,
+            ..
+        } => {
+            // Check if the then_region has a deeper exit merge
+            if let Some(inner) = find_innermost_exit_merge(then_region, ctx) {
+                return Some(inner);
+            }
+            // Check if the else_region has a deeper exit merge
+            if let Some(else_r) = else_region {
+                if let Some(inner) = find_innermost_exit_merge(else_r, ctx) {
+                    return Some(inner);
+                }
+            }
+            // Check if this merge is an exit block
+            let is_exit = ctx.structurer.cfg.graph[*merge].is_exit;
+            if is_exit && else_region.is_none() {
+                // Only return merge if there's no else (meaning control can fall through to merge)
+                // and the then_region terminates (so we don't unreachably emit the merge)
+                let then_terminates = then_region.terminates(&ctx.structurer.cfg);
+                if then_terminates {
+                    return Some(*merge);
+                }
+            }
+            None
+        }
+        Region::Sequence(regions) => {
+            // Check the last element of the sequence
+            regions.last().and_then(|r| find_innermost_exit_merge(r, ctx))
+        }
+        _ => None,
+    }
 }
 
 /// Lower an if-then-else region to statements.
@@ -297,7 +377,8 @@ fn lower_if_then_else(
     cond_block: Option<NodeIndex>,
     then_region: &Region,
     else_region: Option<&Region>,
-    _merge: NodeIndex,
+    merge: NodeIndex,
+    negated: bool,
     ctx: &mut LoweringContext<'_>,
 ) -> Vec<Statement> {
     // INVARIANT: cond_block should be present for well-formed if-then-else regions
@@ -306,24 +387,38 @@ fn lower_if_then_else(
         "lower_if_then_else: cond_block is None, cannot extract condition"
     );
 
+    if std::env::var("HLBC_DEBUG_LOWER").is_ok() {
+        eprintln!("DEBUG lower_if_then_else: cond_block={:?}, merge={:?}, negated={}",
+            cond_block, merge, negated);
+    }
+
     let mut stmts = Vec::new();
 
     // Lower the condition block's preamble (non-control-flow opcodes) first.
     // This ensures any setup code runs before the if-statement.
     if let Some(block) = cond_block {
         let preamble = ctx.lower_block_opcodes(block);
+        if std::env::var("HLBC_DEBUG_LOWER").is_ok() && !preamble.is_empty() {
+            eprintln!("  preamble has {} statements", preamble.len());
+        }
         stmts.extend(preamble);
     }
 
     // Extract the actual condition from the block's terminating conditional jump.
     // This replaces the placeholder condition from the Region.
-    let actual_cond = if let Some(block) = cond_block {
+    let mut actual_cond = if let Some(block) = cond_block {
         ctx.extract_condition(block)
     } else {
         // No condition block - should not happen in well-formed regions,
         // but fall back to true if it does.
         Expr::Constant(Constant::Bool(true))
     };
+
+    // If the branches were swapped during structuring (empty-then normalization),
+    // negate the condition to maintain correct semantics.
+    if negated {
+        actual_cond = Expr::Op(Operation::Not(Box::new(actual_cond)));
+    }
 
     // Lower branches with increased scope depth
     ctx.structurer.scope_depth += 1;
