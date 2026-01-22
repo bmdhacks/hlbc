@@ -6,7 +6,6 @@ members = [
     "crates/cli",
     # "crates/gui",  # Temporarily disabled - missing egui_ui_refresh
     "crates/indexing",
-    "crates/hl-analyze",
     "crates/hl-substitute"
 ]
 resolver = "2"

@@ -1097,7 +1097,7 @@ mod tests {
         let mut iterations = 0;
 
         while made_progress && !graph.is_fully_reduced() && iterations < 100 {
-            made_progress = reduce_one_step(&mut graph, &cfg, &analysis, None);
+            made_progress = reduce_one_step(&mut graph, &cfg, &analysis, None, None);
             iterations += 1;
         }
 

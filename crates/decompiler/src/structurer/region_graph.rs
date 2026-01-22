@@ -563,9 +563,11 @@ impl RegionGraph {
             if succs.len() == 1 {
                 let mut sequence = vec![node];
                 let mut current = succs[0];
+                let mut visited_in_chain: HashSet<NodeIndex> = HashSet::new();
+                visited_in_chain.insert(node);
 
                 // Follow the chain
-                while !in_sequence.contains(&current) {
+                while !in_sequence.contains(&current) && !visited_in_chain.contains(&current) {
                     let current_preds = self.predecessors(current);
                     let current_succs = self.successors(current);
 
@@ -575,6 +577,7 @@ impl RegionGraph {
                     }
 
                     sequence.push(current);
+                    visited_in_chain.insert(current);
 
                     // Continue if exactly 1 successor
                     if current_succs.len() == 1 {
