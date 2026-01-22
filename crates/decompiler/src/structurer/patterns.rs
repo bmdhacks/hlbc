@@ -709,7 +709,7 @@ fn find_has_next_call(
 fn is_has_next_call(op: &Opcode, ctx: &PatternContext<'_>) -> bool {
     match op {
         Opcode::Call1 { fun, .. } => {
-            let name = ctx.code.functions[fun.0].name(ctx.code);
+            let name = ctx.code.get(*fun).name(ctx.code);
             name == "hasNext"
         }
         Opcode::CallMethod { field, args, .. } => {
@@ -779,7 +779,7 @@ fn find_next_call(
 fn is_next_call(op: &Opcode, uses: &[SsaVar], iterator_reg: Reg, ctx: &PatternContext<'_>) -> bool {
     let is_next = match op {
         Opcode::Call1 { fun, .. } => {
-            let name = ctx.code.functions[fun.0].name(ctx.code);
+            let name = ctx.code.get(*fun).name(ctx.code);
             name.as_ref() == "next"
         }
         Opcode::CallMethod { field, args, .. } => {

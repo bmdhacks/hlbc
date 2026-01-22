@@ -249,6 +249,49 @@ impl RegionGraph {
         postorder
     }
 
+    /// Remove a single node from the graph.
+    ///
+    /// This handles petgraph's swap-remove behavior and updates internal mappings.
+    /// Used to remove unreachable (dead code) nodes.
+    ///
+    /// Note: After removal, NodeIndex values may be invalid due to swap-remove.
+    pub fn remove_node(&mut self, node: NodeIndex) {
+        let node_count_before = self.graph.node_count();
+        let removed_index = node.index();
+
+        // Remove from our mapping
+        if let Some(cfg_nodes) = self.region_to_cfg.remove(&node) {
+            for cfg_node in cfg_nodes {
+                self.cfg_to_region.remove(&cfg_node);
+            }
+        }
+
+        // Remove from graph (this may swap the last node into this position)
+        self.graph.remove_node(node);
+
+        // Check if a swap happened (removed node wasn't the last one)
+        if removed_index < node_count_before - 1 {
+            // The node that was at (node_count_before - 1) is now at removed_index
+            let old_last_index = NodeIndex::new(node_count_before - 1);
+            let new_index = NodeIndex::new(removed_index);
+
+            // Update region_to_cfg and cfg_to_region for the swapped node
+            if let Some(cfg_nodes) = self.region_to_cfg.remove(&old_last_index) {
+                for cfg_node in &cfg_nodes {
+                    self.cfg_to_region.insert(*cfg_node, new_index);
+                }
+                self.region_to_cfg.insert(new_index, cfg_nodes);
+            }
+
+            // Update entry if it was the swapped node
+            if self.entry == old_last_index {
+                self.entry = new_index;
+            }
+        }
+
+        self.generation += 1;
+    }
+
     /// Collapse a set of nodes into a single Region node.
     ///
     /// This is the core operation for graph reduction:

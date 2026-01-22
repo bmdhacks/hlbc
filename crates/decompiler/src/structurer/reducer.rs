@@ -73,6 +73,11 @@ pub fn reduce_to_region_with_exceptions(
     let mut graph = RegionGraph::from_cfg(cfg);
     let mut iterations = 0;
 
+    // Phase -1: Remove unreachable (dead code) nodes before reduction.
+    // These can occur when compiler generates unreachable code after Ret/Throw,
+    // e.g., EndTrap opcodes that appear after a Ret.
+    remove_unreachable_nodes(&mut graph);
+
     // Phase 0: Pre-collapse string switches before the main reduction loop
     for ss in string_switches {
         collapse_string_switch(&mut graph, cfg, ss);
@@ -238,8 +243,7 @@ fn reduce_one_step(
 }
 
 /// Compute all nodes reachable from the entry node via BFS.
-#[cfg(debug_assertions)]
-fn compute_reachable_nodes(graph: &RegionGraph) -> HashSet<NodeIndex> {
+fn compute_reachable_nodes_impl(graph: &RegionGraph) -> HashSet<NodeIndex> {
     use std::collections::VecDeque;
     let mut reachable = HashSet::new();
     let mut queue = VecDeque::new();
@@ -255,6 +259,35 @@ fn compute_reachable_nodes(graph: &RegionGraph) -> HashSet<NodeIndex> {
         }
     }
     reachable
+}
+
+/// Wrapper for debug assertions.
+#[cfg(debug_assertions)]
+fn compute_reachable_nodes(graph: &RegionGraph) -> HashSet<NodeIndex> {
+    compute_reachable_nodes_impl(graph)
+}
+
+/// Remove nodes that are not reachable from the entry node.
+/// This handles dead code that the compiler may have generated,
+/// such as EndTrap opcodes that appear after a Ret.
+fn remove_unreachable_nodes(graph: &mut RegionGraph) {
+    let reachable = compute_reachable_nodes_impl(graph);
+    let all_nodes: Vec<_> = graph.node_indices().collect();
+
+    // Find unreachable nodes
+    let mut unreachable: Vec<_> = all_nodes
+        .into_iter()
+        .filter(|n| !reachable.contains(n))
+        .collect();
+
+    // Sort in descending order by index to avoid invalidating remaining indices
+    // due to petgraph's swap-remove behavior (which moves the last node to fill gaps)
+    unreachable.sort_by(|a, b| b.index().cmp(&a.index()));
+
+    // Remove them from highest index first
+    for node in unreachable {
+        graph.remove_node(node);
+    }
 }
 
 /// Collapse a loop pattern. Returns true if progress was made (nodes were reduced).
