@@ -17,11 +17,12 @@ use hlbc::types::{Function, Reg};
 use hlbc::{Bytecode, Resolve};
 
 use crate::analyzer::{CfgAnalysis, NaturalLoop};
+use crate::exception_analysis::ExceptionAnalysis;
 use crate::lifter::{Cfg, EdgeKind};
 use crate::ssa::{SsaCfg, SsaInstr, SsaVar};
 use crate::structurer::region::LoopKind;
 use crate::structurer::region_dominance::RegionDominators;
-use crate::structurer::region_graph::RegionGraph;
+use crate::structurer::region_graph::{RegionGraph, RegionNode};
 use crate::type_prop::TypeInfo;
 
 /// Pattern matcher that uses RegionGraph as the single source of truth.
@@ -363,6 +364,28 @@ pub struct SwitchPattern {
     /// Map from case node (region index) to case values that jump there.
     /// Multiple values may map to the same node (fallthrough/combined cases).
     pub case_values: HashMap<NodeIndex, Vec<i32>>,
+}
+
+/// A detected try-catch pattern ready for collapse.
+#[derive(Debug, Clone)]
+pub struct TryCatchPattern {
+    /// The CFG node containing the Trap opcode (start of try).
+    pub trap_node: NodeIndex,
+
+    /// Nodes in the try body (between Trap and EndTrap, excluding handler).
+    pub try_nodes: HashSet<NodeIndex>,
+
+    /// The CFG node that is the handler entry (catch start).
+    pub handler_node: NodeIndex,
+
+    /// Nodes in the catch body.
+    pub catch_nodes: HashSet<NodeIndex>,
+
+    /// The exception register from Trap opcode.
+    pub exc_reg: Reg,
+
+    /// Merge point (node after try-catch completes), if any.
+    pub merge: Option<NodeIndex>,
 }
 
 /// Find loop patterns in the graph that can be collapsed.
@@ -861,8 +884,9 @@ fn match_switch_pattern(
     let region_node = region_graph.get_node(node)?;
     let cfg_node = region_node.as_block()?;
 
-    // Must have 3+ successors for a switch
-    let cfg_succs = cfg.successors(cfg_node);
+    // Must have 3+ successors for a switch (excluding exception edges)
+    // Exception edges would make a try { if/else } look like a switch
+    let cfg_succs = cfg.successors_no_exceptions(cfg_node);
 
     if std::env::var("HLBC_DEBUG_SWITCH").is_ok() {
         eprintln!("DEBUG match_switch: node={:?} cfg={:?} succs={}", node, cfg_node, cfg_succs.len());
@@ -1043,12 +1067,213 @@ pub fn find_innermost_pattern(
     None
 }
 
+/// Find try-catch patterns in the graph that can be collapsed.
+///
+/// Uses the ExceptionAnalysis to identify Trap/EndTrap pairs.
+/// A try-catch pattern is detected when:
+/// 1. A block contains a Trap opcode (start of try)
+/// 2. There's a corresponding EndTrap opcode (end of catch)
+/// 3. The exception handler is identified from the Trap offset
+///
+/// Returns patterns in innermost-first order for proper nesting.
+pub fn find_try_catch_patterns(
+    region_graph: &RegionGraph,
+    cfg: &Cfg,
+    exception_analysis: &ExceptionAnalysis,
+) -> Vec<TryCatchPattern> {
+    let mut patterns = Vec::new();
+
+    // Collect all trap CFG nodes to detect shared blocks
+    let all_trap_cfg_nodes: HashSet<NodeIndex> = exception_analysis
+        .top_level_regions()
+        .iter()
+        .filter_map(|r| cfg.op_to_block.get(&r.trap_op).copied())
+        .collect();
+
+    // Process each top-level try region (nested ones will be handled recursively)
+    for try_region in exception_analysis.top_level_regions() {
+        if let Some(pattern) = match_try_catch_pattern(region_graph, cfg, try_region, &all_trap_cfg_nodes) {
+            patterns.push(pattern);
+        }
+    }
+
+    // Sort patterns to process innermost/independent ones first:
+    // 1. Prefer patterns with non-empty catch_nodes (handler not mixed)
+    // 2. Then by size (smallest first)
+    // This ensures that when a handler is mixed (contains another Trap),
+    // we process the inner try-catch first, then the outer one can include it.
+    patterns.sort_by_key(|p| {
+        let has_catch = if p.catch_nodes.is_empty() { 1 } else { 0 };
+        (has_catch, p.try_nodes.len() + p.catch_nodes.len())
+    });
+
+    patterns
+}
+
+/// Try to match a single TryRegion as a collapsible try-catch pattern.
+fn match_try_catch_pattern(
+    region_graph: &RegionGraph,
+    cfg: &Cfg,
+    try_region: &crate::exception_analysis::TryRegion,
+    all_trap_cfg_nodes: &HashSet<NodeIndex>,
+) -> Option<TryCatchPattern> {
+    let debug = std::env::var("HLBC_DEBUG_REDUCE").is_ok();
+
+    if debug {
+        eprintln!("DEBUG match_try_catch: trap_op={}, end_trap_op={}, handler_op={}, exc_reg={:?}",
+            try_region.trap_op, try_region.end_trap_op, try_region.handler_op, try_region.exc_reg);
+    }
+
+    // Find the CFG node containing the Trap opcode
+    let trap_cfg_node = cfg.op_to_block.get(&try_region.trap_op)?;
+    let trap_region_node = region_graph.get_region_node(*trap_cfg_node)?;
+
+    // Find the CFG node containing the handler entry
+    let handler_cfg_node = cfg.op_to_block.get(&try_region.handler_op)?;
+    let handler_region_node = region_graph.get_region_node(*handler_cfg_node)?;
+
+    if debug {
+        eprintln!("  trap_cfg_node={:?} -> trap_region_node={:?}", trap_cfg_node, trap_region_node);
+        eprintln!("  handler_cfg_node={:?} -> handler_region_node={:?}", handler_cfg_node, handler_region_node);
+    }
+
+    // If trap and handler are already in the same region node, this try-catch
+    // has already been collapsed. Skip it to avoid infinite loops.
+    if trap_region_node == handler_region_node {
+        if debug {
+            eprintln!("  SKIP: trap and handler already in same region node");
+        }
+        return None;
+    }
+
+    // Check if handler CFG node also contains another try's Trap opcode.
+    // If so, this handler node is "mixed" - it contains both catch code AND
+    // another try region. We need to be careful not to include the wrong code.
+    //
+    // HOWEVER, if the handler region is already a Collapsed region (e.g., another
+    // TryCatch that was already processed), it's no longer "mixed" - it's safe
+    // to include as the catch body.
+    let handler_is_collapsed = matches!(
+        region_graph.get_node(handler_region_node),
+        Some(RegionNode::Collapsed(_))
+    );
+
+    let handler_is_mixed = !handler_is_collapsed
+        && all_trap_cfg_nodes.contains(handler_cfg_node)
+        && handler_cfg_node != trap_cfg_node;
+
+    if debug && handler_is_mixed {
+        eprintln!("  handler_cfg_node {:?} is MIXED (contains another Trap)", handler_cfg_node);
+    }
+    if debug && handler_is_collapsed {
+        eprintln!("  handler_region_node {:?} is COLLAPSED (not mixed)", handler_region_node);
+    }
+
+    // Collect try body nodes: ALL opcodes from trap_op through end_trap_op (inclusive)
+    // This includes:
+    // - The trap block itself
+    // - The try body blocks
+    // - Dead code blocks (like unreached EndTrap after Throw)
+    // Including dead code ensures we don't leave orphaned blocks after collapse.
+    let mut try_nodes = HashSet::new();
+    for op_idx in try_region.trap_op..=try_region.end_trap_op {
+        if let Some(&cfg_node) = cfg.op_to_block.get(&op_idx) {
+            if let Some(region_node) = region_graph.get_region_node(cfg_node) {
+                // Don't include the handler node in try_nodes
+                if region_node != handler_region_node {
+                    try_nodes.insert(region_node);
+                }
+            }
+        }
+    }
+
+    if debug {
+        eprintln!("  try range: {}..={}", try_region.trap_op, try_region.end_trap_op);
+    }
+
+    // Collect catch body nodes
+    // If the handler node is mixed (contains another Trap), don't include it
+    // in catch_nodes - the other try-catch will handle that code.
+    //
+    // Also, if the handler region is a collapsed TryCatch from a SUBSEQUENT
+    // (sequential) try-catch (not nested), don't include it. A subsequent
+    // try-catch starts AFTER this try's end_trap_op.
+    let catch_nodes = if handler_is_mixed {
+        if debug {
+            eprintln!("  catch_nodes empty because handler is mixed");
+        }
+        HashSet::new()
+    } else if handler_is_collapsed {
+        // Check if the collapsed region contains a subsequent try-catch
+        // by checking if any of the original CFG nodes in that region
+        // had a trap_op > this try's end_trap_op
+        let handler_contains_subsequent_try = all_trap_cfg_nodes.iter().any(|&trap_cfg| {
+            // Check if this trap CFG node maps to the same region as handler
+            if let Some(trap_region) = region_graph.get_region_node(trap_cfg) {
+                if trap_region == handler_region_node && trap_cfg != *trap_cfg_node {
+                    // This trap is in the handler region but is different from our trap
+                    // Now check if it's a subsequent try (starts after our try ends)
+                    // We need to look up the trap_op for this CFG node
+                    if let Some(&first_op) = cfg.op_to_block.iter()
+                        .find(|(_op, &block)| block == trap_cfg)
+                        .map(|(op, _)| op)
+                    {
+                        // If the trap in handler region starts after our end_trap_op,
+                        // it's a subsequent try, not an inner try
+                        return first_op > try_region.end_trap_op;
+                    }
+                }
+            }
+            false
+        });
+
+        if handler_contains_subsequent_try {
+            if debug {
+                eprintln!("  catch_nodes empty because handler contains subsequent try-catch");
+            }
+            HashSet::new()
+        } else {
+            let mut nodes = HashSet::new();
+            nodes.insert(handler_region_node);
+            nodes
+        }
+    } else {
+        let mut nodes = HashSet::new();
+        nodes.insert(handler_region_node);
+        nodes
+    };
+
+    if debug {
+        eprintln!("  try_nodes={:?}", try_nodes);
+        eprintln!("  catch_nodes={:?}", catch_nodes);
+    }
+
+    // Find the merge point: for now, use None and let subsequent reduction handle it
+    // The actual merge point depends on where try and catch flows reconverge
+    let merge = None;
+
+    // Ensure we have meaningful content
+    if try_nodes.is_empty() && catch_nodes.is_empty() {
+        return None;
+    }
+
+    Some(TryCatchPattern {
+        trap_node: trap_region_node,
+        try_nodes,
+        handler_node: handler_region_node,
+        catch_nodes,
+        exc_reg: try_region.exc_reg,
+        merge,
+    })
+}
+
 /// A detected pattern ready for collapse.
 #[derive(Debug, Clone)]
 pub enum Pattern {
     Loop(LoopPattern),
     If(IfPattern),
     Switch(SwitchPattern),
+    TryCatch(TryCatchPattern),
 }
 
 impl Pattern {
@@ -1067,6 +1292,14 @@ impl Pattern {
                 let mut nodes = HashSet::new();
                 nodes.insert(sp.selector_node);
                 nodes.extend(sp.body_nodes.iter());
+                nodes
+            }
+            Pattern::TryCatch(tcp) => {
+                let mut nodes = HashSet::new();
+                nodes.insert(tcp.trap_node);
+                nodes.extend(tcp.try_nodes.iter());
+                nodes.insert(tcp.handler_node);
+                nodes.extend(tcp.catch_nodes.iter());
                 nodes
             }
         }

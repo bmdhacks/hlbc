@@ -18,10 +18,11 @@ use std::collections::HashSet;
 
 use crate::analyzer::CfgAnalysis;
 use crate::ast::{Constant, Expr};
+use crate::exception_analysis::ExceptionAnalysis;
 use crate::lifter::Cfg;
 use crate::structurer::patterns::{
-    find_if_patterns, find_loop_patterns, find_switch_patterns, IfPattern, LoopPattern,
-    PatternContext, SwitchPattern,
+    find_if_patterns, find_loop_patterns, find_switch_patterns,
+    IfPattern, LoopPattern, PatternContext, SwitchPattern,
 };
 use crate::structurer::region::{Region, SwitchCase};
 use crate::structurer::StringSwitchCfgMapping;
@@ -54,6 +55,20 @@ pub fn reduce_to_region_with_string_switches(
     analysis: &CfgAnalysis,
     ctx: Option<&PatternContext<'_>>,
     string_switches: &[StringSwitchCfgMapping],
+) -> Region {
+    reduce_to_region_with_exceptions(cfg, analysis, ctx, string_switches, None)
+}
+
+/// Reduce a CFG to a single Region, with support for exceptions and string switches.
+///
+/// This is the most complete variant of the reduction function.
+/// If `exception_analysis` is provided, enables detection and collapsing of try-catch patterns.
+pub fn reduce_to_region_with_exceptions(
+    cfg: &Cfg,
+    analysis: &CfgAnalysis,
+    ctx: Option<&PatternContext<'_>>,
+    string_switches: &[StringSwitchCfgMapping],
+    exception_analysis: Option<&ExceptionAnalysis>,
 ) -> Region {
     let mut graph = RegionGraph::from_cfg(cfg);
     let mut iterations = 0;
@@ -97,7 +112,7 @@ pub fn reduce_to_region_with_string_switches(
             }
         }
 
-        let made_progress = reduce_one_step(&mut graph, cfg, analysis, ctx);
+        let made_progress = reduce_one_step(&mut graph, cfg, analysis, ctx, exception_analysis);
         let node_count_after = graph.node_count();
 
         if std::env::var("HLBC_DEBUG_REDUCE").is_ok() && node_count_before <= 5 {
@@ -145,6 +160,7 @@ pub fn reduce_to_region_with_string_switches(
 /// Perform one reduction step on the graph.
 ///
 /// Tries patterns in priority order:
+/// 0. Try-catch patterns (highest priority - exception edges confuse other patterns)
 /// 1. Innermost loops (smallest body first)
 /// 2. If-then-else patterns
 /// 3. Switch patterns
@@ -156,6 +172,7 @@ fn reduce_one_step(
     cfg: &Cfg,
     analysis: &CfgAnalysis,
     ctx: Option<&PatternContext<'_>>,
+    exception_analysis: Option<&ExceptionAnalysis>,
 ) -> bool {
     let node_count_before = graph.node_count();
     let made_progress;
@@ -166,6 +183,17 @@ fn reduce_one_step(
     if std::env::var("HLBC_DEBUG_REDUCE").is_ok() {
         eprintln!("DEBUG reduce_one_step: node_count={}", node_count_before);
     }
+
+    // Priority 0: Try-catch patterns
+    // NOTE: Try-catch pattern detection is currently disabled because it has
+    // issues with CFG blocks that span multiple exception regions. When
+    // CFG block boundaries don't align with exception boundaries, the
+    // collapse produces incorrect nesting.
+    //
+    // TODO: Revisit try-catch handling with a different approach:
+    // - Handle try-catch during lowering based on Trap/EndTrap opcodes
+    // - Or split CFG blocks at exception boundaries before pattern matching
+    let _ = exception_analysis; // Silence unused warning
 
     // Priority 1: Collapse if-then-else patterns that are INSIDE loops first
     // This ensures nested if-else structures are reduced before their containing loops.
@@ -554,6 +582,11 @@ fn collapse_switch(
         graph.collapse(&nodes_to_collapse, switch_region);
     }
 }
+
+// NOTE: collapse_try_catch has been removed.
+// Try-catch handling is now done at the opcode level during lowering
+// via lower_with_exceptions() in lower.rs. This avoids issues where
+// CFG blocks don't align with exception boundaries.
 
 /// Collapse a string switch pattern into a Region::Switch node.
 ///

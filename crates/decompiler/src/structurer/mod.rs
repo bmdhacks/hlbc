@@ -35,7 +35,7 @@ use crate::exception_analysis::ExceptionAnalysis;
 // Re-exports for new reducer-based structuring (used by lib.rs)
 pub use lower::{lower_region, LoweringContext};
 pub use patterns::PatternContext;
-pub use reducer::{reduce_to_region, reduce_to_region_with_string_switches};
+pub use reducer::{reduce_to_region, reduce_to_region_with_string_switches, reduce_to_region_with_exceptions};
 
 pub use stmts::simplify_statements; // external export
 

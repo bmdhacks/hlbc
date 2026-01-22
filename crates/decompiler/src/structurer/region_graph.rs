@@ -197,6 +197,16 @@ impl RegionGraph {
             .collect()
     }
 
+    /// Get successors excluding exception handler edges.
+    /// Use this for pattern detection where exception edges would interfere.
+    pub fn successors_no_exceptions(&self, node: NodeIndex) -> Vec<NodeIndex> {
+        self.graph
+            .edges(node)
+            .filter(|e| !matches!(e.weight(), EdgeKind::ExceptionHandler))
+            .map(|e| e.target())
+            .collect()
+    }
+
     /// Get the RegionGraph node index for an original CFG node.
     pub fn get_region_node(&self, cfg_node: NodeIndex) -> Option<NodeIndex> {
         self.cfg_to_region.get(&cfg_node).copied()

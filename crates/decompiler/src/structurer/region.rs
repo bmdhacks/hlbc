@@ -152,6 +152,18 @@ pub enum Region {
         merge: NodeIndex,
     },
 
+    /// A try-catch region for exception handling.
+    TryCatch {
+        /// The try body region.
+        try_body: Box<Region>,
+        /// The catch body region.
+        catch_body: Box<Region>,
+        /// Register holding the caught exception (from Trap opcode).
+        exc_reg: Reg,
+        /// The merge point where control reconverges after try-catch.
+        merge: Option<NodeIndex>,
+    },
+
     /// A goto to handle irreducible control flow.
     /// This is the fallback when proper structuring isn't possible.
     /// During lowering, this emits a labeled statement and goto.
@@ -180,6 +192,7 @@ impl Region {
                     .and_then(|c| c.body.entry_node())
                     .or_else(|| default.entry_node())
             }
+            Region::TryCatch { try_body, .. } => try_body.entry_node(),
             Region::Goto { target } => Some(*target),
             Region::Empty => None,
         }
@@ -194,6 +207,9 @@ impl Region {
             Region::IfThenElse { merge, .. } => Some(*merge),
             Region::Loop { exit, .. } => Some(*exit),
             Region::Switch { merge, .. } => Some(*merge),
+            Region::TryCatch { merge, catch_body, .. } => {
+                merge.or_else(|| catch_body.exit_node())
+            }
             Region::Goto { target } => Some(*target),
             Region::Empty => None,
         }
@@ -239,6 +255,10 @@ impl Region {
                 let all_cases_terminate = cases.iter().all(|c| c.body.terminates(cfg));
                 let default_terminates = default.terminates(cfg);
                 all_cases_terminate && default_terminates
+            }
+            Region::TryCatch { try_body, catch_body, .. } => {
+                // Try-catch terminates if BOTH branches terminate
+                try_body.terminates(cfg) && catch_body.terminates(cfg)
             }
             Region::Goto { .. } => false,
             Region::Empty => false,
@@ -286,6 +306,10 @@ impl Region {
                 }
                 default.collect_nodes(nodes);
             }
+            Region::TryCatch { try_body, catch_body, .. } => {
+                try_body.collect_nodes(nodes);
+                catch_body.collect_nodes(nodes);
+            }
             Region::Goto { .. } | Region::Empty => {}
         }
     }
@@ -295,6 +319,9 @@ impl Region {
         match self {
             Region::Empty => true,
             Region::Sequence(regions) => regions.is_empty() || regions.iter().all(|r| r.is_empty()),
+            Region::TryCatch { try_body, catch_body, .. } => {
+                try_body.is_empty() && catch_body.is_empty()
+            }
             _ => false,
         }
     }
@@ -315,6 +342,9 @@ impl Region {
             Region::Loop { body, .. } => body.block_count(),
             Region::Switch { cases, default, .. } => {
                 cases.iter().map(|c| c.body.block_count()).sum::<usize>() + default.block_count()
+            }
+            Region::TryCatch { try_body, catch_body, .. } => {
+                try_body.block_count() + catch_body.block_count()
             }
             Region::Goto { .. } | Region::Empty => 0,
         }

@@ -154,6 +154,16 @@ impl Cfg {
         None
     }
 
+    /// Get successors excluding exception handler edges.
+    /// Use this for pattern detection where exception edges would interfere.
+    pub fn successors_no_exceptions(&self, node: NodeIndex) -> Vec<NodeIndex> {
+        self.graph
+            .edges(node)
+            .filter(|e| !matches!(e.weight(), EdgeKind::ExceptionHandler))
+            .map(|e| e.target())
+            .collect()
+    }
+
     /// Number of basic blocks
     pub fn num_blocks(&self) -> usize {
         self.graph.node_count()

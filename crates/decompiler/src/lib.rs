@@ -192,7 +192,7 @@ pub fn decompile_code_with_options(
     use crate::ssa::SsaCfg;
     use crate::type_prop::TypePropagator;
     use crate::structurer::{
-        Structurer, PatternContext, reduce_to_region_with_string_switches, LoweringContext, lower_region,
+        Structurer, PatternContext, reduce_to_region_with_exceptions, LoweringContext, lower_region,
         simplify_statements,
     };
 
@@ -239,9 +239,18 @@ pub fn decompile_code_with_options(
 
     // Get string switch mappings for pre-collapse
     let string_switch_mappings = &structurer.string_switch_cfg_mappings;
-    let region = reduce_to_region_with_string_switches(&cfg, &analysis, Some(&pattern_ctx), string_switch_mappings);
+    // Pass exception_analysis to enable try-catch pattern detection
+    let exception_analysis = &structurer.exception_analysis;
+    let region = reduce_to_region_with_exceptions(
+        &cfg,
+        &analysis,
+        Some(&pattern_ctx),
+        string_switch_mappings,
+        Some(exception_analysis),
+    );
 
     // Lower the region tree to statements
+    // lower_region handles both regular and exception-aware lowering internally
     let mut lowering_ctx = LoweringContext::new(&mut structurer);
     let lowered_stmts = lower_region(&region, &mut lowering_ctx);
 

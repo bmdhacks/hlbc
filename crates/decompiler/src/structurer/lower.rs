@@ -22,12 +22,33 @@ use crate::ast::{Constant, Expr, Operation, Statement};
 use crate::structurer::region::{LoopKind, Region};
 use crate::structurer::Structurer;
 
+use crate::exception_analysis::TryRegion;
+
 /// Lower a Region tree to Statement AST.
 ///
 /// This is the main entry point for the new structurer architecture.
 /// It takes a Region (from `reduce_to_region`) and produces the final
 /// Statement list that can be formatted as Haxe code.
+///
+/// For functions with exception handling, this automatically uses opcode-level
+/// Trap/EndTrap detection rather than CFG-based detection, which avoids
+/// boundary mismatch issues.
 pub fn lower_region(region: &Region, ctx: &mut LoweringContext<'_>) -> Vec<Statement> {
+    // Check if this function has exceptions - if so, use opcode-level lowering
+    if ctx.structurer.exception_analysis.has_exceptions() {
+        let num_ops = ctx.structurer.func.ops.len();
+        let top_level_regions: Vec<TryRegion> = ctx.structurer.exception_analysis
+            .top_level_regions()
+            .to_vec();
+        return lower_opcode_range(0, num_ops, &top_level_regions, ctx);
+    }
+
+    lower_region_inner(region, ctx)
+}
+
+/// Inner lowering that handles Region variants without exception checking.
+/// Called by `lower_region` after exception check, and recursively for nested regions.
+fn lower_region_inner(region: &Region, ctx: &mut LoweringContext<'_>) -> Vec<Statement> {
     match region {
         Region::Block(node) => lower_block(*node, ctx),
         Region::Sequence(regions) => lower_sequence(regions, ctx),
@@ -53,6 +74,12 @@ pub fn lower_region(region: &Region, ctx: &mut LoweringContext<'_>) -> Vec<State
             default,
             merge,
         } => lower_switch(selector, *selector_block, cases, default, *merge, ctx),
+        Region::TryCatch {
+            try_body,
+            catch_body,
+            exc_reg,
+            merge,
+        } => lower_try_catch(try_body, catch_body, *exc_reg, *merge, ctx),
         Region::Goto { target } => lower_goto(*target, ctx),
         Region::Empty => Vec::new(),
     }
@@ -303,7 +330,7 @@ fn lower_block(node: NodeIndex, ctx: &mut LoweringContext<'_>) -> Vec<Statement>
 fn lower_sequence(regions: &[Region], ctx: &mut LoweringContext<'_>) -> Vec<Statement> {
     let mut stmts = Vec::new();
     for region in regions {
-        stmts.extend(lower_region(region, ctx));
+        stmts.extend(lower_region_inner(region, ctx));
     }
 
     // Check if we need to emit a fallthrough for the last element's merge.
@@ -742,6 +769,37 @@ fn lower_switch(
     result
 }
 
+/// Lower a try-catch region to statements.
+///
+/// Try-catch regions are detected from Trap/EndTrap opcode pairs.
+/// The Trap opcode sets up an exception handler with the exception register.
+fn lower_try_catch(
+    try_body: &Region,
+    catch_body: &Region,
+    exc_reg: Reg,
+    _merge: Option<NodeIndex>,
+    ctx: &mut LoweringContext<'_>,
+) -> Vec<Statement> {
+    // Lower try body with increased scope depth
+    ctx.structurer.scope_depth += 1;
+    let try_stmts = lower_region(try_body, ctx);
+    ctx.structurer.scope_depth -= 1;
+
+    // Get variable name for exception register
+    let catch_var = ctx.structurer.reg_name(exc_reg).to_string();
+
+    // Lower catch body with increased scope depth
+    ctx.structurer.scope_depth += 1;
+    let catch_stmts = lower_region(catch_body, ctx);
+    ctx.structurer.scope_depth -= 1;
+
+    vec![Statement::TryCatch {
+        try_stmts,
+        catch_var,
+        catch_stmts,
+    }]
+}
+
 /// Lower a goto region to statements.
 ///
 /// Gotos are the fallback for irreducible control flow.
@@ -827,6 +885,201 @@ fn default_for_type(type_ref: hlbc::types::RefType, code: &hlbc::Bytecode) -> Ex
         Some(Type::Bool) => Expr::Constant(Constant::Bool(false)),
         _ => Expr::Constant(Constant::Null),
     }
+}
+
+// =============================================================================
+// Opcode-Level Exception Handling
+// =============================================================================
+// These functions handle Trap/EndTrap at precise opcode boundaries, avoiding
+// the CFG block alignment issues that occur with CFG-based try-catch detection.
+
+/// Lower an opcode range, detecting try-catch at opcode level.
+fn lower_opcode_range(
+    start: usize,
+    end: usize,
+    try_regions: &[TryRegion],
+    ctx: &mut LoweringContext<'_>,
+) -> Vec<Statement> {
+    let debug = std::env::var("HLBC_DEBUG_LOWER_EXC").is_ok();
+
+    if debug {
+        eprintln!("DEBUG lower_opcode_range: start={} end={} try_regions={}",
+            start, end, try_regions.len());
+    }
+
+    let mut stmts = Vec::new();
+    let mut op_idx = start;
+
+    while op_idx < end {
+        // Check if this opcode starts an exception region
+        if let Some(region) = try_regions.iter().find(|r| r.trap_op == op_idx) {
+            if debug {
+                eprintln!("  Found exception region at op {}: trap_op={}, end_trap_op={}, handler_op={}",
+                    op_idx, region.trap_op, region.end_trap_op, region.handler_op);
+            }
+
+            let try_catch = lower_exception_region(
+                region,
+                end,
+                try_regions,
+                ctx,
+            );
+            stmts.push(try_catch);
+
+            // Skip past the entire try-catch region (including catch body)
+            op_idx = find_catch_end(region, end, try_regions);
+            if debug {
+                eprintln!("  After try-catch, op_idx={}", op_idx);
+            }
+            continue;
+        }
+
+        // Find which CFG block this opcode belongs to
+        if let Some(&cfg_node) = ctx.structurer.cfg.op_to_block.get(&op_idx) {
+            let block = &ctx.structurer.cfg.graph[cfg_node];
+
+            // Lower this block's opcodes (from op_idx to block.end)
+            // Only lower opcodes within our range
+            let block_end = block.end.min(end - 1);
+
+            if debug {
+                eprintln!("  Lowering block opcodes {}..={} (block {:?})", op_idx, block_end, cfg_node);
+            }
+
+            for block_op_idx in op_idx..=block_end {
+                // Skip if this starts a nested exception region
+                if try_regions.iter().any(|r| r.trap_op == block_op_idx) {
+                    break;
+                }
+
+                ctx.structurer.current_op = block_op_idx;
+
+                // Set up SSA context
+                if let Some((dst, uses)) = ctx.structurer.ssa.get_instr_for_op(block_op_idx) {
+                    ctx.structurer.current_ssa_dst = dst;
+                    ctx.structurer.current_ssa_uses = uses.to_vec();
+                } else {
+                    ctx.structurer.current_ssa_dst = None;
+                    ctx.structurer.current_ssa_uses.clear();
+                }
+
+                // Skip string switch pattern opcodes
+                if ctx.structurer.string_switch_opcodes.contains(&block_op_idx) {
+                    continue;
+                }
+
+                // Skip control flow opcodes - they're implicit in the Region structure
+                if ctx.structurer.is_control_flow_op(block_op_idx) {
+                    continue;
+                }
+
+                // Check for terminal instructions (Ret, Throw)
+                if let Some(term_stmt) = ctx.structurer.check_terminal(block_op_idx) {
+                    stmts.push(term_stmt);
+                    continue;
+                }
+
+                // Invalidate conflicting inlines before processing
+                let invalidated = ctx.structurer.invalidate_conflicting_inlines(
+                    &ctx.structurer.func.ops[block_op_idx].clone(),
+                );
+                stmts.extend(invalidated);
+
+                // Generate statements for this opcode
+                let new_stmts = ctx.structurer.opcode_to_statements(block_op_idx);
+                stmts.extend(new_stmts);
+            }
+
+            // Move past this block
+            op_idx = block_end + 1;
+        } else {
+            // No block found for this opcode (shouldn't happen)
+            op_idx += 1;
+        }
+    }
+
+    stmts
+}
+
+/// Lower a try-catch region using opcode ranges for boundaries.
+fn lower_exception_region(
+    region: &TryRegion,
+    outer_end: usize,
+    all_try_regions: &[TryRegion],
+    ctx: &mut LoweringContext<'_>,
+) -> Statement {
+    let debug = std::env::var("HLBC_DEBUG_LOWER_EXC").is_ok();
+
+    // Get variable name for exception register
+    // Use raw names to prevent SSA versioning mismatches
+    ctx.structurer.use_raw_name_regs.insert(region.exc_reg);
+    let catch_var = ctx.structurer.reg_name(region.exc_reg).to_string();
+
+    if debug {
+        eprintln!("  lower_exception_region: try_body {}..{}, handler starts at {}",
+            region.trap_op + 1, region.end_trap_op, region.handler_op);
+    }
+
+    // Try body: from trap+1 to end_trap (excluding EndTrap opcode)
+    ctx.structurer.scope_depth += 1;
+    let try_stmts = lower_opcode_range(
+        region.trap_op + 1,
+        region.end_trap_op,  // Exclusive end - don't include EndTrap
+        &region.nested,  // Handle nested try-catch in try body
+        ctx,
+    );
+    ctx.structurer.scope_depth -= 1;
+
+    // Catch body: from handler_op to catch_end
+    let catch_end = find_catch_end(region, outer_end, all_try_regions);
+
+    if debug {
+        eprintln!("  Catch body: {}..{}", region.handler_op, catch_end);
+    }
+
+    ctx.structurer.scope_depth += 1;
+    let catch_stmts = lower_opcode_range(
+        region.handler_op,
+        catch_end,
+        &[],  // No nested regions tracked in catch body for now
+        ctx,
+    );
+    ctx.structurer.scope_depth -= 1;
+
+    Statement::TryCatch {
+        try_stmts,
+        catch_var,
+        catch_stmts,
+    }
+}
+
+/// Find where a catch body ends.
+///
+/// The catch body ends at:
+/// 1. The next sequential top-level try region that starts after this catch
+/// 2. Or the outer boundary (outer_end)
+fn find_catch_end(region: &TryRegion, outer_end: usize, all_try_regions: &[TryRegion]) -> usize {
+    let mut catch_end = outer_end;
+
+    // Look for the next top-level try region that starts after handler_op
+    // but is NOT nested within this try-catch
+    for other_region in all_try_regions {
+        // Skip if this is the same region or a nested region
+        if other_region.trap_op == region.trap_op {
+            continue;
+        }
+
+        // If this region starts after our handler and before current catch_end,
+        // and it's not nested inside our try body, it marks our catch end
+        if other_region.trap_op > region.handler_op
+            && other_region.trap_op < catch_end
+            && other_region.trap_op > region.end_trap_op  // Not inside our try body
+        {
+            catch_end = other_region.trap_op;
+        }
+    }
+
+    catch_end
 }
 
 #[cfg(test)]
