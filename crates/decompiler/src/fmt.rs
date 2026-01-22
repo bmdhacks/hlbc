@@ -983,20 +983,39 @@ impl Operation {
     }
 }
 
-/// Helper to determine if an expression needs parentheses when used as operand
-fn needs_parens(expr: &Expr, parent_prec: u8, is_right: bool) -> bool {
+/// Helper to determine if an expression needs parentheses when used as operand.
+///
+/// For associative operators (&&, ||, +, *, &, |, ^), same-precedence children
+/// on RHS don't need parens since regrouping doesn't change the result.
+fn needs_parens(expr: &Expr, parent_op: &Operation, is_right: bool) -> bool {
     if let Expr::Op(child_op) = expr {
         let child_prec = child_op.precedence();
-        // RHS needs parens if equal or lower precedence (right-to-left would need different handling)
-        // LHS needs parens if strictly lower precedence
+        let parent_prec = parent_op.precedence();
+
         if is_right {
-            child_prec <= parent_prec
+            // For associative operators with same child op, no parens needed on RHS
+            // e.g., a && (b && c) can be written as a && b && c
+            if is_associative(parent_op) && std::mem::discriminant(child_op) == std::mem::discriminant(parent_op) {
+                child_prec < parent_prec
+            } else {
+                child_prec <= parent_prec
+            }
         } else {
             child_prec < parent_prec
         }
     } else {
         false
     }
+}
+
+/// Check if an operator is associative (regrouping doesn't change result).
+fn is_associative(op: &Operation) -> bool {
+    use Operation::*;
+    matches!(op,
+        Add(_, _) | Mul(_, _) |           // Arithmetic
+        And(_, _) | Or(_, _) | Xor(_, _) | // Bitwise
+        LogicalAnd(_, _) | LogicalOr(_, _) // Logical
+    )
 }
 
 struct OperationDisplay<'a> {
@@ -1011,7 +1030,6 @@ impl<'a> Display for OperationDisplay<'a> {
         use Operation::*;
 
         let disp = |e: &'a Expr| e.display(self.indent, self.code, self.f);
-        let prec = self.op.precedence();
 
         match self.op {
             Add(e1, e2) | Sub(e1, e2) | Mul(e1, e2) | Div(e1, e2) | Mod(e1, e2) => {
@@ -1023,13 +1041,13 @@ impl<'a> Display for OperationDisplay<'a> {
                     Mod(_, _) => "%",
                     _ => unreachable!(),
                 };
-                if needs_parens(e1, prec, false) {
+                if needs_parens(e1, self.op, false) {
                     write!(fmt, "({})", disp(e1))?;
                 } else {
                     write!(fmt, "{}", disp(e1))?;
                 }
                 write!(fmt, " {} ", op_str)?;
-                if needs_parens(e2, prec, true) {
+                if needs_parens(e2, self.op, true) {
                     write!(fmt, "({})", disp(e2))?;
                 } else {
                     write!(fmt, "{}", disp(e2))?;
@@ -1049,13 +1067,13 @@ impl<'a> Display for OperationDisplay<'a> {
                     LogicalOr(_, _) => "||",
                     _ => unreachable!(),
                 };
-                if needs_parens(e1, prec, false) {
+                if needs_parens(e1, self.op, false) {
                     write!(fmt, "({})", disp(e1))?;
                 } else {
                     write!(fmt, "{}", disp(e1))?;
                 }
                 write!(fmt, " {} ", op_str)?;
-                if needs_parens(e2, prec, true) {
+                if needs_parens(e2, self.op, true) {
                     write!(fmt, "({})", disp(e2))?;
                 } else {
                     write!(fmt, "{}", disp(e2))?;
