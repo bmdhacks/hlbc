@@ -169,9 +169,12 @@ pub enum Region {
     /// This captures multiple consecutive condition blocks that all share the same
     /// "true" target. During lowering, we extract conditions from each block and
     /// build a compound OR expression.
+    ///
+    /// Nested AND chains are also supported: `if (a || (b && c) || d) { then }`
     OrChain {
         /// CFG blocks containing the conditions (in order).
         /// Each block ends with a conditional jump to the shared target.
+        /// For nested AND chains, this includes only the first block of each AND sub-chain.
         condition_blocks: Vec<NodeIndex>,
         /// The region executed when any condition is true.
         then_region: Box<Region>,
@@ -179,6 +182,11 @@ pub enum Region {
         continuation: NodeIndex,
         /// Whether the last condition is inverted (needs negation in compound OR).
         last_condition_inverted: bool,
+        /// Nested AND chains within the OR chain.
+        /// Maps condition index to the CFG nodes in that AND sub-chain.
+        /// When a condition at index i has a nested AND, nested_and_chains[i]
+        /// contains all the CFG blocks in that AND chain (including the first block).
+        nested_and_chains: std::collections::HashMap<usize, Vec<NodeIndex>>,
     },
 
     /// A goto to handle irreducible control flow.
@@ -334,8 +342,12 @@ impl Region {
                 try_body.collect_nodes(nodes);
                 catch_body.collect_nodes(nodes);
             }
-            Region::OrChain { condition_blocks, then_region, .. } => {
+            Region::OrChain { condition_blocks, then_region, nested_and_chains, .. } => {
                 nodes.extend(condition_blocks.iter().copied());
+                // Also include nodes from nested AND chains
+                for and_chain in nested_and_chains.values() {
+                    nodes.extend(and_chain.iter().copied());
+                }
                 then_region.collect_nodes(nodes);
             }
             Region::Goto { .. } | Region::Empty => {}
@@ -374,8 +386,11 @@ impl Region {
             Region::TryCatch { try_body, catch_body, .. } => {
                 try_body.block_count() + catch_body.block_count()
             }
-            Region::OrChain { condition_blocks, then_region, .. } => {
-                condition_blocks.len() + then_region.block_count()
+            Region::OrChain { condition_blocks, then_region, nested_and_chains, .. } => {
+                let nested_count: usize = nested_and_chains.values()
+                    .map(|chain| chain.len().saturating_sub(1)) // First block already counted
+                    .sum();
+                condition_blocks.len() + nested_count + then_region.block_count()
             }
             Region::Goto { .. } | Region::Empty => 0,
         }

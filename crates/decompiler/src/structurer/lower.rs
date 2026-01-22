@@ -85,7 +85,8 @@ fn lower_region_inner(region: &Region, ctx: &mut LoweringContext<'_>) -> Vec<Sta
             then_region,
             continuation,
             last_condition_inverted,
-        } => lower_or_chain(condition_blocks, then_region, *continuation, *last_condition_inverted, ctx),
+            nested_and_chains,
+        } => lower_or_chain(condition_blocks, then_region, *continuation, *last_condition_inverted, nested_and_chains, ctx),
         Region::Goto { target } => lower_goto(*target, ctx),
         Region::Empty => Vec::new(),
     }
@@ -792,14 +793,12 @@ fn lower_try_catch(
 }
 
 /// Lower an OR chain region to statements.
-///
-/// OR chains like `if (a || b || c || d) throw X` are converted to a single if statement
-/// with a compound OR condition.
 fn lower_or_chain(
     condition_blocks: &[NodeIndex],
     then_region: &Region,
     _continuation: NodeIndex,
     last_condition_inverted: bool,
+    nested_and_chains: &std::collections::HashMap<usize, Vec<NodeIndex>>,
     ctx: &mut LoweringContext<'_>,
 ) -> Vec<Statement> {
     let mut stmts = Vec::new();
@@ -809,22 +808,27 @@ fn lower_or_chain(
     let num_conditions = condition_blocks.len();
 
     for (i, &block_node) in condition_blocks.iter().enumerate() {
-        // Lower any preamble statements (before the conditional jump)
-        // This uses lower_block_opcodes which properly sets up SSA context
-        // and tracks inline expressions
-        let preamble = ctx.lower_block_opcodes(block_node);
-        stmts.extend(preamble);
+        // Check if this condition has a nested AND chain
+        if let Some(and_chain) = nested_and_chains.get(&i) {
+            // Build compound AND expression from the nested chain
+            let and_cond = build_nested_and_expression(and_chain, ctx, &mut stmts);
+            conditions.push(and_cond);
+        } else {
+            // Regular OR condition - lower preamble and extract condition
+            let preamble = ctx.lower_block_opcodes(block_node);
+            stmts.extend(preamble);
 
-        // Extract condition from the terminating conditional jump
-        let mut cond = ctx.extract_condition(block_node);
+            // Extract condition from the terminating conditional jump
+            let mut cond = ctx.extract_condition(block_node);
 
-        // If this is the last condition and it's inverted, negate it
-        // (e.g., `JSGte` jumping to success means `!(x >= 0)` = `x < 0`)
-        if last_condition_inverted && i == num_conditions - 1 {
-            cond = not(cond);
+            // If this is the last condition and it's inverted, negate it
+            // (e.g., `JSGte` jumping to success means `!(x >= 0)` = `x < 0`)
+            if last_condition_inverted && i == num_conditions - 1 {
+                cond = not(cond);
+            }
+
+            conditions.push(cond);
         }
-
-        conditions.push(cond);
     }
 
     // Build compound OR condition: cond0 || cond1 || cond2 || ...
@@ -847,6 +851,53 @@ fn lower_or_chain(
     });
 
     stmts
+}
+
+/// Build a compound AND expression from a nested AND chain.
+///
+/// For `(b > 0 && c > 0)` in `if (a || (b > 0 && c > 0) || d)`:
+/// - First block: `if b <= 0 jump to skip` -> condition is `b > 0` (negated)
+/// - Last block: `if c > 0 jump to shared` -> condition is `c > 0` (direct)
+///
+/// The conditions are connected with AND.
+fn build_nested_and_expression(
+    and_chain: &[NodeIndex],
+    ctx: &mut LoweringContext<'_>,
+    preamble_stmts: &mut Vec<Statement>,
+) -> Expr {
+    let mut and_conditions: Vec<Expr> = Vec::new();
+
+    for (i, &cfg_node) in and_chain.iter().enumerate() {
+        // Lower preamble statements for this block
+        let preamble = ctx.lower_block_opcodes(cfg_node);
+        preamble_stmts.extend(preamble);
+
+        // Extract the condition from this block
+        let cond = ctx.extract_condition(cfg_node);
+
+        if i < and_chain.len() - 1 {
+            // Non-last AND block: condition is INVERTED
+            // These blocks jump to the skip target when the condition is TRUE
+            // So `JSGte if 0 >= b` (b <= 0) needs to become `b > 0`
+            // The extract_condition returns the condition for the TRUE branch,
+            // so we need to NEGATE it for the AND logic
+            and_conditions.push(not(cond));
+        } else {
+            // Last AND block: condition is DIRECT (inherited jcond=true)
+            // These blocks jump to shared_target when condition is TRUE
+            // So `JSLt if 0 < c` (c > 0) stays as `c > 0`
+            and_conditions.push(cond);
+        }
+    }
+
+    // Build compound AND: cond0 && cond1 && cond2 && ...
+    if and_conditions.is_empty() {
+        Expr::Constant(crate::ast::Constant::Bool(true))
+    } else {
+        and_conditions.into_iter().reduce(|acc, cond| {
+            Expr::Op(crate::ast::Operation::LogicalAnd(Box::new(acc), Box::new(cond)))
+        }).unwrap()
+    }
 }
 
 /// Lower a goto region to statements.

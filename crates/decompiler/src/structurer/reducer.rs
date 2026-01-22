@@ -458,11 +458,14 @@ fn collapse_if(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &IfPattern) -> bool
     }
 }
 
-/// Collapse an OR chain pattern into a Region::IfThenElse with compound condition.
+/// Collapse an OR chain pattern into a Region::OrChain with compound condition.
 ///
 /// OR chains like `if (a || b || c || d) throw X` compile to multiple condition blocks
-/// that all share the same true target. We collapse them into a single IfThenElse with
-/// the shared target as the then branch.
+/// that all share the same true target. We collapse them into a single OrChain region
+/// with the shared target as the then branch.
+///
+/// Nested AND chains like `if (a || (b && c) || d) throw X` are also handled.
+/// The nested_and_chains map stores which condition indices have AND sub-chains.
 ///
 /// Returns true if progress was made (nodes were reduced).
 fn collapse_or_chain(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &OrChainPattern) -> bool {
@@ -482,17 +485,32 @@ fn collapse_or_chain(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &OrChainPatte
         .filter_map(|&node| graph.get_node(node).and_then(|n| n.as_block()))
         .collect();
 
+    // Convert nested_and_chains from pattern indices to use CFG nodes directly
+    // The pattern uses indices into condition_nodes, but we need the actual CFG nodes
+    let nested_and_chains = pattern.nested_and_chains.clone();
+
     let if_region = Region::OrChain {
         condition_blocks: condition_cfg_nodes,
         then_region: Box::new(then_region),
         continuation: pattern.continuation,
         last_condition_inverted: pattern.last_condition_inverted,
+        nested_and_chains,
     };
 
-    // Collect all nodes to collapse: all condition nodes + shared target
+    // Collect all nodes to collapse: all condition nodes + shared target + nested AND blocks
     let mut nodes_to_collapse = HashSet::new();
     nodes_to_collapse.extend(pattern.condition_nodes.iter().copied());
     nodes_to_collapse.insert(pattern.shared_target);
+
+    // Also include all nested AND chain nodes
+    for and_chain in pattern.nested_and_chains.values() {
+        for &cfg_node in and_chain {
+            if let Some(region_node) = graph.get_region_node(cfg_node) {
+                nodes_to_collapse.insert(region_node);
+            }
+        }
+    }
+
     // Don't include continuation - that's where control goes after the OR chain
 
     // Only collapse if we have 2+ nodes

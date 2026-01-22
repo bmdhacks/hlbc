@@ -387,9 +387,25 @@ pub struct TryCatchPattern {
 /// THROW: throw X
 /// CONTINUE: ...
 /// ```
+///
+/// Nested AND chains within OR chains are also supported. For example:
+/// `if (a || (b && c) || d) throw X;` compiles to:
+/// ```text
+/// Block 0: if a jump to THROW else Block 2 (OR)
+/// Block 2: if b <= 0 jump to Block 6 else Block 4 (AND start - skips to next OR on false)
+/// Block 4: if c > 0 jump to THROW else Block 6 (AND end - inherits outer jcond=true)
+/// Block 6: if d >= 0 jump to CONTINUE else THROW (inverted last OR)
+/// ```
+///
+/// Note: AND chain patterns like `if (a && b && c) work;` have a similar CFG structure
+/// but with the continuation also flowing to the shared target. These are NOT matched
+/// as OR chains (we return None in pattern detection) and are instead handled by the
+/// normal if-pattern detector, which produces correct nested if-else structures.
 #[derive(Debug, Clone)]
 pub struct OrChainPattern {
     /// All condition nodes in the chain (in order).
+    /// For nested AND chains, this includes the first block of each AND sub-chain
+    /// (the one that starts the AND).
     pub condition_nodes: Vec<NodeIndex>,
 
     /// The shared "true" target (e.g., the throw block).
@@ -404,6 +420,12 @@ pub struct OrChainPattern {
     /// Whether the last condition is inverted (jumps to continuation on true).
     /// When true, the last condition should be negated in the compound OR.
     pub last_condition_inverted: bool,
+
+    /// Nested AND chains within the OR chain.
+    /// Maps OR condition index to the CFG nodes in that AND sub-chain.
+    /// The first node in each Vec is the AND-start block (which is also in condition_nodes),
+    /// followed by the remaining AND blocks up to and including the AND-end block.
+    pub nested_and_chains: HashMap<usize, Vec<NodeIndex>>,
 }
 
 /// Find loop patterns in the graph that can be collapsed.
@@ -914,6 +936,81 @@ pub fn find_or_chain_patterns(
     patterns
 }
 
+/// Try to detect a nested AND sub-chain within an OR chain.
+///
+/// When building an OR chain, if we encounter a block whose `true` target is NOT
+/// the shared target, it might be the start of a nested AND sub-chain.
+///
+/// For `if (a || (b && c) || d) throw`:
+/// - Block for condition `b`: true -> next_OR_block (skip on b<=0), false -> block_c
+/// - Block for condition `c`: true -> shared_target (inherited jcond), false -> next_OR_block
+///
+/// Returns (and_chain_cfg_nodes, rejoin_cfg_node) if a nested AND is detected.
+fn try_detect_nested_and(
+    cfg: &Cfg,
+    start_cfg_node: NodeIndex,
+    shared_target_cfg: NodeIndex,
+    skip_target_cfg: NodeIndex,
+) -> Option<(Vec<NodeIndex>, NodeIndex)> {
+    // The start block's true target should be the skip target (next OR condition)
+    // and its false target should lead into the AND chain
+    let start_succs = cfg.successors_with_edges(start_cfg_node);
+    if start_succs.len() != 2 {
+        return None;
+    }
+
+    let (true_target, false_target, _) = identify_branches(&start_succs)?;
+
+    // Verify the structure: true -> skip_target, false -> AND continuation
+    if true_target != skip_target_cfg {
+        return None;
+    }
+
+    // Start collecting AND chain nodes, beginning with the start block
+    let mut and_chain = vec![start_cfg_node];
+    let mut current_cfg = false_target;
+
+    // Follow the false path to collect AND chain blocks
+    // The AND chain ends when we find a block whose true target is shared_target
+    loop {
+        let succs = cfg.successors_with_edges(current_cfg);
+        if succs.len() != 2 {
+            // Not a conditional - AND chain broken
+            return None;
+        }
+
+        let (next_true, next_false, _) = identify_branches(&succs)?;
+
+        if next_true == shared_target_cfg {
+            // This is the AND-end block - it inherits the outer jcond=true
+            // Its condition jumps to shared_target when true
+            and_chain.push(current_cfg);
+            // The false path should go to skip_target (rejoin the OR chain)
+            if next_false == skip_target_cfg {
+                return Some((and_chain, skip_target_cfg));
+            }
+            // Otherwise the AND chain doesn't properly rejoin the OR chain
+            return None;
+        }
+
+        // Check if this block continues the AND chain
+        // AND blocks jump to skip_target on true (condition false -> skip)
+        if next_true == skip_target_cfg {
+            // This is another AND block in the chain
+            and_chain.push(current_cfg);
+            current_cfg = next_false;
+        } else {
+            // This block doesn't fit the AND pattern
+            return None;
+        }
+
+        // Safety limit to prevent infinite loops
+        if and_chain.len() > 100 {
+            return None;
+        }
+    }
+}
+
 /// Try to build an OR chain starting from a given node.
 fn try_build_or_chain(
     region_graph: &RegionGraph,
@@ -945,6 +1042,7 @@ fn try_build_or_chain(
     let mut condition_nodes = vec![start_node];
     let mut current_false_target = false_target;
     let mut last_condition_inverted = false;
+    let mut nested_and_chains: HashMap<usize, Vec<NodeIndex>> = HashMap::new();
 
     loop {
         // Get the region node for the current false target
@@ -977,16 +1075,44 @@ fn try_build_or_chain(
             current_false_target = next_false_target;
             last_condition_inverted = false;
         } else {
-            // Different true target - chain ends here
-            // But check for the inverted last condition pattern:
-            // Last condition might be `if (x >= 0) jump to CONTINUE else THROW`
-            // which is `if !(x < 0)` - still part of the OR chain
+            // Different true target - could be:
+            // 1. Inverted last condition: false -> shared_target
+            // 2. Nested AND chain: true -> later_OR_block, false -> AND_continuation
+            // 3. End of OR chain
+
             if next_false_target == shared_target_cfg {
-                // The last condition is inverted - include it
+                // Case 1: The last condition is inverted
+                // e.g., `if (d >= 0) jump to CONTINUE else THROW`
                 condition_nodes.push(current_region_node);
                 current_false_target = next_true_target; // Continuation is true target
                 last_condition_inverted = true;
+                break;
             }
+
+            // Case 2: Check for nested AND chain
+            // The true target should be a later OR condition block (eventually reaches shared_target or is inverted)
+            // Try to detect if there's a valid AND chain starting at current_false_target
+            if let Some((and_chain_cfg, rejoin_cfg)) = try_detect_nested_and(
+                cfg,
+                current_false_target,
+                shared_target_cfg,
+                next_true_target,
+            ) {
+                // Found a nested AND chain!
+                // Store the AND chain for this condition index
+                let condition_idx = condition_nodes.len();
+                nested_and_chains.insert(condition_idx, and_chain_cfg.clone());
+
+                // Add the first block of the AND chain as the condition node
+                condition_nodes.push(current_region_node);
+
+                // Continue OR chain from the rejoin point
+                current_false_target = rejoin_cfg;
+                last_condition_inverted = false;
+                continue;
+            }
+
+            // Case 3: End of OR chain
             break;
         }
     }
@@ -1010,12 +1136,30 @@ fn try_build_or_chain(
     // Get region node for continuation
     let continuation = region_graph.get_region_node(current_false_target)?;
 
+    // Check if continuation flows to shared_target
+    // This happens in AND chain patterns like `if (a && b && c) work;` where:
+    // - Guards jump to shared_target (return) on failure
+    // - Continuation (work) also flows to shared_target (return) after completing
+    //
+    // In this case, we should NOT match as an OR chain. The if-pattern detector
+    // will handle these as nested if-else structures, which produces correct output.
+    // Matching as an OR chain creates problematic graph structures (diamonds).
+    let continuation_flows_to_shared = cfg
+        .successors(current_false_target)
+        .contains(&shared_target_cfg);
+
+    if continuation_flows_to_shared {
+        // Skip AND chain patterns - let the if-pattern detector handle them
+        return None;
+    }
+
     Some(OrChainPattern {
         condition_nodes,
         shared_target,
         continuation,
         shared_target_terminates,
         last_condition_inverted,
+        nested_and_chains,
     })
 }
 
