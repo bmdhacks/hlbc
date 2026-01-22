@@ -464,11 +464,17 @@ impl SsaCfg {
             }
             // Uses in regular operations - these are in-block uses
             for op in &block.ops {
-                if let SsaInstr::Op { uses, .. } = op {
-                    for use_var in uses {
-                        // Skip version 0 (undefined/parameter)
-                        if use_var.version > 0 {
-                            info.entry(*use_var).or_default().use_count += 1;
+                if let SsaInstr::Op { op_idx, uses, .. } = op {
+                    // NullCheck uses don't prevent inlining - they're compiler-inserted
+                    // guards that don't consume the value. The subsequent Field/SetField
+                    // operation is the actual consumer.
+                    let is_nullcheck = matches!(&f.ops[*op_idx], Opcode::NullCheck { .. });
+                    if !is_nullcheck {
+                        for use_var in uses {
+                            // Skip version 0 (undefined/parameter)
+                            if use_var.version > 0 {
+                                info.entry(*use_var).or_default().use_count += 1;
+                            }
                         }
                     }
                 }

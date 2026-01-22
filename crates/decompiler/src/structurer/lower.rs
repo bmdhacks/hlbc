@@ -695,9 +695,13 @@ fn lower_switch(
             // Try to resolve the variable from the selector expression
             match selector {
                 Expr::Variable(reg, _) => {
-                    // Set up SSA context for the block's first op for name resolution
-                    ctx.structurer.current_op = block.start;
-                    if let Some((ssa_dst, ssa_uses)) = ctx.structurer.ssa.get_instr_for_op(block.start) {
+                    // Set up SSA context for the block's END op for name resolution.
+                    // For string switches, the JNull at block.end is the opcode that
+                    // uses the switch argument register, so that's where we need context.
+                    // Using block.start would fail if the variable's debug name was
+                    // assigned between block.start and block.end.
+                    ctx.structurer.current_op = block.end;
+                    if let Some((ssa_dst, ssa_uses)) = ctx.structurer.ssa.get_instr_for_op(block.end) {
                         ctx.structurer.current_ssa_dst = ssa_dst;
                         ctx.structurer.current_ssa_uses = ssa_uses.clone();
                     } else {
