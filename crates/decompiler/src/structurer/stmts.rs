@@ -332,16 +332,6 @@ impl<'a> Structurer<'a> {
         None
     }
 
-    /// Convert a global reference to an expression.
-    /// Checks for string constants first, otherwise returns an identifier.
-    pub(super) fn global_to_expr(&self, global: hlbc::types::RefGlobal) -> Expr {
-        if let Some(string_ref) = self.get_global_string_value(global) {
-            Expr::Constant(Constant::String(string_ref))
-        } else {
-            Expr::Ident(self.get_global_name(global))
-        }
-    }
-
     /// Get the type reference for a register.
     pub(super) fn get_type_ref(&self, reg: Reg) -> RefType {
         let reg_idx = reg.0 as usize;
@@ -813,16 +803,31 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::Call1 { dst, fun, arg0 } => {
-                // Check for constructor call: Call1 following New with same register
-                // Pattern: New reg0 = new Type; Call1 void = Constructor(reg0)
-                // Skip since the New already creates the object
-                if op_idx > 0 {
-                    if let Some(Opcode::New { dst: new_dst }) = self.func.ops.get(op_idx - 1) {
-                        if *new_dst == *arg0 {
-                            // This is a constructor call following New - skip it
-                            return stmts;
-                        }
+                // Check for constructor calls
+                if self.is_constructor_function(*fun) {
+                    // Check for pending constructor: Call1 __constructor__(obj) - no-arg constructor
+                    if let Some((type_ref, new_op_idx)) = self.pending_constructors.remove(arg0) {
+                        // No-arg constructor
+                        let ctor_args = vec![];
+                        // Use SSA destination from the New opcode for proper variable naming
+                        let var = if let Some((Some(ssa_dst), _)) = self.ssa.get_instr_for_op(new_op_idx) {
+                            self.reg_to_expr_ssa_dst(*arg0, ssa_dst)
+                        } else {
+                            self.reg_to_expr_dst(*arg0)
+                        };
+                        let ctor = ConstructorCall::new(type_ref, ctor_args);
+                        stmts.push(self.make_assign(var, Expr::Constructor(ctor)));
+                        return stmts;
                     }
+                    // No pending constructor - if first arg is reg0 and we're in a constructor,
+                    // this is a super() call; otherwise suppress
+                    if self.is_current_function_constructor() && *arg0 == Reg(0) {
+                        let call = Call::new_super(vec![]);
+                        stmts.push(self.make_call_stmt(*dst, call));
+                        return stmts;
+                    }
+                    // Constructor call without pending New - suppress it
+                    return stmts;
                 }
 
                 // Check for super method call: calling parent's method with same name, this as arg
@@ -840,28 +845,81 @@ impl<'a> Structurer<'a> {
                     self.iterator_regs.insert(*dst);
                 }
 
-                // Check for array wrapper functions: TypeName(array) -> ArrayObj
-                // These are generated functions that wrap native arrays into typed ArrayObj
-                // The function name matches a type (String, Int, etc.) and takes array, returns ArrayObj
-                // We can just pass through the array since it's already been assigned
+                // Check for internal HL type initializer/wrapper functions
+                // These are generated functions for hl.types.* (ArrayBytes, ArrayObj, IntMap, etc.)
+                // NOT user functions that happen to take hl.types.* arguments
                 if let Some(func) = fun.as_fn(self.code) {
-                    // Check if return type is ArrayObj or ArrayDyn
-                    if let Some(ret_type) = self.code.types.get(func.ty(self.code).ret.0) {
-                        if let Type::Obj(obj) = ret_type {
-                            if let Some(ret_name) = self.code.strings.get(obj.name.0) {
-                                if ret_name == "hl.types.ArrayObj" || ret_name == "hl.types.ArrayDyn" {
-                                    // Check if first arg is array type
-                                    if !func.ty(self.code).args.is_empty() {
-                                        if let Some(Type::Array) = self.code.types.get(func.ty(self.code).args[0].0) {
-                                            // This is an array wrapper - just pass through the array
-                                            let var = self.reg_to_expr_dst(*dst);
-                                            let arr = self.reg_to_expr(*arg0);
-                                            stmts.push(self.make_assign(var, arr));
-                                            return stmts;
-                                        }
-                                    }
-                                }
+                    let ty = func.ty(self.code);
+                    let fun_name = fun.name(self.code);
+
+                    // Check if this function is defined on an internal HL type
+                    let func_is_on_hl_type = func.parent
+                        .and_then(|p| p.as_obj(self.code))
+                        .map(|obj| {
+                            let parent_name = obj.name(self.code);
+                            parent_name.starts_with("hl.types.") ||
+                            parent_name.starts_with("hl.$types.") ||
+                            parent_name.starts_with("haxe.std.hl.types.")
+                        })
+                        .unwrap_or(false);
+
+                    // Check if this is a type initializer function (name is a primitive type)
+                    // These are functions like String@183, Int@xxx that initialize hl.types.* objects
+                    let is_type_initializer = matches!(
+                        fun_name.as_ref(),
+                        "String" | "Int" | "Float" | "Bool" | "Dynamic" | "Single" |
+                        "Int8" | "Int16" | "Int32" | "Int64" | "UInt8" | "UInt16"
+                    );
+
+                    if (func_is_on_hl_type || is_type_initializer) && !ty.args.is_empty() {
+                        // Check if first arg is an internal HL type (hl.types.*)
+                        let first_arg_is_hl_type = {
+                            if let Some(Type::Obj(obj)) = self.code.types.get(ty.args[0].0) {
+                                let arg_type_name = self.code.get(obj.name);
+                                arg_type_name.starts_with("hl.types.") ||
+                                arg_type_name.starts_with("hl.$types.")
+                            } else {
+                                false
                             }
+                        };
+
+                        // Check if first arg is a native array type
+                        let first_arg_is_native_array = matches!(
+                            self.code.types.get(ty.args[0].0),
+                            Some(Type::Array)
+                        );
+
+                        // Check if return type is an internal HL type
+                        let ret_is_hl_type = {
+                            if let Some(Type::Obj(obj)) = self.code.types.get(ty.ret.0) {
+                                let ret_name = self.code.get(obj.name);
+                                ret_name.starts_with("hl.types.") || ret_name.starts_with("hl.$types.")
+                            } else {
+                                false
+                            }
+                        };
+
+                        if first_arg_is_hl_type {
+                            // Check if return type is void - this is an initializer, suppress it
+                            if matches!(self.code.types.get(ty.ret.0), Some(Type::Void)) {
+                                return stmts;
+                            }
+
+                            // Return is also hl.types.* - internal wrapper, pass through
+                            if ret_is_hl_type {
+                                let var = self.reg_to_expr_dst(*dst);
+                                let arr = self.reg_to_expr(*arg0);
+                                stmts.push(self.make_assign(var, arr));
+                                return stmts;
+                            }
+                        }
+
+                        // Native array being wrapped into hl.types.* - pass through the array
+                        if first_arg_is_native_array && ret_is_hl_type {
+                            let var = self.reg_to_expr_dst(*dst);
+                            let arr = self.reg_to_expr(*arg0);
+                            stmts.push(self.make_assign(var, arr));
+                            return stmts;
                         }
                     }
                 }
@@ -899,6 +957,33 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::Call2 { dst, fun, arg0, arg1 } => {
+                // Check for constructor calls
+                if self.is_constructor_function(*fun) {
+                    // Check for pending constructor: Call2 __constructor__(obj, arg1)
+                    if let Some((type_ref, new_op_idx)) = self.pending_constructors.remove(arg0) {
+                        let ctor_args = vec![self.reg_to_expr(*arg1)];
+                        // Use SSA destination from the New opcode for proper variable naming
+                        let var = if let Some((Some(ssa_dst), _)) = self.ssa.get_instr_for_op(new_op_idx) {
+                            self.reg_to_expr_ssa_dst(*arg0, ssa_dst)
+                        } else {
+                            self.reg_to_expr_dst(*arg0)
+                        };
+                        let ctor = ConstructorCall::new(type_ref, ctor_args);
+                        stmts.push(self.make_assign(var, Expr::Constructor(ctor)));
+                        return stmts;
+                    }
+                    // No pending constructor - if first arg is reg0 and we're in a constructor,
+                    // this is a super() call; otherwise suppress (already handled elsewhere)
+                    if self.is_current_function_constructor() && *arg0 == Reg(0) {
+                        let super_args = vec![self.reg_to_expr(*arg1)];
+                        let call = Call::new_super(super_args);
+                        stmts.push(self.make_call_stmt(*dst, call));
+                        return stmts;
+                    }
+                    // Constructor call without pending New - suppress it
+                    return stmts;
+                }
+
                 let name = fun.name(self.code);
 
                 // Handle hl.BaseType.check(type, value) -> Std.isOfType(value, Type)
@@ -1045,6 +1130,39 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::Call3 { dst, fun, arg0, arg1, arg2 } => {
+                // Check for constructor calls
+                if self.is_constructor_function(*fun) {
+                    // Check for pending constructor: Call3 __constructor__(obj, arg1, arg2)
+                    if let Some((type_ref, new_op_idx)) = self.pending_constructors.remove(arg0) {
+                        let ctor_args = vec![
+                            self.reg_to_expr(*arg1),
+                            self.reg_to_expr(*arg2),
+                        ];
+                        // Use SSA destination from the New opcode for proper variable naming
+                        let var = if let Some((Some(ssa_dst), _)) = self.ssa.get_instr_for_op(new_op_idx) {
+                            self.reg_to_expr_ssa_dst(*arg0, ssa_dst)
+                        } else {
+                            self.reg_to_expr_dst(*arg0)
+                        };
+                        let ctor = ConstructorCall::new(type_ref, ctor_args);
+                        stmts.push(self.make_assign(var, Expr::Constructor(ctor)));
+                        return stmts;
+                    }
+                    // No pending constructor - if first arg is reg0 and we're in a constructor,
+                    // this is a super() call; otherwise suppress
+                    if self.is_current_function_constructor() && *arg0 == Reg(0) {
+                        let super_args = vec![
+                            self.reg_to_expr(*arg1),
+                            self.reg_to_expr(*arg2),
+                        ];
+                        let call = Call::new_super(super_args);
+                        stmts.push(self.make_call_stmt(*dst, call));
+                        return stmts;
+                    }
+                    // Constructor call without pending New - suppress it
+                    return stmts;
+                }
+
                 let args = [*arg0, *arg1, *arg2];
                 let call = self.try_make_method_call(*fun, &args)
                     .unwrap_or_else(|| Call::new_fun(*fun, vec![
@@ -1056,6 +1174,41 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::Call4 { dst, fun, arg0, arg1, arg2, arg3 } => {
+                // Check for constructor calls
+                if self.is_constructor_function(*fun) {
+                    // Check for pending constructor: Call4 __constructor__(obj, arg1, arg2, arg3)
+                    if let Some((type_ref, new_op_idx)) = self.pending_constructors.remove(arg0) {
+                        let ctor_args = vec![
+                            self.reg_to_expr(*arg1),
+                            self.reg_to_expr(*arg2),
+                            self.reg_to_expr(*arg3),
+                        ];
+                        // Use SSA destination from the New opcode for proper variable naming
+                        let var = if let Some((Some(ssa_dst), _)) = self.ssa.get_instr_for_op(new_op_idx) {
+                            self.reg_to_expr_ssa_dst(*arg0, ssa_dst)
+                        } else {
+                            self.reg_to_expr_dst(*arg0)
+                        };
+                        let ctor = ConstructorCall::new(type_ref, ctor_args);
+                        stmts.push(self.make_assign(var, Expr::Constructor(ctor)));
+                        return stmts;
+                    }
+                    // No pending constructor - if first arg is reg0 and we're in a constructor,
+                    // this is a super() call; otherwise suppress
+                    if self.is_current_function_constructor() && *arg0 == Reg(0) {
+                        let super_args = vec![
+                            self.reg_to_expr(*arg1),
+                            self.reg_to_expr(*arg2),
+                            self.reg_to_expr(*arg3),
+                        ];
+                        let call = Call::new_super(super_args);
+                        stmts.push(self.make_call_stmt(*dst, call));
+                        return stmts;
+                    }
+                    // Constructor call without pending New - suppress it
+                    return stmts;
+                }
+
                 let args = [*arg0, *arg1, *arg2, *arg3];
                 let call = self.try_make_method_call(*fun, &args)
                     .unwrap_or_else(|| Call::new_fun(*fun, vec![
@@ -1068,15 +1221,32 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::CallN { dst, fun, args } => {
-                // Check for super constructor call: inside constructor, calling parent's __constructor__
-                if self.is_current_function_constructor() && self.is_constructor_function(*fun) {
-                    if !args.is_empty() && args[0] == Reg(0) {
+                // Check for constructor calls (including super)
+                if self.is_constructor_function(*fun) && !args.is_empty() {
+                    // Check for super constructor call: inside constructor, calling parent's __constructor__ with reg0
+                    if self.is_current_function_constructor() && args[0] == Reg(0) {
                         // This is super(args...) - skip first arg (this)
                         let super_args: Vec<_> = args[1..].iter().map(|r| self.reg_to_expr(*r)).collect();
                         let call = Call::new_super(super_args);
                         stmts.push(self.make_call_stmt(*dst, call));
                         return stmts;
                     }
+
+                    // Check for pending constructor: CallN __constructor__(obj, args...)
+                    if let Some((type_ref, new_op_idx)) = self.pending_constructors.remove(&args[0]) {
+                        let ctor_args: Vec<_> = args[1..].iter().map(|r| self.reg_to_expr(*r)).collect();
+                        // Use SSA destination from the New opcode for proper variable naming
+                        let var = if let Some((Some(ssa_dst), _)) = self.ssa.get_instr_for_op(new_op_idx) {
+                            self.reg_to_expr_ssa_dst(args[0], ssa_dst)
+                        } else {
+                            self.reg_to_expr_dst(args[0])
+                        };
+                        let ctor = ConstructorCall::new(type_ref, ctor_args);
+                        stmts.push(self.make_assign(var, Expr::Constructor(ctor)));
+                        return stmts;
+                    }
+                    // Constructor call without pending New - suppress it
+                    return stmts;
                 }
 
                 let call = self.try_make_method_call(*fun, args)
@@ -1220,7 +1390,6 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::New { dst } => {
-                let var = self.reg_to_expr_dst(*dst);
                 let type_ref = self.get_type_ref(*dst);
                 // For Virtual types and DynObj (anonymous objects), use empty object literal
                 // DynObj is used when fields are set dynamically via DynSet, then cast to Virtual
@@ -1228,22 +1397,30 @@ impl<'a> Structurer<'a> {
                     &self.code.types[type_ref.0],
                     hlbc::types::Type::Virtual { .. } | hlbc::types::Type::DynObj
                 ) {
+                    let var = self.reg_to_expr_dst(*dst);
                     Some(self.make_assign(var, Expr::Anonymous(type_ref, HashMap::new())))
                 } else {
-                    // Look ahead for __constructor__ call to get constructor arguments
-                    let (ctor_args, ctor_op_idx, consumed_ops) = self.find_constructor_args(*dst, op_idx);
-                    // Only suppress opcodes if we actually found a constructor call
-                    // Otherwise, consumed_ops may contain unrelated ops that shouldn't be suppressed
-                    if let Some(idx) = ctor_op_idx {
-                        // Suppress the constructor call opcode
-                        self.suppressed_ops.insert(idx);
-                        // Suppress opcodes that contributed to constructor arguments (e.g., Float, Ref)
-                        for consumed_idx in consumed_ops {
-                            self.suppressed_ops.insert(consumed_idx);
-                        }
+                    // Check for internal HL types that don't have __constructor__ methods
+                    // These are allocated via static functions and initialized differently
+                    let is_internal_hl_type = if let Some(Type::Obj(obj)) = self.code.types.get(type_ref.0) {
+                        let type_name = self.code.get(obj.name);
+                        type_name.starts_with("hl.types.") || type_name.starts_with("hl.$types.")
+                    } else {
+                        false
+                    };
+
+                    if is_internal_hl_type {
+                        // Internal HL types: emit empty constructor immediately
+                        // These don't have __constructor__ calls
+                        let var = self.reg_to_expr_dst(*dst);
+                        let ctor = ConstructorCall::new(type_ref, vec![]);
+                        Some(self.make_assign(var, Expr::Constructor(ctor)))
+                    } else {
+                        // Defer constructor emission: store pending info and emit at Call site
+                        // This ensures all argument expressions are evaluated AFTER their definitions
+                        self.pending_constructors.insert(*dst, (type_ref, op_idx));
+                        None
                     }
-                    let ctor = ConstructorCall::new(type_ref, ctor_args);
-                    Some(self.make_assign(var, Expr::Constructor(ctor)))
                 }
             }
 

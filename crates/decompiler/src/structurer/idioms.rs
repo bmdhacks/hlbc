@@ -3,7 +3,6 @@
 //! This module handles detection of Haxe-specific patterns in HashLink bytecode:
 //! - String switch detection (9-opcode pattern per case)
 //! - Enum switch pattern detection and unwrapping
-//! - Constructor argument collection
 //! - Internal function suppression (__expand, __construct, etc.)
 //! - Interface cache field detection
 //!
@@ -16,25 +15,26 @@ use hlbc::opcodes::Opcode;
 use hlbc::types::{Function, Reg, RefFun, RefField, RefString, RefType, Type};
 use hlbc::{Bytecode, Resolve};
 
-use crate::ast::{Call, Constant, ConstructorCall, Expr, Operation};
+use crate::ast::{Constant, Expr};
 use crate::ssa::get_dst_reg as get_opcode_dst;
 
 use super::{StringSwitchCase, StringSwitchRegion, Structurer};
 
 impl<'a> Structurer<'a> {
-    /// Detect internal function calls (__expand, __construct, __constructor__) and suppress them.
+    /// Detect internal function calls (__expand, __construct) and suppress them.
     /// These are runtime implementation details that shouldn't appear in decompiled output.
+    /// NOTE: __constructor__ calls are handled in the Call handlers (stmts.rs), not here.
     pub fn detect_internal_function_calls(&mut self) {
         let ops = &self.func.ops;
 
         for (i, op) in ops.iter().enumerate() {
-            // Extract function ref and first argument (if any) from call opcodes
-            let (fun, first_arg) = match op {
-                Opcode::Call2 { fun, arg0, .. } => (Some(*fun), Some(*arg0)),
-                Opcode::Call3 { fun, arg0, .. } => (Some(*fun), Some(*arg0)),
-                Opcode::Call4 { fun, arg0, .. } => (Some(*fun), Some(*arg0)),
-                Opcode::CallN { fun, args, .. } => (Some(*fun), args.first().copied()),
-                _ => (None, None),
+            // Extract function ref from call opcodes
+            let fun = match op {
+                Opcode::Call2 { fun, .. } => Some(*fun),
+                Opcode::Call3 { fun, .. } => Some(*fun),
+                Opcode::Call4 { fun, .. } => Some(*fun),
+                Opcode::CallN { fun, .. } => Some(*fun),
+                _ => None,
             };
 
             if let Some(fun) = fun {
@@ -46,15 +46,10 @@ impl<'a> Structurer<'a> {
                         if name == "__expand" || name == "__construct" {
                             self.suppressed_ops.insert(i);
                         }
-                        // - __constructor__: constructor call (folded into `new Type(...)`)
-                        //   BUT NOT super constructor calls (where first arg is `this`, i.e., reg0)
-                        else if name.starts_with("__constructor__") {
-                            // Don't suppress if first arg is reg0 (this) - that's a super() call
-                            let is_super_call = first_arg == Some(Reg(0));
-                            if !is_super_call {
-                                self.suppressed_ops.insert(i);
-                            }
-                        }
+                        // NOTE: __constructor__ calls are NOT suppressed here.
+                        // They are handled in the Call handlers (Call2/Call3/Call4/CallN)
+                        // which emit proper `new Type(args)` syntax when there's a pending
+                        // constructor, or fall through to emit the super() call.
                     }
                 }
             }
@@ -562,350 +557,6 @@ impl<'a> Structurer<'a> {
         } else {
             None
         }
-    }
-
-    /// Look ahead from a New opcode to find the __constructor__ call arguments.
-    /// In HashLink bytecode, object construction is split:
-    ///   New reg0 = new Type
-    ///   GetGlobal reg1 = global@5  // "Hello World"
-    ///   Call2 __constructor__(reg0, reg1)
-    /// We need to combine these into: new Type("Hello World")
-    /// Returns (constructor_args, constructor_call_opcode_index, consumed_op_indices)
-    pub(super) fn find_constructor_args(&self, new_dst: Reg, new_op_idx: usize) -> (Vec<Expr>, Option<usize>, Vec<usize>) {
-        // Search forward within the same basic block for a constructor call
-        let block = self.cfg.op_to_block.get(&new_op_idx);
-        let search_end = block
-            .and_then(|b| Some(self.cfg.graph[*b].end))
-            .unwrap_or(self.func.ops.len().saturating_sub(1));
-
-        // Track register values from intermediate opcodes
-        let mut reg_values: HashMap<Reg, Expr> = HashMap::new();
-
-        // Track intermediate New opcodes (for nested constructors like `new Point(new Point(1,2).x, ...)`)
-        // Maps register -> type reference from the New opcode
-        let mut pending_new: HashMap<Reg, RefType> = HashMap::new();
-
-        // Track which opcodes contribute to constructor arguments (to suppress them)
-        let mut consumed_ops: Vec<usize> = Vec::new();
-
-        // Track which Call opcodes wrote to which registers, so we can consume them
-        // when their results are used as constructor arguments
-        let mut call_dst_to_idx: HashMap<Reg, usize> = HashMap::new();
-
-        for idx in (new_op_idx + 1)..=search_end {
-            // Search within the same basic block for constructor call
-            if idx >= self.func.ops.len() {
-                break;
-            }
-
-            let op = &self.func.ops[idx];
-
-            // Helper to get expression for a register - used during tracking
-            let get_val = |reg: Reg, regs: &HashMap<Reg, Expr>| -> Expr {
-                regs.get(&reg).cloned().unwrap_or_else(|| self.reg_to_expr(reg))
-            };
-
-            // Track constant/global/computed assignments
-            // Also mark opcodes as consumed so they can be suppressed
-            match op {
-                Opcode::String { dst, ptr } => {
-                    reg_values.insert(*dst, Expr::Constant(Constant::String(*ptr)));
-                    consumed_ops.push(idx);
-                }
-                Opcode::Int { dst, ptr } => {
-                    reg_values.insert(*dst, Expr::Constant(Constant::Int(*ptr)));
-                    consumed_ops.push(idx);
-                }
-                Opcode::Float { dst, ptr } => {
-                    reg_values.insert(*dst, Expr::Constant(Constant::Float(*ptr)));
-                    consumed_ops.push(idx);
-                }
-                Opcode::Bool { dst, value } => {
-                    reg_values.insert(*dst, Expr::Constant(Constant::Bool(*value)));
-                    consumed_ops.push(idx);
-                }
-                Opcode::Null { dst } => {
-                    reg_values.insert(*dst, Expr::Constant(Constant::Null));
-                    consumed_ops.push(idx);
-                }
-                // Track field access
-                Opcode::Field { dst, obj, field } => {
-                    let obj_expr = get_val(*obj, &reg_values);
-                    let field_name = self.get_field_name(*obj, *field);
-                    reg_values.insert(*dst, Expr::Field(Box::new(obj_expr), field_name));
-                    consumed_ops.push(idx);
-                }
-                // Track this.field access
-                Opcode::GetThis { dst, field } => {
-                    let this = Expr::Variable(Reg(0), Some("this".into()));
-                    let field_name = self.get_field_name(Reg(0), *field);
-                    reg_values.insert(*dst, Expr::Field(Box::new(this), field_name));
-                    consumed_ops.push(idx);
-                }
-                // Track arithmetic operations
-                Opcode::Add { dst, a, b } => {
-                    let a_expr = get_val(*a, &reg_values);
-                    let b_expr = get_val(*b, &reg_values);
-                    reg_values.insert(*dst, Expr::Op(Operation::Add(Box::new(a_expr), Box::new(b_expr))));
-                    consumed_ops.push(idx);
-                }
-                Opcode::Sub { dst, a, b } => {
-                    let a_expr = get_val(*a, &reg_values);
-                    let b_expr = get_val(*b, &reg_values);
-                    reg_values.insert(*dst, Expr::Op(Operation::Sub(Box::new(a_expr), Box::new(b_expr))));
-                    consumed_ops.push(idx);
-                }
-                Opcode::Mul { dst, a, b } => {
-                    let a_expr = get_val(*a, &reg_values);
-                    let b_expr = get_val(*b, &reg_values);
-                    reg_values.insert(*dst, Expr::Op(Operation::Mul(Box::new(a_expr), Box::new(b_expr))));
-                    consumed_ops.push(idx);
-                }
-                Opcode::SDiv { dst, a, b } | Opcode::UDiv { dst, a, b } => {
-                    let a_expr = get_val(*a, &reg_values);
-                    let b_expr = get_val(*b, &reg_values);
-                    reg_values.insert(*dst, Expr::Op(Operation::Div(Box::new(a_expr), Box::new(b_expr))));
-                    consumed_ops.push(idx);
-                }
-                Opcode::Neg { dst, src } => {
-                    let src_expr = get_val(*src, &reg_values);
-                    reg_values.insert(*dst, Expr::Op(Operation::Neg(Box::new(src_expr))));
-                    consumed_ops.push(idx);
-                }
-                // Track moves
-                Opcode::Mov { dst, src } => {
-                    let src_expr = get_val(*src, &reg_values);
-                    reg_values.insert(*dst, src_expr);
-                    consumed_ops.push(idx);
-                }
-                // Track refs - pass through the underlying value
-                Opcode::Ref { dst, src } => {
-                    let src_expr = get_val(*src, &reg_values);
-                    reg_values.insert(*dst, src_expr);
-                    consumed_ops.push(idx);
-                }
-                // Track casts
-                Opcode::ToSFloat { dst, src } | Opcode::ToUFloat { dst, src } => {
-                    let src_expr = get_val(*src, &reg_values);
-                    reg_values.insert(*dst, Expr::Cast(Box::new(src_expr), "Float".into()));
-                    consumed_ops.push(idx);
-                }
-                Opcode::ToInt { dst, src } => {
-                    let src_expr = get_val(*src, &reg_values);
-                    let call = Expr::Call(Box::new(Call {
-                        fun: Expr::Field(Box::new(Expr::Ident("Std".into())), "int".into()),
-                        args: vec![src_expr],
-                    }));
-                    reg_values.insert(*dst, call);
-                    consumed_ops.push(idx);
-                }
-                // Track function calls (for things like Math.cos, Math.sin, inner.clone(), etc.)
-                // We track calls into reg_values for value propagation and map dst -> idx
-                // in call_dst_to_idx. When the constructor is found, we consume any calls
-                // whose results are directly used as constructor arguments (the call is
-                // inlined into the constructor expression, so no separate statement needed).
-                Opcode::Call0 { dst, fun } => {
-                    let call = Expr::Call(Box::new(Call::new_fun(*fun, vec![])));
-                    reg_values.insert(*dst, call);
-                    call_dst_to_idx.insert(*dst, idx);
-                }
-                Opcode::Call1 { dst, fun, arg0 } => {
-                    let arg = get_val(*arg0, &reg_values);
-                    // Try to detect method call (obj.method() instead of method(obj))
-                    // Use the tracked value (arg) as receiver, not reg_to_expr
-                    let call = if let Some((owner_type, method_name)) = self.get_method_info(*fun) {
-                        let first_arg_type = self.get_type_ref(*arg0);
-                        if self.is_subtype_of(first_arg_type, owner_type) {
-                            // Create method call: obj.method()
-                            let method = Expr::Field(Box::new(arg.clone()), method_name);
-                            Expr::Call(Box::new(Call { fun: method, args: vec![] }))
-                        } else {
-                            Expr::Call(Box::new(Call::new_fun(*fun, vec![arg])))
-                        }
-                    } else {
-                        Expr::Call(Box::new(Call::new_fun(*fun, vec![arg])))
-                    };
-                    reg_values.insert(*dst, call);
-                    call_dst_to_idx.insert(*dst, idx);
-                }
-                // Track Call2 but skip if it's the constructor call we're looking for
-                Opcode::Call2 { dst, fun, arg0, arg1 } if *arg0 != new_dst => {
-                    let a0 = get_val(*arg0, &reg_values);
-                    let a1 = get_val(*arg1, &reg_values);
-                    let call = Expr::Call(Box::new(Call::new_fun(*fun, vec![a0, a1])));
-                    reg_values.insert(*dst, call);
-                    call_dst_to_idx.insert(*dst, idx);
-                }
-                // Track Call3 but skip if it's the constructor call
-                Opcode::Call3 { dst, fun, arg0, arg1, arg2 } if *arg0 != new_dst => {
-                    let a0 = get_val(*arg0, &reg_values);
-                    let a1 = get_val(*arg1, &reg_values);
-                    let a2 = get_val(*arg2, &reg_values);
-                    let call = Expr::Call(Box::new(Call::new_fun(*fun, vec![a0, a1, a2])));
-                    reg_values.insert(*dst, call);
-                    call_dst_to_idx.insert(*dst, idx);
-                }
-                // Track Call4 but skip if it's the constructor call
-                Opcode::Call4 { dst, fun, arg0, arg1, arg2, arg3 } if *arg0 != new_dst => {
-                    let a0 = get_val(*arg0, &reg_values);
-                    let a1 = get_val(*arg1, &reg_values);
-                    let a2 = get_val(*arg2, &reg_values);
-                    let a3 = get_val(*arg3, &reg_values);
-                    let call = Expr::Call(Box::new(Call::new_fun(*fun, vec![a0, a1, a2, a3])));
-                    reg_values.insert(*dst, call);
-                    call_dst_to_idx.insert(*dst, idx);
-                }
-                // Track CallN but skip if it's the constructor call
-                Opcode::CallN { dst, fun, args } if args.first() != Some(&new_dst) => {
-                    let call_args: Vec<_> = args.iter().map(|r| get_val(*r, &reg_values)).collect();
-                    let call = Expr::Call(Box::new(Call::new_fun(*fun, call_args)));
-                    reg_values.insert(*dst, call);
-                    call_dst_to_idx.insert(*dst, idx);
-                }
-                // GetGlobal is pure (just reads a global) - safe to suppress
-                Opcode::GetGlobal { dst, global } => {
-                    reg_values.insert(*dst, self.global_to_expr(*global));
-                    consumed_ops.push(idx);
-                }
-                // Track intermediate New opcodes (for nested constructors)
-                // New itself is not suppressed - it needs the constructor call tracking
-                Opcode::New { dst } if *dst != new_dst => {
-                    // Get type from the register's declared type
-                    let type_ref = self.func.regs.get(dst.0 as usize).copied().unwrap_or(RefType(0));
-                    pending_new.insert(*dst, type_ref);
-                    // Don't suppress - nested New needs its own constructor handling
-                }
-                _ => {}
-            }
-
-            // Helper function to get expression for a register (not a closure to avoid borrow issues)
-            // Also checks pending_new for New operations without constructor calls (e.g., internal HL arrays)
-            fn get_expr(
-                reg: Reg,
-                reg_values: &HashMap<Reg, Expr>,
-                pending_new: &HashMap<Reg, RefType>,
-                structurer: &Structurer
-            ) -> Expr {
-                if let Some(expr) = reg_values.get(&reg) {
-                    expr.clone()
-                } else if let Some(type_ref) = pending_new.get(&reg) {
-                    // New without constructor call - create empty constructor expression
-                    // This handles internal HL types like hl.types.ArrayObj
-                    Expr::Constructor(ConstructorCall::new(*type_ref, vec![]))
-                } else {
-                    structurer.reg_to_expr(reg)
-                }
-            }
-
-            // Check for intermediate __constructor__ calls (for nested constructors)
-            // These are constructor calls on registers OTHER than our target new_dst
-            match op {
-                Opcode::Call2 { fun, arg0, arg1, .. }
-                    if *arg0 != new_dst && self.is_constructor_function(*fun) => {
-                    // Build the complete constructor expression for this intermediate object
-                    if let Some(ty_ref) = pending_new.remove(arg0) {
-                        let args = vec![get_expr(*arg1, &reg_values, &pending_new, self)];
-                        let ctor = Expr::Constructor(ConstructorCall::new(ty_ref, args));
-                        reg_values.insert(*arg0, ctor);
-                    }
-                }
-                Opcode::Call3 { fun, arg0, arg1, arg2, .. }
-                    if *arg0 != new_dst && self.is_constructor_function(*fun) => {
-                    if let Some(ty_ref) = pending_new.remove(arg0) {
-                        let args = vec![
-                            get_expr(*arg1, &reg_values, &pending_new, self),
-                            get_expr(*arg2, &reg_values, &pending_new, self)
-                        ];
-                        let ctor = Expr::Constructor(ConstructorCall::new(ty_ref, args));
-                        reg_values.insert(*arg0, ctor);
-                    }
-                }
-                Opcode::Call4 { fun, arg0, arg1, arg2, arg3, .. }
-                    if *arg0 != new_dst && self.is_constructor_function(*fun) => {
-                    if let Some(ty_ref) = pending_new.remove(arg0) {
-                        let args = vec![
-                            get_expr(*arg1, &reg_values, &pending_new, self),
-                            get_expr(*arg2, &reg_values, &pending_new, self),
-                            get_expr(*arg3, &reg_values, &pending_new, self),
-                        ];
-                        let ctor = Expr::Constructor(ConstructorCall::new(ty_ref, args));
-                        reg_values.insert(*arg0, ctor);
-                    }
-                }
-                Opcode::CallN { fun, args, .. }
-                    if !args.is_empty() && args[0] != new_dst && self.is_constructor_function(*fun) => {
-                    if let Some(ty_ref) = pending_new.remove(&args[0]) {
-                        let ctor_args: Vec<_> = args[1..].iter()
-                            .map(|r| get_expr(*r, &reg_values, &pending_new, self))
-                            .collect();
-                        let ctor = Expr::Constructor(ConstructorCall::new(ty_ref, ctor_args));
-                        reg_values.insert(args[0], ctor);
-                    }
-                }
-                _ => {}
-            }
-
-            // Check for the target constructor call
-            match op {
-                // Call2 __constructor__(obj, arg1)
-                Opcode::Call2 { fun, arg0, arg1, .. } if *arg0 == new_dst => {
-                    if self.is_constructor_function(*fun) {
-                        // Consume any Call that wrote to arg registers
-                        if let Some(&call_idx) = call_dst_to_idx.get(arg1) {
-                            consumed_ops.push(call_idx);
-                        }
-                        return (vec![get_expr(*arg1, &reg_values, &pending_new, self)], Some(idx), consumed_ops);
-                    }
-                }
-                // Call3 __constructor__(obj, arg1, arg2)
-                Opcode::Call3 { fun, arg0, arg1, arg2, .. } if *arg0 == new_dst => {
-                    if self.is_constructor_function(*fun) {
-                        // Consume any Call that wrote to arg registers
-                        for arg in [arg1, arg2] {
-                            if let Some(&call_idx) = call_dst_to_idx.get(arg) {
-                                consumed_ops.push(call_idx);
-                            }
-                        }
-                        return (vec![
-                            get_expr(*arg1, &reg_values, &pending_new, self),
-                            get_expr(*arg2, &reg_values, &pending_new, self)
-                        ], Some(idx), consumed_ops);
-                    }
-                }
-                // Call4 __constructor__(obj, arg1, arg2, arg3)
-                Opcode::Call4 { fun, arg0, arg1, arg2, arg3, .. } if *arg0 == new_dst => {
-                    if self.is_constructor_function(*fun) {
-                        // Consume any Call that wrote to arg registers
-                        for arg in [arg1, arg2, arg3] {
-                            if let Some(&call_idx) = call_dst_to_idx.get(arg) {
-                                consumed_ops.push(call_idx);
-                            }
-                        }
-                        return (vec![
-                            get_expr(*arg1, &reg_values, &pending_new, self),
-                            get_expr(*arg2, &reg_values, &pending_new, self),
-                            get_expr(*arg3, &reg_values, &pending_new, self),
-                        ], Some(idx), consumed_ops);
-                    }
-                }
-                // CallN __constructor__(obj, args...)
-                Opcode::CallN { fun, args, .. } if !args.is_empty() && args[0] == new_dst => {
-                    if self.is_constructor_function(*fun) {
-                        // Consume any Call that wrote to arg registers
-                        for arg in &args[1..] {
-                            if let Some(&call_idx) = call_dst_to_idx.get(arg) {
-                                consumed_ops.push(call_idx);
-                            }
-                        }
-                        return (args[1..].iter()
-                            .map(|r| get_expr(*r, &reg_values, &pending_new, self))
-                            .collect(), Some(idx), consumed_ops);
-                    }
-                }
-                _ => {}
-            }
-        }
-        (vec![], None, consumed_ops) // No constructor call found
     }
 
     /// Check if a function is a __constructor__

@@ -196,6 +196,10 @@ pub struct Structurer<'a> {
     /// This allows us to skip emitting VarDecls for variables that were hoisted but never
     /// actually assigned (e.g., because the assignment was dead and skipped).
     pub(crate) actually_used_vars: HashSet<Str>,
+    /// Pending constructors: maps New dst register -> (type_ref, new_op_idx)
+    /// When New is seen, we store the info here instead of emitting.
+    /// When the constructor Call is seen, we emit the full new Type(args) statement.
+    pub(crate) pending_constructors: HashMap<Reg, (RefType, usize)>,
 }
 
 impl<'a> Structurer<'a> {
@@ -309,6 +313,7 @@ impl<'a> Structurer<'a> {
             suppressed_ops: HashSet::new(),
             enum_param_bindings: HashMap::new(),
             actually_used_vars: HashSet::new(),
+            pending_constructors: HashMap::new(),
         }
     }
 
