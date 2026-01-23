@@ -170,12 +170,11 @@ impl<'a> Structurer<'a> {
     /// Create a call statement, handling void return types correctly.
     /// For void functions, we emit just the call as an expression statement.
     /// For non-void functions, we assign the result to a variable.
-    pub(super) fn make_call_stmt(&mut self, dst: Reg, call: Call) -> Statement {
+    pub(super) fn make_call_stmt(&mut self, dst: Reg, call: Call) -> Option<Statement> {
         if self.is_void_type(dst) {
-            Statement::ExprStatement(Expr::Call(Box::new(call)))
+            Some(Statement::ExprStatement(Expr::Call(Box::new(call))))
         } else {
-            let var = self.reg_to_expr_dst(dst);
-            self.make_assign(var, Expr::Call(Box::new(call)))
+            self.try_inline_or_assign(dst, Expr::Call(Box::new(call)))
         }
     }
 
@@ -799,7 +798,7 @@ impl<'a> Structurer<'a> {
 
             Opcode::Call0 { dst, fun } => {
                 let call = Call::new_fun(*fun, vec![]);
-                Some(self.make_call_stmt(*dst, call))
+                self.make_call_stmt(*dst, call)
             }
 
             Opcode::Call1 { dst, fun, arg0 } => {
@@ -823,7 +822,7 @@ impl<'a> Structurer<'a> {
                     // this is a super() call; otherwise suppress
                     if self.is_current_function_constructor() && *arg0 == Reg(0) {
                         let call = Call::new_super(vec![]);
-                        stmts.push(self.make_call_stmt(*dst, call));
+                        stmts.extend(self.make_call_stmt(*dst, call));
                         return stmts;
                     }
                     // Constructor call without pending New - suppress it
@@ -834,7 +833,7 @@ impl<'a> Structurer<'a> {
                 if *arg0 == Reg(0) && self.is_super_method_call(*fun) {
                     if let Some(method_name) = self.get_function_name(*fun) {
                         let call = Call::new_super_method(method_name, vec![]);
-                        stmts.push(self.make_call_stmt(*dst, call));
+                        stmts.extend(self.make_call_stmt(*dst, call));
                         return stmts;
                     }
                 }
@@ -953,7 +952,7 @@ impl<'a> Structurer<'a> {
                 let args = [*arg0];
                 let call = self.try_make_method_call(*fun, &args)
                     .unwrap_or_else(|| Call::new_fun(*fun, vec![self.reg_to_expr(*arg0)]));
-                Some(self.make_call_stmt(*dst, call))
+                self.make_call_stmt(*dst, call)
             }
 
             Opcode::Call2 { dst, fun, arg0, arg1 } => {
@@ -977,7 +976,7 @@ impl<'a> Structurer<'a> {
                     if self.is_current_function_constructor() && *arg0 == Reg(0) {
                         let super_args = vec![self.reg_to_expr(*arg1)];
                         let call = Call::new_super(super_args);
-                        stmts.push(self.make_call_stmt(*dst, call));
+                        stmts.extend(self.make_call_stmt(*dst, call));
                         return stmts;
                     }
                     // Constructor call without pending New - suppress it
@@ -1016,9 +1015,7 @@ impl<'a> Structurer<'a> {
                             let value_expr = self.reg_to_expr(*arg1);
                             let type_expr = Expr::Ident(class_name.into());
                             let call = Call::new(std_is_of_type, vec![value_expr, type_expr]);
-                            let stmt = self.make_call_stmt(*dst, call);
-                            stmts.push(stmt);
-                            return stmts;
+                            stmts.extend(self.make_call_stmt(*dst, call));
                         }
                     }
                 }
@@ -1126,7 +1123,7 @@ impl<'a> Structurer<'a> {
                 let args = [*arg0, *arg1];
                 let call = self.try_make_method_call(*fun, &args)
                     .unwrap_or_else(|| Call::new_fun(*fun, vec![self.reg_to_expr(*arg0), self.reg_to_expr(*arg1)]));
-                Some(self.make_call_stmt(*dst, call))
+                self.make_call_stmt(*dst, call)
             }
 
             Opcode::Call3 { dst, fun, arg0, arg1, arg2 } => {
@@ -1156,7 +1153,7 @@ impl<'a> Structurer<'a> {
                             self.reg_to_expr(*arg2),
                         ];
                         let call = Call::new_super(super_args);
-                        stmts.push(self.make_call_stmt(*dst, call));
+                        stmts.extend(self.make_call_stmt(*dst, call));
                         return stmts;
                     }
                     // Constructor call without pending New - suppress it
@@ -1170,7 +1167,7 @@ impl<'a> Structurer<'a> {
                         self.reg_to_expr(*arg1),
                         self.reg_to_expr(*arg2),
                     ]));
-                Some(self.make_call_stmt(*dst, call))
+                self.make_call_stmt(*dst, call)
             }
 
             Opcode::Call4 { dst, fun, arg0, arg1, arg2, arg3 } => {
@@ -1202,7 +1199,7 @@ impl<'a> Structurer<'a> {
                             self.reg_to_expr(*arg3),
                         ];
                         let call = Call::new_super(super_args);
-                        stmts.push(self.make_call_stmt(*dst, call));
+                        stmts.extend(self.make_call_stmt(*dst, call));
                         return stmts;
                     }
                     // Constructor call without pending New - suppress it
@@ -1217,7 +1214,7 @@ impl<'a> Structurer<'a> {
                         self.reg_to_expr(*arg2),
                         self.reg_to_expr(*arg3),
                     ]));
-                Some(self.make_call_stmt(*dst, call))
+                self.make_call_stmt(*dst, call)
             }
 
             Opcode::CallN { dst, fun, args } => {
@@ -1228,7 +1225,7 @@ impl<'a> Structurer<'a> {
                         // This is super(args...) - skip first arg (this)
                         let super_args: Vec<_> = args[1..].iter().map(|r| self.reg_to_expr(*r)).collect();
                         let call = Call::new_super(super_args);
-                        stmts.push(self.make_call_stmt(*dst, call));
+                        stmts.extend(self.make_call_stmt(*dst, call));
                         return stmts;
                     }
 
@@ -1254,7 +1251,7 @@ impl<'a> Structurer<'a> {
                         let arg_exprs: Vec<_> = args.iter().map(|r| self.reg_to_expr(*r)).collect();
                         Call::new_fun(*fun, arg_exprs)
                     });
-                Some(self.make_call_stmt(*dst, call))
+                self.make_call_stmt(*dst, call)
             }
 
             Opcode::CallMethod { dst, field, args } => {
@@ -1330,7 +1327,7 @@ impl<'a> Structurer<'a> {
                         assign: Expr::Call(Box::new(call)),
                     })
                 } else {
-                    Some(self.make_call_stmt(*dst, call))
+                    self.make_call_stmt(*dst, call)
                 }
             }
 
@@ -1345,14 +1342,14 @@ impl<'a> Structurer<'a> {
                 let method = Expr::Field(Box::new(this), method_name);
                 let arg_exprs: Vec<_> = args.iter().map(|r| self.reg_to_expr(*r)).collect();
                 let call = Call { fun: method, args: arg_exprs };
-                Some(self.make_call_stmt(*dst, call))
+                self.make_call_stmt(*dst, call)
             }
 
             Opcode::CallClosure { dst, fun, args } => {
                 let fun_expr = self.reg_to_expr(*fun);
                 let arg_exprs: Vec<_> = args.iter().map(|r| self.reg_to_expr(*r)).collect();
                 let call = Call { fun: fun_expr, args: arg_exprs };
-                Some(self.make_call_stmt(*dst, call))
+                self.make_call_stmt(*dst, call)
             }
 
             Opcode::GetGlobal { dst, global } => {
@@ -2037,7 +2034,7 @@ impl<'a> Structurer<'a> {
         // For calls, run deferred invalidation AFTER building the call expression
         // This allows inline expressions to be consumed as arguments before invalidation
         if is_call {
-            let mut invalidated = self.invalidate_conflicting_inlines(op);
+            let mut invalidated = self.invalidate_conflicting_inlines_excluding(op, self.current_ssa_dst);
             stmts.append(&mut invalidated);
         }
 

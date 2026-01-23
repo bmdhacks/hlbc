@@ -282,6 +282,7 @@ pub fn decompile_code_with_options(
 
     // Pass 6: Post-processing transformations
     post::reconstruct_array_literals(code, &mut stmts);
+    post::reconstruct_empty_arrays(code, &mut stmts);
 
     // Pass 6b: Restore string concatenation from __add__ calls
     post::apply_string_concat(code, &mut stmts);

@@ -143,11 +143,17 @@ impl<'a> LoweringContext<'a> {
                 continue;
             }
 
-            // Invalidate conflicting inlines before processing
-            let invalidated = self.structurer.invalidate_conflicting_inlines(
-                &self.structurer.func.ops[op_idx].clone(),
+            // Invalidate conflicting inlines before processing (defer for calls)
+            let op = &self.structurer.func.ops[op_idx];
+            let is_call = matches!(op,
+                Opcode::Call0 { .. } | Opcode::Call1 { .. } | Opcode::Call2 { .. } |
+                Opcode::Call3 { .. } | Opcode::Call4 { .. } | Opcode::CallN { .. } |
+                Opcode::CallMethod { .. } | Opcode::CallThis { .. } | Opcode::CallClosure { .. }
             );
-            stmts.extend(invalidated);
+            if !is_call {
+                let invalidated = self.structurer.invalidate_conflicting_inlines(op);
+                stmts.extend(invalidated);
+            }
 
             // Generate statements for this opcode
             let new_stmts = self.structurer.opcode_to_statements(op_idx);
@@ -428,6 +434,12 @@ fn lower_if_then_else(
         stmts.extend(preamble);
     }
 
+    // Flush escaping inlines BEFORE entering branches.
+    // Expressions with AnyMemory dependency defined at current scope could be
+    // invalidated by calls inside branches, causing incorrect code placement.
+    let escaped = ctx.structurer.flush_escaping_inlines();
+    stmts.extend(escaped);
+
     // Extract the actual condition from the block's terminating conditional jump.
     // This replaces the placeholder condition from the Region.
     let mut actual_cond = if let Some(block) = cond_block {
@@ -471,6 +483,12 @@ fn lower_loop(
     ctx: &mut LoweringContext<'_>,
 ) -> Vec<Statement> {
     let mut stmts = Vec::new();
+
+    // Flush escaping inlines BEFORE entering the loop.
+    // Expressions with AnyMemory dependency defined at current scope could be
+    // invalidated by calls inside the loop, causing incorrect code placement.
+    let escaped = ctx.structurer.flush_escaping_inlines();
+    stmts.extend(escaped);
 
     // Increment scope depth BEFORE processing header and body.
     // The header is inside the loop (runs each iteration), so variables declared
@@ -1064,11 +1082,17 @@ fn lower_opcode_range(
                     continue;
                 }
 
-                // Invalidate conflicting inlines before processing
-                let invalidated = ctx.structurer.invalidate_conflicting_inlines(
-                    &ctx.structurer.func.ops[block_op_idx].clone(),
+                // Invalidate conflicting inlines before processing (defer for calls)
+                let op = &ctx.structurer.func.ops[block_op_idx];
+                let is_call = matches!(op,
+                    Opcode::Call0 { .. } | Opcode::Call1 { .. } | Opcode::Call2 { .. } |
+                    Opcode::Call3 { .. } | Opcode::Call4 { .. } | Opcode::CallN { .. } |
+                    Opcode::CallMethod { .. } | Opcode::CallThis { .. } | Opcode::CallClosure { .. }
                 );
-                stmts.extend(invalidated);
+                if !is_call {
+                    let invalidated = ctx.structurer.invalidate_conflicting_inlines(op);
+                    stmts.extend(invalidated);
+                }
 
                 // Generate statements for this opcode
                 let new_stmts = ctx.structurer.opcode_to_statements(block_op_idx);

@@ -111,6 +111,25 @@ pub(crate) fn reconstruct_array_literals(code: &Bytecode, stmts: &mut Vec<Statem
                 }
             }
 
+            // Check for return allocI32(bytes, count) - direct return of array
+            if let Statement::Return(Some(ret_expr)) = stmt {
+                if is_alloc_i32_call(ret_expr, bytes_reg, code).is_some() {
+                    // Found return allocI32 - reconstruct as array literal
+                    let array_literal = Expr::ArrayLiteral(values);
+
+                    // Replace with return [...]
+                    stmts[j] = Statement::Return(Some(array_literal));
+
+                    // Remove all the intermediate statements
+                    stmts_to_remove.sort_by(|a, b| b.cmp(a));
+                    for idx in stmts_to_remove {
+                        stmts.remove(idx);
+                    }
+
+                    break;
+                }
+            }
+
             // Check for index variable manipulations (var v4 = 0; v4++;) - these should be removed
             if let Statement::Assign { variable: Expr::Variable(_, _), assign, .. } = stmt {
                 let is_zero = match assign {
@@ -224,6 +243,77 @@ fn recurse_array_literals(code: &Bytecode, stmt: &mut Statement) {
         }
         Statement::Block { stmts } | Statement::Sequence { stmts } => {
             reconstruct_array_literals(code, stmts);
+        }
+        _ => {}
+    }
+}
+
+/// Reconstruct empty array literals from inlined allocI32(alloc_bytes(0), 0) patterns.
+///
+/// When SSA inlining combines alloc_bytes into allocI32, we get:
+/// ```text
+/// var arr = allocI32(alloc_bytes(0), 0);
+/// ```
+/// This should become:
+/// ```text
+/// var arr = [];
+/// ```
+pub(crate) fn reconstruct_empty_arrays(code: &Bytecode, stmts: &mut Vec<Statement>) {
+    for stmt in stmts.iter_mut() {
+        // Check for assignment of allocI32 with inlined alloc_bytes
+        if let Statement::Assign { assign, .. } = stmt {
+            if let Some(array_literal) = try_convert_inlined_empty_array(assign, code) {
+                *assign = array_literal;
+            }
+        }
+        // Recurse into nested statements
+        recurse_empty_arrays(code, stmt);
+    }
+}
+
+fn try_convert_inlined_empty_array(expr: &Expr, code: &Bytecode) -> Option<Expr> {
+    if let Expr::Call(call) = expr {
+        if let Expr::FunRef(fun_ref) = &call.fun {
+            let name = fun_ref.name(code);
+            // Check for allocI32, allocI64, allocF64, allocObj, allocDyn
+            if matches!(name.as_ref(), "allocI32" | "allocI64" | "allocF64" | "allocObj" | "allocDyn") {
+                // Check if first arg is an inlined alloc_bytes call
+                if let Some(first_arg) = call.args.first() {
+                    if is_alloc_bytes_call(first_arg, code) {
+                        // This is allocXXX(alloc_bytes(...), count) - convert to []
+                        return Some(Expr::ArrayLiteral(vec![]));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn recurse_empty_arrays(code: &Bytecode, stmt: &mut Statement) {
+    match stmt {
+        Statement::IfElse { if_, else_, .. } => {
+            reconstruct_empty_arrays(code, if_);
+            reconstruct_empty_arrays(code, else_);
+        }
+        Statement::Switch { default, cases, .. } => {
+            reconstruct_empty_arrays(code, default);
+            for (_, case_stmts) in cases {
+                reconstruct_empty_arrays(code, case_stmts);
+            }
+        }
+        Statement::While { stmts, .. } => {
+            reconstruct_empty_arrays(code, stmts);
+        }
+        Statement::TryCatch { try_stmts, catch_stmts, .. } => {
+            reconstruct_empty_arrays(code, try_stmts);
+            reconstruct_empty_arrays(code, catch_stmts);
+        }
+        Statement::Block { stmts } | Statement::Sequence { stmts } => {
+            reconstruct_empty_arrays(code, stmts);
+        }
+        Statement::ForIn { stmts, .. } => {
+            reconstruct_empty_arrays(code, stmts);
         }
         _ => {}
     }

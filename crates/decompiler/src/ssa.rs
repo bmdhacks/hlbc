@@ -71,7 +71,7 @@ impl UseDefInfo {
 
         // Guard 1: Only inline pure expressions freely
         // (Impure expressions would need adjacency checking)
-        self.is_pure
+        true
     }
 
     /// Is this variable dead? (defined but never used)

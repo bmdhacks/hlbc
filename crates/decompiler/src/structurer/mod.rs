@@ -58,6 +58,22 @@ pub(crate) enum MemoryDep {
     AnyMemory,
 }
 
+/// An expression stored for potential inlining, along with its context.
+/// Used to track where expressions were defined and what memory they depend on,
+/// enabling escape analysis to flush expressions before conditional branches.
+#[derive(Clone, Debug)]
+pub(crate) struct InlineExpr {
+    /// The expression to be inlined
+    pub expr: Expr,
+    /// Memory dependency - what memory this expression reads
+    pub mem_dep: MemoryDep,
+    /// The CFG block where this expression was defined (tracked for potential future use)
+    #[allow(dead_code)]
+    pub def_block: NodeIndex,
+    /// The scope depth when this expression was defined
+    pub def_scope: u32,
+}
+
 /// A detected string switch case (used for string switch detection)
 #[derive(Debug, Clone)]
 pub(crate) struct StringSwitchCase {
@@ -178,13 +194,13 @@ pub struct Structurer<'a> {
     pub(crate) string_switch_opcodes: HashSet<usize>,
     /// Current loop header (if any) - used to distinguish continue from switch fall-through
     pub(crate) current_loop_header: Option<NodeIndex>,
-    /// Expressions available for inlining (SSA var -> (expression, memory dependency))
+    /// Expressions available for inlining (SSA var -> InlineExpr)
     /// Single-use, pure expressions are stored here instead of emitting a statement.
     /// When the variable is referenced, the stored expression is inlined at the use site.
-    /// The memory dependency tracks what memory the expression reads, allowing smart
-    /// invalidation when conflicting writes occur.
+    /// The InlineExpr tracks memory dependency, definition block, and scope depth,
+    /// enabling escape analysis to flush expressions before conditional branches.
     /// Uses RefCell for interior mutability so we can remove entries when inlined.
-    pub(crate) inline_exprs: RefCell<HashMap<SsaVar, (Expr, MemoryDep)>>,
+    pub(crate) inline_exprs: RefCell<HashMap<SsaVar, InlineExpr>>,
     /// Opcodes to suppress (not emit as statements)
     /// Used when an opcode's result is consumed by another construct (e.g., EnumIndex for switch)
     pub(crate) suppressed_ops: HashSet<usize>,

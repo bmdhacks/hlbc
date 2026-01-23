@@ -158,15 +158,15 @@ impl<'a> Structurer<'a> {
         // First check if it's a constant - constants can be used multiple times
         {
             let inline_exprs = self.inline_exprs.borrow();
-            if let Some((expr, _)) = inline_exprs.get(&var) {
-                if matches!(expr, Expr::Constant(_)) {
-                    return Some(expr.clone());
+            if let Some(inline) = inline_exprs.get(&var) {
+                if matches!(inline.expr, Expr::Constant(_)) {
+                    return Some(inline.expr.clone());
                 }
             }
         }
 
         // For non-constants, remove after retrieval (single use)
-        self.inline_exprs.borrow_mut().remove(&var).map(|(expr, _)| expr)
+        self.inline_exprs.borrow_mut().remove(&var).map(|inline| inline.expr)
     }
 
     /// Check if a variable should be inlined based on use-def info and debug names.
@@ -194,7 +194,7 @@ impl<'a> Structurer<'a> {
 
     /// Store an expression for potential inlining, or emit as assignment.
     /// If the current SSA destination variable can be inlined:
-    ///   - Stores the expression with its memory dependency and returns None
+    ///   - Stores the expression with its memory dependency and definition context, returns None
     /// Otherwise:
     ///   - Returns Some(assignment statement)
     pub(super) fn try_inline_or_assign(&mut self, dst: Reg, expr: Expr) -> Option<Statement> {
@@ -203,8 +203,17 @@ impl<'a> Structurer<'a> {
             if ssa_var.reg == dst && self.can_inline_var(ssa_var) {
                 // Compute memory dependency for this expression based on source opcode
                 let mem_dep = self.compute_memory_dep();
-                // Store for inlining - don't emit statement
-                self.inline_exprs.borrow_mut().insert(ssa_var, (expr, mem_dep));
+                // Get the definition block for escape analysis
+                let def_block = self.cfg.block_for_op(self.current_op)
+                    .expect("opcode should have a block");
+                // Store for inlining with full context - don't emit statement
+                let inline = super::InlineExpr {
+                    expr,
+                    mem_dep,
+                    def_block,
+                    def_scope: self.scope_depth,
+                };
+                self.inline_exprs.borrow_mut().insert(ssa_var, inline);
                 return None;
             }
         }
@@ -288,12 +297,12 @@ impl<'a> Structurer<'a> {
     }
 
     /// Invalidate pending inline expressions that conflict with the given opcode.
-    /// Called before processing each opcode to ensure we don't inline expressions
-    /// whose source memory has been modified.
-    ///
-    /// Returns statements for any invalidated expressions (they need to be emitted
-    /// since we originally suppressed their definition statements).
     pub(super) fn invalidate_conflicting_inlines(&mut self, op: &Opcode) -> Vec<Statement> {
+        self.invalidate_conflicting_inlines_excluding(op, None)
+    }
+
+    /// Invalidate with optional exclusion (for deferred call invalidation).
+    pub(super) fn invalidate_conflicting_inlines_excluding(&mut self, op: &Opcode, exclude: Option<SsaVar>) -> Vec<Statement> {
         let conflicts_with: Box<dyn Fn(&MemoryDep) -> bool> = match op {
             // SetField invalidates any pending inline that reads the same field
             Opcode::SetField { obj, field, .. } => {
@@ -340,8 +349,11 @@ impl<'a> Structurer<'a> {
         // Borrow for reading to find conflicts
         {
             let inline_exprs = self.inline_exprs.borrow();
-            for (ssa_var, (expr, dep)) in inline_exprs.iter() {
-                if conflicts_with(dep) {
+            for (ssa_var, inline) in inline_exprs.iter() {
+                if exclude == Some(*ssa_var) {
+                    continue;
+                }
+                if conflicts_with(&inline.mem_dep) {
                     // Create assignment statement for the invalidated expression
                     let var_name: Str = ssa_var.name().into();
                     let var_expr = Expr::Variable(ssa_var.reg, Some(var_name.clone()));
@@ -358,7 +370,7 @@ impl<'a> Structurer<'a> {
                     stmts.push(Statement::Assign {
                         declaration: false,
                         variable: var_expr,
-                        assign: expr.clone(),
+                        assign: inline.expr.clone(),
                     });
                     to_remove.push(*ssa_var);
                 }
@@ -371,6 +383,62 @@ impl<'a> Structurer<'a> {
             for var in to_remove {
                 inline_exprs.remove(&var);
             }
+        }
+
+        stmts
+    }
+
+    /// Flush pending inline expressions that would escape into a conditional.
+    /// Called before entering IfThenElse/Loop/Switch to prevent scope violations.
+    ///
+    /// The problem: when expressions with `MemoryDep::AnyMemory` (like call results)
+    /// are stored for inlining before a conditional, they can be incorrectly invalidated
+    /// and flushed **inside** a branch instead of before it. This causes "variable used
+    /// without being initialized" errors when the actual use is after the merge point.
+    ///
+    /// Solution: before entering branches, flush expressions that:
+    /// - Are defined at the current scope depth (not deeper)
+    /// - Have AnyMemory dependency (could be invalidated by calls inside branches)
+    pub(super) fn flush_escaping_inlines(&mut self) -> Vec<Statement> {
+        let mut stmts = Vec::new();
+        let mut to_remove = Vec::new();
+
+        {
+            let inline_exprs = self.inline_exprs.borrow();
+            for (ssa_var, inline) in inline_exprs.iter() {
+                // Escape condition: defined at current scope with AnyMemory dep
+                // These could be invalidated by calls inside branches, causing
+                // the assignment to appear inside a branch instead of before it
+                if inline.def_scope == self.scope_depth
+                   && matches!(inline.mem_dep, MemoryDep::AnyMemory) {
+                    // Create assignment statement
+                    let var_name: Str = ssa_var.name().into();
+                    let var_expr = Expr::Variable(ssa_var.reg, Some(var_name.clone()));
+
+                    // Ensure variable is declared
+                    if !self.declared_vars.contains(&var_name) {
+                        self.declared_vars.insert(var_name.clone());
+                        self.hoisted_vars.insert(var_name.clone());
+                        self.actually_used_vars.insert(var_name.clone());
+                        if let Some(tr) = self.func.regs.get(ssa_var.reg.0 as usize).copied() {
+                            self.hoisted_var_types.insert(var_name, tr);
+                        }
+                    }
+
+                    stmts.push(Statement::Assign {
+                        declaration: false,
+                        variable: var_expr,
+                        assign: inline.expr.clone(),
+                    });
+                    to_remove.push(*ssa_var);
+                }
+            }
+        }
+
+        // Remove flushed entries
+        let mut inline_exprs = self.inline_exprs.borrow_mut();
+        for var in to_remove {
+            inline_exprs.remove(&var);
         }
 
         stmts
