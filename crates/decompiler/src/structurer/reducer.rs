@@ -545,11 +545,19 @@ fn structure_body_subgraph(
         return Region::Empty;
     }
 
-    // For now, create a sequence of blocks in the order they appear
-    // The body will be processed by the lowering phase which handles control flow
+    // Collect unique regions, avoiding duplicates when multiple CFG nodes map
+    // to the same collapsed region node.
     let mut regions: Vec<Region> = Vec::new();
+    let mut seen_region_nodes: HashSet<NodeIndex> = HashSet::new();
+
     for &cfg_node in body_cfg_nodes {
         if let Some(region_node) = graph.get_region_node(cfg_node) {
+            // Skip if we've already added this region
+            if seen_region_nodes.contains(&region_node) {
+                continue;
+            }
+            seen_region_nodes.insert(region_node);
+
             if let Some(node) = graph.get_node(region_node) {
                 match node {
                     RegionNode::Block(cfg_idx) => {
