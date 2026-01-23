@@ -408,8 +408,13 @@ pub struct OrChainPattern {
     /// (the one that starts the AND).
     pub condition_nodes: Vec<NodeIndex>,
 
-    /// The shared "true" target (e.g., the throw block).
+    /// The shared "true" target (e.g., the throw block or body start).
     pub shared_target: NodeIndex,
+
+    /// All CFG nodes that are part of the body (between shared_target and continuation).
+    /// This is empty for terminating bodies (throw/return) but populated for
+    /// non-terminating bodies that may contain nested control flow.
+    pub body_cfg_nodes: Vec<NodeIndex>,
 
     /// The continuation after the OR chain (the "false" path of the last condition).
     pub continuation: NodeIndex,
@@ -904,6 +909,7 @@ pub fn find_or_chain_patterns(
     region_graph: &RegionGraph,
     cfg: &Cfg,
     _analysis: &CfgAnalysis,
+    ctx: Option<&PatternContext<'_>>,
 ) -> Vec<OrChainPattern> {
     let mut patterns = Vec::new();
     let mut used_nodes: HashSet<NodeIndex> = HashSet::new();
@@ -919,7 +925,7 @@ pub fn find_or_chain_patterns(
         }
 
         // Try to build an OR chain starting from this node
-        if let Some(pattern) = try_build_or_chain(region_graph, cfg, start_node, &used_nodes) {
+        if let Some(pattern) = try_build_or_chain(region_graph, cfg, start_node, &used_nodes, ctx) {
             // Only accept chains with 2+ conditions (otherwise regular if pattern handles it)
             if pattern.condition_nodes.len() >= 2 {
                 // Mark all condition nodes as used
@@ -1017,6 +1023,7 @@ fn try_build_or_chain(
     cfg: &Cfg,
     start_node: NodeIndex,
     used_nodes: &HashSet<NodeIndex>,
+    _ctx: Option<&PatternContext<'_>>,
 ) -> Option<OrChainPattern> {
     // Get the CFG node
     let start_cfg_node = region_graph.get_node(start_node)?.as_block()?;
@@ -1122,28 +1129,30 @@ fn try_build_or_chain(
         return None;
     }
 
-    // IMPORTANT: Only match OR chains where the shared target terminates (throw/return).
-    // This distinguishes OR chains (if (a || b) throw X) from AND chains (if (a && b) return X).
-    // AND chains have a similar CFG structure but their shared target is the "skip" path,
-    // not a terminating action.
-    if !shared_target_terminates {
-        return None;
-    }
-
     // Get region node for shared target
     let shared_target = region_graph.get_region_node(shared_target_cfg)?;
 
     // Get region node for continuation
     let continuation = region_graph.get_region_node(current_false_target)?;
 
-    // Check if continuation flows to shared_target
-    // This happens in AND chain patterns like `if (a && b && c) work;` where:
-    // - Guards jump to shared_target (return) on failure
-    // - Continuation (work) also flows to shared_target (return) after completing
+    // CRITICAL: Distinguish OR chains from AND chains using reachability analysis.
     //
-    // In this case, we should NOT match as an OR chain. The if-pattern detector
-    // will handle these as nested if-else structures, which produces correct output.
-    // Matching as an OR chain creates problematic graph structures (diamonds).
+    // For OR chains `if (a || b) { body; }`:
+    //   - Conditions jump to body (shared_target) on success
+    //   - Body flows to continuation after executing
+    //   - shared_target CAN reach continuation
+    //
+    // For AND chains `if (a && b && c) return X;`:
+    //   - Conditions jump to skip (shared_target) on failure
+    //   - Body is on the fall-through path, not shared_target
+    //   - shared_target is the NEXT chain or continuation, doesn't flow "through" body
+    //   - In terminating bodies, shared_target is disjoint from continuation path
+    //
+    // Check 1: If shared_target terminates, it's a valid OR chain (throw/return body)
+    // Check 2: If shared_target can reach continuation, it's likely an OR chain (body → continuation)
+    // Check 3: If continuation flows TO shared_target, it's an AND chain (reject)
+
+    // Check 3: Continuation flowing to shared_target indicates AND chain
     let continuation_flows_to_shared = cfg
         .successors(current_false_target)
         .contains(&shared_target_cfg);
@@ -1153,9 +1162,91 @@ fn try_build_or_chain(
         return None;
     }
 
+    // Check 2: For non-terminating shared targets, verify body can reach continuation
+    // This distinguishes `if (a || b) { body; }` from AND chains where shared_target
+    // is a skip point that doesn't flow back to the body path
+    if !shared_target_terminates {
+        // BFS to check if shared_target can reach continuation
+        let mut can_reach_continuation = false;
+        let mut visited = HashSet::new();
+        let mut queue = vec![shared_target_cfg];
+        visited.insert(shared_target_cfg);
+
+        // Don't traverse through condition nodes (they're part of the chain, not body)
+        for &cond_node in &condition_nodes {
+            if let Some(cfg_node) = region_graph.get_node(cond_node).and_then(|n| n.as_block()) {
+                visited.insert(cfg_node);
+            }
+        }
+
+        while let Some(node) = queue.pop() {
+            if node == current_false_target {
+                can_reach_continuation = true;
+                break;
+            }
+            for succ in cfg.successors(node) {
+                if !visited.contains(&succ) {
+                    visited.insert(succ);
+                    queue.push(succ);
+                }
+            }
+        }
+
+        if !can_reach_continuation {
+            // shared_target can't reach continuation - this is an AND chain, not OR
+            return None;
+        }
+
+        // Check if shared_target (body start) has internal control flow that isn't reduced yet.
+        // If the body start is a conditional (multiple successors not all going to continuation),
+        // the inner structure should be reduced first before we collapse the OR chain.
+        let shared_target_succs = cfg.successors(shared_target_cfg);
+        if shared_target_succs.len() > 1 {
+            // Body starts with a conditional - check if it's been collapsed
+            if let Some(region_node) = region_graph.get_region_node(shared_target_cfg) {
+                if let Some(node) = region_graph.get_node(region_node) {
+                    if !node.is_collapsed() {
+                        // Body has unconditional internal control flow - let it be reduced first
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    // Collect all body CFG nodes (between shared_target and continuation).
+    // For terminating bodies (throw/return), this will be empty or just the shared_target.
+    // For non-terminating bodies with nested control flow, we need all blocks.
+    let mut body_cfg_nodes = Vec::new();
+    if !shared_target_terminates {
+        // BFS to find all nodes reachable from shared_target that aren't continuation
+        let mut visited = HashSet::new();
+        let mut queue = vec![shared_target_cfg];
+        visited.insert(shared_target_cfg);
+
+        // Also mark the continuation and condition nodes as visited to avoid including them
+        visited.insert(current_false_target);
+        for &cond_node in &condition_nodes {
+            if let Some(cfg_node) = region_graph.get_node(cond_node).and_then(|n| n.as_block()) {
+                visited.insert(cfg_node);
+            }
+        }
+
+        while let Some(node) = queue.pop() {
+            body_cfg_nodes.push(node);
+            for succ in cfg.successors(node) {
+                if !visited.contains(&succ) {
+                    visited.insert(succ);
+                    queue.push(succ);
+                }
+            }
+        }
+    }
+
     Some(OrChainPattern {
         condition_nodes,
         shared_target,
+        body_cfg_nodes,
         continuation,
         shared_target_terminates,
         last_condition_inverted,

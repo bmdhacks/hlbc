@@ -148,7 +148,7 @@ fn reduce_one_step(
     // These need to be detected BEFORE regular if patterns because each individual
     // condition block in an OR chain can't be collapsed alone (the shared target
     // isn't dominated by any single condition).
-    let or_chain_patterns = find_or_chain_patterns(graph, cfg, analysis);
+    let or_chain_patterns = find_or_chain_patterns(graph, cfg, analysis, ctx);
     if let Some(ocp) = or_chain_patterns.into_iter().next() {
         made_progress = collapse_or_chain(graph, cfg, &ocp);
     } else {
@@ -468,9 +468,14 @@ fn collapse_if(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &IfPattern) -> bool
 /// The nested_and_chains map stores which condition indices have AND sub-chains.
 ///
 /// Returns true if progress was made (nodes were reduced).
-fn collapse_or_chain(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &OrChainPattern) -> bool {
-    // Build the then region from the shared target
-    let then_region = if let Some(node) = graph.get_node(pattern.shared_target) {
+fn collapse_or_chain(graph: &mut RegionGraph, cfg: &Cfg, pattern: &OrChainPattern) -> bool {
+    // Build the then region from the body nodes
+    let then_region = if !pattern.body_cfg_nodes.is_empty() {
+        // Non-terminating body with nested control flow
+        // Create a subgraph for the body and reduce it recursively
+        structure_body_subgraph(graph, cfg, &pattern.body_cfg_nodes)
+    } else if let Some(node) = graph.get_node(pattern.shared_target) {
+        // Terminating body (single block)
         match node {
             RegionNode::Block(cfg_idx) => Region::Block(*cfg_idx),
             RegionNode::Collapsed(r) => r.clone(),
@@ -497,10 +502,17 @@ fn collapse_or_chain(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &OrChainPatte
         nested_and_chains,
     };
 
-    // Collect all nodes to collapse: all condition nodes + shared target + nested AND blocks
+    // Collect all nodes to collapse: all condition nodes + shared target + nested AND blocks + body
     let mut nodes_to_collapse = HashSet::new();
     nodes_to_collapse.extend(pattern.condition_nodes.iter().copied());
     nodes_to_collapse.insert(pattern.shared_target);
+
+    // Include all body CFG nodes
+    for &cfg_node in &pattern.body_cfg_nodes {
+        if let Some(region_node) = graph.get_region_node(cfg_node) {
+            nodes_to_collapse.insert(region_node);
+        }
+    }
 
     // Also include all nested AND chain nodes
     for and_chain in pattern.nested_and_chains.values() {
@@ -519,6 +531,44 @@ fn collapse_or_chain(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &OrChainPatte
         true
     } else {
         false
+    }
+}
+
+/// Structure a subgraph of body nodes into a Region.
+/// Used for OR chain bodies that contain nested control flow.
+fn structure_body_subgraph(
+    graph: &RegionGraph,
+    _cfg: &Cfg,
+    body_cfg_nodes: &[NodeIndex],
+) -> Region {
+    if body_cfg_nodes.is_empty() {
+        return Region::Empty;
+    }
+
+    // For now, create a sequence of blocks in the order they appear
+    // The body will be processed by the lowering phase which handles control flow
+    let mut regions: Vec<Region> = Vec::new();
+    for &cfg_node in body_cfg_nodes {
+        if let Some(region_node) = graph.get_region_node(cfg_node) {
+            if let Some(node) = graph.get_node(region_node) {
+                match node {
+                    RegionNode::Block(cfg_idx) => {
+                        regions.push(Region::Block(*cfg_idx));
+                    }
+                    RegionNode::Collapsed(r) => {
+                        regions.push(r.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    if regions.len() == 1 {
+        regions.pop().unwrap()
+    } else if regions.is_empty() {
+        Region::Empty
+    } else {
+        Region::Sequence(regions)
     }
 }
 
