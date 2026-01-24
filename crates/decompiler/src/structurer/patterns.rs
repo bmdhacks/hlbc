@@ -1312,14 +1312,58 @@ fn match_switch_pattern(
     // In that case, we still want to match the pattern.
     let merge_cfg = analysis.ipdom(cfg_node);
 
-    // If no merge point, check if we can still match
+
+    // If no merge point, try to find a common exit target among case successors.
+    // This handles switches where some cases throw (no strict ipdom) but others
+    // converge to a common point (like a return block).
     let merge_cfg = match merge_cfg {
         Some(m) => m,
         None if is_switch_block => {
-            // This is a switch with no merge (all cases likely terminate).
-            // Use the selector node itself as a dummy merge - this signals
-            // that there's no real merge point.
-            cfg_node
+            // Try to find a common exit target by looking at where the case bodies go.
+            // We do a simple BFS from each case target and count which exit blocks
+            // are reachable, then pick the most common one.
+            let cfg_succs = cfg.successors_no_exceptions(cfg_node);
+            let mut exit_counts: HashMap<NodeIndex, usize> = HashMap::new();
+
+            for &case_target in &cfg_succs {
+                // Do a BFS to find reachable exit/terminal blocks
+                let mut visited: HashSet<NodeIndex> = HashSet::new();
+                let mut queue = vec![case_target];
+                visited.insert(case_target);
+
+                while let Some(node) = queue.pop() {
+                    let block = &cfg.graph[node];
+                    // Check if this is an exit or terminal block
+                    if block.is_exit || cfg.successors(node).is_empty() {
+                        // This case reaches this exit
+                        *exit_counts.entry(node).or_insert(0) += 1;
+                        // Don't continue from exit blocks
+                        continue;
+                    }
+
+                    // Continue BFS to successors
+                    for succ in cfg.successors(node) {
+                        if visited.insert(succ) {
+                            queue.push(succ);
+                        }
+                    }
+                }
+            }
+
+            // Find the exit block reached by the most cases
+            if let Some((&common_exit, &count)) = exit_counts.iter().max_by_key(|(_, c)| *c) {
+                // If at least 2 cases reach this exit, use it as merge
+                // (or all cases if there's only one exit)
+                if count >= 2 || (exit_counts.len() == 1 && count >= 1) {
+                    common_exit
+                } else {
+                    // Fall back to selector as dummy merge
+                    cfg_node
+                }
+            } else {
+                // No exits found, use selector as dummy merge
+                cfg_node
+            }
         }
         None => return None,
     };
@@ -1327,16 +1371,42 @@ fn match_switch_pattern(
     // Collect case nodes and body
     let mut case_nodes_set = HashSet::new();
     let mut case_nodes = Vec::new();
-    let mut body_nodes = HashSet::new();
     let mut default_node = None;
+    let mut fallthrough_target: Option<NodeIndex> = None;
 
     // Check edge types to identify default vs cases
     // Note: Switch can have multiple edges to the same target (multiple case values),
-    // so we deduplicate by using a HashSet
+    // so we deduplicate by using a HashSet.
+    //
+    // IMPORTANT: For Switch opcodes with an offset of 0, the case target is the
+    // same as the fall-through address. We need to:
+    // 1. Check if FallThrough target matches any ConditionalTrue target
+    // 2. If so, that ConditionalTrue case IS the default (handles unmatched values)
+    let mut conditional_targets: HashSet<NodeIndex> = HashSet::new();
+
+    // First pass: collect all ConditionalTrue targets and find FallThrough
+    for (target, kind) in cfg.successors_with_edges(cfg_node) {
+        match kind {
+            EdgeKind::ConditionalTrue => {
+                conditional_targets.insert(target);
+            }
+            EdgeKind::FallThrough => {
+                fallthrough_target = Some(target);
+            }
+            _ => {}
+        }
+    }
+
+    // Second pass: build case list and identify default
     for (target, kind) in cfg.successors_with_edges(cfg_node) {
         match kind {
             EdgeKind::FallThrough => {
-                default_node = Some(target);
+                // Only treat as explicit default if not already a case target
+                if !conditional_targets.contains(&target) {
+                    default_node = Some(target);
+                }
+                // If FallThrough matches a ConditionalTrue, that case serves as default
+                // We'll handle this during lowering by checking if any case matches
             }
             EdgeKind::ConditionalTrue | _ => {
                 // Only add each target once
@@ -1345,10 +1415,45 @@ fn match_switch_pattern(
                 }
             }
         }
+    }
 
-        // For switch patterns, just add the direct target - switch body nodes are
-        // simpler to collect since switches are typically detected early
-        body_nodes.insert(target);
+    // If no explicit default but FallThrough matches a case, use that as default
+    if default_node.is_none() {
+        if let Some(ft) = fallthrough_target {
+            if conditional_targets.contains(&ft) {
+                default_node = Some(ft);
+            }
+        }
+    }
+
+    let merge = region_graph.get_region_node(merge_cfg)?;
+
+    // Collect ALL nodes between the switch and the merge.
+    // This includes direct case targets and any intermediate nodes.
+    // We do a BFS from the switch selector to find all reachable nodes
+    // that are dominated by the switch (excluding the merge itself).
+    let mut body_cfg_nodes: HashSet<NodeIndex> = HashSet::new();
+    let mut queue: Vec<NodeIndex> = case_nodes.clone();
+    if let Some(def) = default_node {
+        queue.push(def);
+    }
+
+    for &start in &queue {
+        body_cfg_nodes.insert(start);
+    }
+
+    while let Some(node) = queue.pop() {
+        // Skip the merge node
+        if node == merge_cfg {
+            continue;
+        }
+
+        // Add successors that we haven't seen
+        for succ in cfg.successors(node) {
+            if succ != merge_cfg && body_cfg_nodes.insert(succ) {
+                queue.push(succ);
+            }
+        }
     }
 
     // Convert to region graph indices
@@ -1357,12 +1462,12 @@ fn match_switch_pattern(
         .filter_map(|&n| region_graph.get_region_node(n))
         .collect();
 
-    let body_region_nodes: HashSet<_> = body_nodes
+    // Collect body region nodes, deduplicating since multiple CFG nodes
+    // might map to the same collapsed region node
+    let body_region_nodes: HashSet<_> = body_cfg_nodes
         .iter()
         .filter_map(|&n| region_graph.get_region_node(n))
         .collect();
-
-    let merge = region_graph.get_region_node(merge_cfg)?;
 
     // Extract selector register and case values from the Switch opcode if ctx is available
     let (selector_reg, case_values) = if let Some(ctx) = ctx {

@@ -589,16 +589,52 @@ fn collapse_switch(
 ) {
     use crate::ast::Constant;
 
-    // Build cases from case nodes
+    // Build cases from case nodes.
+    // For each case, we need to collect ALL nodes from the case target to the merge,
+    // not just the direct successor. This handles cases where if-patterns have been
+    // collapsed inside a switch case, leaving subsequent code as separate nodes.
     let mut cases = Vec::new();
     for &case_node in &pattern.case_nodes {
-        let body = if let Some(node) = graph.get_node(case_node) {
-            match node {
-                RegionNode::Block(cfg_idx) => Region::Block(*cfg_idx),
-                RegionNode::Collapsed(r) => r.clone(),
+        // Collect all nodes in this case's path to the merge
+        let mut case_body_nodes: Vec<NodeIndex> = Vec::new();
+        let mut visited: HashSet<NodeIndex> = HashSet::new();
+        let mut queue = vec![case_node];
+        visited.insert(case_node);
+        visited.insert(pattern.merge); // Don't include merge in case body
+
+        while let Some(node) = queue.pop() {
+            case_body_nodes.push(node);
+
+            // Follow successors until we hit the merge or exit
+            for succ in graph.successors(node) {
+                if visited.insert(succ) {
+                    queue.push(succ);
+                }
+            }
+        }
+
+        // Build the case body from collected nodes
+        let body = if case_body_nodes.len() == 1 {
+            // Just one node - use it directly
+            if let Some(node) = graph.get_node(case_node) {
+                match node {
+                    RegionNode::Block(cfg_idx) => Region::Block(*cfg_idx),
+                    RegionNode::Collapsed(r) => r.clone(),
+                }
+            } else {
+                Region::Empty
             }
         } else {
-            Region::Empty
+            // Multiple nodes - build a sequence
+            let regions: Vec<Region> = case_body_nodes
+                .iter()
+                .filter_map(|&n| graph.get_node(n))
+                .map(|node| match node {
+                    RegionNode::Block(cfg_idx) => Region::Block(*cfg_idx),
+                    RegionNode::Collapsed(r) => r.clone(),
+                })
+                .collect();
+            Region::sequence(regions)
         };
 
         // Get case values for this node from the pattern
