@@ -2096,14 +2096,16 @@ pub fn detect_for_in_loops(stmts: &mut Vec<Statement>) -> bool {
         }
 
         // Look for pattern: var i = start; while (i < end) { body; i++; }
+        // Also handles Haxe's pattern where increment is at START: while (i < end) { i++; body; }
         if i + 1 < stmts.len() {
-            if let Some((var_name, start_expr)) = extract_counter_init(&stmts[i]) {
+            if let Some((counter_name, start_expr)) = extract_counter_init(&stmts[i]) {
                 if let Statement::While { cond, stmts: body } = &stmts[i + 1] {
-                    if let Some(end_expr) = extract_less_than_condition(cond, &var_name) {
-                        if let Some(new_body) = extract_body_with_increment(body, &var_name) {
+                    if let Some(end_expr) = extract_less_than_condition(cond, &counter_name) {
+                        // Try trailing increment first (C-style: body; i++)
+                        if let Some(new_body) = extract_body_with_increment(body, &counter_name) {
                             // Found the pattern! Convert to for-in
                             let for_in = Statement::ForIn {
-                                var_name: var_name.into(),
+                                var_name: counter_name.into(),
                                 iterable: Expr::Range(
                                     Box::new(start_expr),
                                     Box::new(end_expr),
@@ -2115,7 +2117,41 @@ pub fn detect_for_in_loops(stmts: &mut Vec<Statement>) -> bool {
                             stmts.remove(i);
                             stmts[i] = for_in;
                             changed = true;
-                            // Don't increment i - we just modified it
+                            continue;
+                        }
+
+                        // Try Haxe-style pattern: visible = counter; counter++; body
+                        // This is for (visible in 0...end) { body }
+                        if let Some((visible_var, new_body)) = extract_haxe_range_pattern(body, &counter_name) {
+                            let for_in = Statement::ForIn {
+                                var_name: visible_var.into(),
+                                iterable: Expr::Range(
+                                    Box::new(start_expr),
+                                    Box::new(end_expr),
+                                ),
+                                stmts: new_body,
+                            };
+
+                            stmts.remove(i);
+                            stmts[i] = for_in;
+                            changed = true;
+                            continue;
+                        }
+
+                        // Try simple leading increment (just i++; body)
+                        if let Some(new_body) = extract_body_with_leading_increment(body, &counter_name) {
+                            let for_in = Statement::ForIn {
+                                var_name: counter_name.into(),
+                                iterable: Expr::Range(
+                                    Box::new(start_expr),
+                                    Box::new(end_expr),
+                                ),
+                                stmts: new_body,
+                            };
+
+                            stmts.remove(i);
+                            stmts[i] = for_in;
+                            changed = true;
                             continue;
                         }
                     }
@@ -2130,15 +2166,40 @@ pub fn detect_for_in_loops(stmts: &mut Vec<Statement>) -> bool {
 }
 
 /// Extract counter initialization from a statement.
-/// Returns (var_name, start_value) if this is `var name = value` with an integer.
+/// Returns (var_name, start_value) if this is `name = value` with an integer.
+/// Handles both declarations (`var i = 0`) and assignments (`i = 0`).
 fn extract_counter_init(stmt: &Statement) -> Option<(String, Expr)> {
     match stmt {
+        // Declaration: var i = 0
         Statement::Assign {
             declaration: true,
             variable: Expr::Variable(_, Some(name)),
             assign,
         } => {
-            // Check if the assignment is an integer (common case: var i = 0)
+            if is_integer_expr(assign) {
+                Some((name.to_string(), assign.clone()))
+            } else {
+                None
+            }
+        }
+        // Non-declaration assignment: i = 0 (variable was declared separately)
+        Statement::Assign {
+            declaration: false,
+            variable: Expr::Variable(_, Some(name)),
+            assign,
+        } => {
+            if is_integer_expr(assign) {
+                Some((name.to_string(), assign.clone()))
+            } else {
+                None
+            }
+        }
+        // Also handle Expr::Ident for names without registers
+        Statement::Assign {
+            variable: Expr::Ident(name),
+            assign,
+            ..
+        } => {
             if is_integer_expr(assign) {
                 Some((name.to_string(), assign.clone()))
             } else {
@@ -2221,6 +2282,308 @@ fn extract_body_with_increment(body: &[Statement], var_name: &str) -> Option<Vec
 /// Check if expression is the constant 1.
 fn is_one(expr: &Expr) -> bool {
     matches!(expr, Expr::Constant(Constant::InlineInt(1)))
+}
+
+/// Extract the loop body if it STARTS with an increment of the counter variable.
+/// This is the Haxe pattern where `for (i in 0...n)` compiles to:
+/// ```
+/// i = 0;
+/// while (i < n) {
+///     i++;  // increment at START
+///     // body
+/// }
+/// ```
+/// Returns Some(body_without_increment) if the body starts with `var++` or `var = var + 1`.
+fn extract_body_with_leading_increment(body: &[Statement], var_name: &str) -> Option<Vec<Statement>> {
+    if body.is_empty() {
+        return None;
+    }
+
+    let first = &body[0];
+
+    // Check for i++ as expression statement
+    if let Statement::ExprStatement(Expr::Op(Operation::Incr(inner))) = first {
+        if is_var_named(inner, var_name) {
+            return Some(body[1..].to_vec());
+        }
+    }
+
+    // Check for i = i + 1 pattern
+    if let Statement::Assign {
+        variable,
+        assign: Expr::Op(Operation::Add(left, right)),
+        ..
+    } = first
+    {
+        if is_var_named(variable, var_name) {
+            // Check if it's var = var + 1 or var = 1 + var
+            let is_add_one = (is_var_named(left, var_name) && is_one(right))
+                || (is_one(left) && is_var_named(right, var_name));
+            if is_add_one {
+                return Some(body[1..].to_vec());
+            }
+        }
+    }
+
+    None
+}
+
+/// Extract the Haxe range loop pattern where there's a separate loop variable.
+/// Pattern:
+/// ```
+/// counter = 0;
+/// while (counter < limit) {
+///     loop_var = counter;    // copy counter to user variable
+///     counter = counter + 1; // increment counter
+///     ... body using loop_var ...
+/// }
+/// ```
+/// Returns Some((loop_var_name, body)) if the pattern matches.
+fn extract_haxe_range_pattern(body: &[Statement], counter_name: &str) -> Option<(String, Vec<Statement>)> {
+    if body.len() < 2 {
+        return None;
+    }
+
+    // First statement should be: loop_var = counter
+    let loop_var_name = match &body[0] {
+        Statement::Assign {
+            variable: Expr::Variable(_, Some(name)),
+            assign,
+            ..
+        } => {
+            // Check if assign is the counter variable
+            if is_var_named(assign, counter_name) {
+                // Make sure loop_var is different from counter
+                if name.as_ref() != counter_name {
+                    Some(name.to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        Statement::Assign {
+            variable: Expr::Ident(name),
+            assign,
+            ..
+        } => {
+            if is_var_named(assign, counter_name) && name.as_ref() != counter_name {
+                Some(name.to_string())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }?;
+
+    // Second statement should be: counter = counter + 1 (or counter++)
+    let is_increment = match &body[1] {
+        Statement::ExprStatement(Expr::Op(Operation::Incr(inner))) => {
+            is_var_named(inner, counter_name)
+        }
+        Statement::Assign {
+            variable,
+            assign: Expr::Op(Operation::Add(left, right)),
+            ..
+        } => {
+            is_var_named(variable, counter_name)
+                && ((is_var_named(left, counter_name) && is_one(right))
+                    || (is_one(left) && is_var_named(right, counter_name)))
+        }
+        _ => false,
+    };
+
+    if !is_increment {
+        return None;
+    }
+
+    // The rest is the loop body
+    Some((loop_var_name, body[2..].to_vec()))
+}
+
+// =============================================================================
+// Remove Trailing Continues: Remove superfluous `continue` at end of loops
+// =============================================================================
+
+/// Remove superfluous `continue` statements at the end of loop bodies.
+///
+/// A `continue` at the very end of a loop body is redundant since the loop
+/// would naturally continue anyway. This cleanup produces cleaner output.
+///
+/// Also handles `continue` at the end of if-else branches within loops.
+pub fn remove_trailing_continues(stmts: &mut Vec<Statement>) -> bool {
+    let mut changed = false;
+
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            Statement::While { stmts: body, .. } => {
+                // Recursively process nested structures
+                if remove_trailing_continues(body) {
+                    changed = true;
+                }
+                // Remove trailing continue from this loop body
+                if remove_trailing_continue_from_body(body) {
+                    changed = true;
+                }
+            }
+            Statement::ForIn { stmts: body, .. } => {
+                if remove_trailing_continues(body) {
+                    changed = true;
+                }
+                if remove_trailing_continue_from_body(body) {
+                    changed = true;
+                }
+            }
+            Statement::IfElse { if_, else_, .. } => {
+                if remove_trailing_continues(if_) {
+                    changed = true;
+                }
+                if remove_trailing_continues(else_) {
+                    changed = true;
+                }
+            }
+            Statement::IfElseChain { branches, else_ } => {
+                for (_, body) in branches.iter_mut() {
+                    if remove_trailing_continues(body) {
+                        changed = true;
+                    }
+                }
+                if remove_trailing_continues(else_) {
+                    changed = true;
+                }
+            }
+            Statement::Switch { cases, default, .. } => {
+                for (_, body) in cases.iter_mut() {
+                    if remove_trailing_continues(body) {
+                        changed = true;
+                    }
+                }
+                if remove_trailing_continues(default) {
+                    changed = true;
+                }
+            }
+            Statement::TryCatch { try_stmts, catch_stmts, .. } => {
+                if remove_trailing_continues(try_stmts) {
+                    changed = true;
+                }
+                if remove_trailing_continues(catch_stmts) {
+                    changed = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    changed
+}
+
+/// Remove a trailing `continue` from a loop body.
+/// Also handles `continue` at the end of if-else branches.
+fn remove_trailing_continue_from_body(body: &mut Vec<Statement>) -> bool {
+    if body.is_empty() {
+        return false;
+    }
+
+    // Check if the last statement is a bare continue
+    if matches!(body.last(), Some(Statement::Continue)) {
+        body.pop();
+        return true;
+    }
+
+    // Check if the last statement is an if-else where both branches end in continue
+    // In this case, we can remove the continues from both branches
+    if let Some(Statement::IfElse { if_, else_, .. }) = body.last_mut() {
+        let mut changed = false;
+
+        // Remove trailing continue from if branch
+        if matches!(if_.last(), Some(Statement::Continue)) {
+            if_.pop();
+            changed = true;
+        }
+
+        // Remove trailing continue from else branch
+        if matches!(else_.last(), Some(Statement::Continue)) {
+            else_.pop();
+            changed = true;
+        }
+
+        return changed;
+    }
+
+    false
+}
+
+// =============================================================================
+// Remove Empty If Statements: Clean up empty if/else after internal call suppression
+// =============================================================================
+
+/// Remove empty if statements that result from suppressing internal calls like `__expand`.
+///
+/// When internal functions like `__expand` are suppressed, the bounds-check if statements
+/// that guard them become empty:
+/// ```haxe
+/// if (idx >= arr.length) {
+///     // __expand was here but got suppressed
+/// }
+/// arr[idx] = value;
+/// ```
+/// This pass removes such empty if statements.
+pub fn remove_empty_if_statements(stmts: &mut Vec<Statement>) -> bool {
+    let mut changed = false;
+
+    // First, recursively process nested structures
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            Statement::IfElse { if_, else_, .. } => {
+                if remove_empty_if_statements(if_) { changed = true; }
+                if remove_empty_if_statements(else_) { changed = true; }
+            }
+            Statement::IfElseChain { branches, else_ } => {
+                for (_, body) in branches.iter_mut() {
+                    if remove_empty_if_statements(body) { changed = true; }
+                }
+                if remove_empty_if_statements(else_) { changed = true; }
+            }
+            Statement::While { stmts: body, .. } => {
+                if remove_empty_if_statements(body) { changed = true; }
+            }
+            Statement::ForIn { stmts: body, .. } => {
+                if remove_empty_if_statements(body) { changed = true; }
+            }
+            Statement::Switch { default, cases, .. } => {
+                if remove_empty_if_statements(default) { changed = true; }
+                for (_, case_stmts) in cases.iter_mut() {
+                    if remove_empty_if_statements(case_stmts) { changed = true; }
+                }
+            }
+            Statement::TryCatch { try_stmts, catch_stmts, .. } => {
+                if remove_empty_if_statements(try_stmts) { changed = true; }
+                if remove_empty_if_statements(catch_stmts) { changed = true; }
+            }
+            Statement::Block { stmts: inner } | Statement::Sequence { stmts: inner } => {
+                if remove_empty_if_statements(inner) { changed = true; }
+            }
+            _ => {}
+        }
+    }
+
+    // Then, remove if statements where BOTH branches are empty
+    stmts.retain(|stmt| {
+        match stmt {
+            Statement::IfElse { if_, else_, .. } => {
+                if if_.is_empty() && else_.is_empty() {
+                    changed = true;
+                    false // remove
+                } else {
+                    true // keep
+                }
+            }
+            _ => true,
+        }
+    });
+
+    changed
 }
 
 #[cfg(test)]

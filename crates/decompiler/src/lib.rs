@@ -310,6 +310,9 @@ pub fn decompile_code_with_options(
         }
     }
 
+    // Pass 7b: Remove empty if statements (from suppressed internal calls like __expand)
+    post::remove_empty_if_statements(&mut stmts);
+
     // Pass 8: Inline single-use variables to reduce verbosity
     post::inline_single_use_vars(&mut stmts);
 
@@ -339,6 +342,9 @@ pub fn decompile_code_with_options(
     // Pass 14: For-in loop detection - convert while counter patterns to for-in
     // var i = 0; while (i < n) { body; i++; } → for (i in 0...n) { body }
     post::detect_for_in_loops(&mut stmts);
+
+    // Pass 15: Remove superfluous continues at the end of loop bodies
+    post::remove_trailing_continues(&mut stmts);
 
     // Clean up: remove this function from the "currently decompiling" set
     DECOMPILING_FUNCTIONS.with(|set| {
