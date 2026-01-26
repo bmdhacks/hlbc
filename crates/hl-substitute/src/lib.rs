@@ -76,6 +76,14 @@ pub struct FieldTypeMismatchInfo {
     pub target_type: String, // e.g. "f64"
 }
 
+/// Information about a field order mismatch (different field at same position)
+#[derive(Debug, Clone)]
+pub struct FieldOrderMismatchInfo {
+    pub position: usize,       // 0-based field index
+    pub source_field: String,  // "fieldName:Type"
+    pub target_field: String,  // "fieldName:Type"
+}
+
 /// Information about a type layout mismatch
 #[derive(Debug, Clone)]
 pub struct TypeMismatchInfo {
@@ -84,6 +92,7 @@ pub struct TypeMismatchInfo {
     pub source_fields: usize,
     pub missing_fields: Vec<String>,
     pub field_type_mismatches: Vec<FieldTypeMismatchInfo>,
+    pub field_order_mismatches: Vec<FieldOrderMismatchInfo>,
 }
 
 /// Substitute functions from source bytecode into target bytecode
@@ -184,6 +193,15 @@ pub fn substitute_functions(
                     field_name: ftm.field_name.clone(),
                     source_type: ftm.source_type.clone(),
                     target_type: ftm.target_type.clone(),
+                })
+                .collect(),
+            field_order_mismatches: mismatch
+                .field_order_mismatches
+                .iter()
+                .map(|fom| FieldOrderMismatchInfo {
+                    position: fom.position,
+                    source_field: fom.source_field.clone(),
+                    target_field: fom.target_field.clone(),
                 })
                 .collect(),
         });
@@ -474,6 +492,15 @@ pub fn substitute_functions_by_pattern_with_options(
                     field_name: ftm.field_name.clone(),
                     source_type: ftm.source_type.clone(),
                     target_type: ftm.target_type.clone(),
+                })
+                .collect(),
+            field_order_mismatches: mismatch
+                .field_order_mismatches
+                .iter()
+                .map(|fom| FieldOrderMismatchInfo {
+                    position: fom.position,
+                    source_field: fom.source_field.clone(),
+                    target_field: fom.target_field.clone(),
                 })
                 .collect(),
         });

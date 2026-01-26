@@ -74,6 +74,31 @@ fn find_construct_index_by_name(code: &Bytecode, enum_type: RefType, name: &str)
     }
 }
 
+/// Check if two types are both virtuals with equivalent fields (same names, ignoring order)
+/// Virtual types are looked up by field name, so order doesn't matter for compatibility
+pub fn virtuals_equivalent(
+    src_code: &Bytecode,
+    src_type: RefType,
+    target_code: &Bytecode,
+    target_type: RefType,
+) -> bool {
+    match (src_code.get(src_type), target_code.get(target_type)) {
+        (Type::Virtual { fields: src_fields }, Type::Virtual { fields: target_fields }) => {
+            // Collect field names as sets
+            let src_names: std::collections::HashSet<_> = src_fields
+                .iter()
+                .map(|f| src_code.get(f.name).to_string())
+                .collect();
+            let target_names: std::collections::HashSet<_> = target_fields
+                .iter()
+                .map(|f| target_code.get(f.name).to_string())
+                .collect();
+            src_names == target_names
+        }
+        _ => false,
+    }
+}
+
 /// Format a type as a human-readable string (e.g. "null(f64)", "obj(GlDriver)")
 pub fn format_type(code: &Bytecode, t: RefType) -> String {
     match code.get(t) {
@@ -121,6 +146,14 @@ pub struct FieldTypeMismatch {
     pub target_type: String, // e.g. "f64"
 }
 
+/// Information about a field order mismatch (same field count, different field at same position)
+#[derive(Debug, Clone)]
+pub struct FieldOrderMismatch {
+    pub position: usize,           // 0-based field index
+    pub source_field: String,      // "fieldName:Type"
+    pub target_field: String,      // "fieldName:Type"
+}
+
 /// Information about type layout mismatches between source and target
 #[derive(Debug, Clone)]
 pub struct TypeMismatch {
@@ -130,6 +163,7 @@ pub struct TypeMismatch {
     pub missing_in_target: Vec<String>,            // fields in source but not target
     pub extra_in_target: Vec<String>,              // fields in target but not source (less common)
     pub field_type_mismatches: Vec<FieldTypeMismatch>, // same name, different type
+    pub field_order_mismatches: Vec<FieldOrderMismatch>, // different field at same position
 }
 
 /// Merges pools from source bytecode into target bytecode, building an IndexRemap
@@ -1559,7 +1593,10 @@ impl<'a> PoolMerger<'a> {
                 let target_type_str = format_type(self.target, target_field.t);
 
                 // If formatted types differ, it's a mismatch
-                if src_type_str != target_type_str {
+                // But skip if both are virtuals with equivalent fields (order doesn't matter for virtuals)
+                if src_type_str != target_type_str
+                    && !virtuals_equivalent(self.source, src_field.t, self.target, target_field.t)
+                {
                     field_type_mismatches.push(FieldTypeMismatch {
                         field_name: src_name,
                         source_type: src_type_str,
@@ -1569,10 +1606,34 @@ impl<'a> PoolMerger<'a> {
             }
         }
 
+        // Check for field ORDER mismatches (same count, different field at same position)
+        // This is critical for Obj/Struct types where field access is by index
+        let mut field_order_mismatches = Vec::new();
+        if src_obj.fields.len() == target_obj.fields.len() {
+            for (pos, (src_field, target_field)) in
+                src_obj.fields.iter().zip(target_obj.fields.iter()).enumerate()
+            {
+                let src_name = self.source.get(src_field.name).to_string();
+                let target_name = self.target.get(target_field.name).to_string();
+
+                // If field names differ at this position, it's an order mismatch
+                if src_name != target_name {
+                    let src_type_str = format_type(self.source, src_field.t);
+                    let target_type_str = format_type(self.target, target_field.t);
+                    field_order_mismatches.push(FieldOrderMismatch {
+                        position: pos,
+                        source_field: format!("{}:{}", src_name, src_type_str),
+                        target_field: format!("{}:{}", target_name, target_type_str),
+                    });
+                }
+            }
+        }
+
         // Only record if there's any kind of mismatch
         if !missing_in_target.is_empty()
             || src_obj.fields.len() != target_obj.fields.len()
             || !field_type_mismatches.is_empty()
+            || !field_order_mismatches.is_empty()
         {
             self.type_mismatches.insert(
                 src_type.0,
@@ -1583,6 +1644,7 @@ impl<'a> PoolMerger<'a> {
                     missing_in_target: missing_in_target.clone(),
                     extra_in_target,
                     field_type_mismatches: field_type_mismatches.clone(),
+                    field_order_mismatches: field_order_mismatches.clone(),
                 },
             );
 
@@ -1601,6 +1663,15 @@ impl<'a> PoolMerger<'a> {
                 self.warnings.push(format!(
                     "Type '{}' field '{}' has different type: source={}, target={}",
                     type_name, ftm.field_name, ftm.source_type, ftm.target_type
+                ));
+            }
+
+            // Warn about field order mismatches - field indices won't match!
+            if !field_order_mismatches.is_empty() {
+                self.warnings.push(format!(
+                    "Type '{}' has {} fields at wrong positions (source vs target field order differs)",
+                    type_name,
+                    field_order_mismatches.len()
                 ));
             }
         }

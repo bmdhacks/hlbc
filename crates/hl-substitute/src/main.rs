@@ -328,6 +328,11 @@ fn main() -> Result<()> {
                 println!("      ! {}: source={}, target={}",
                          ftm.field_name, ftm.source_type, ftm.target_type);
             }
+            // Show field order mismatches - field indices won't match
+            for fom in &tm.field_order_mismatches {
+                println!("      ! field {}: source={}, target={}",
+                         fom.position, fom.source_field, fom.target_field);
+            }
         }
         println!("    NOTE: Type mismatches may cause runtime errors.");
         println!("    Use --compare-types to see details.");
@@ -440,6 +445,22 @@ fn get_field_types(code: &Bytecode, ty: &Type) -> Vec<(String, String)> {
     }
 }
 
+/// Check if two type strings are equivalent virtuals (same fields, different order)
+/// Virtual types are looked up by field name, so order doesn't matter
+fn are_equivalent_virtual_strings(type_a: &str, type_b: &str) -> bool {
+    // Both must be virtual types
+    let (Some(inner_a), Some(inner_b)) = (
+        type_a.strip_prefix("virtual(").and_then(|s| s.strip_suffix(")")),
+        type_b.strip_prefix("virtual(").and_then(|s| s.strip_suffix(")")),
+    ) else {
+        return false;
+    };
+    // Compare field names as sets
+    let fields_a: std::collections::HashSet<&str> = inner_a.split(',').collect();
+    let fields_b: std::collections::HashSet<&str> = inner_b.split(',').collect();
+    fields_a == fields_b
+}
+
 /// Dump types from bytecode with optional prefix filter
 fn dump_types(code: &Bytecode, prefix: Option<&str>) {
     let mut types_info: BTreeMap<String, (usize, Vec<String>, &'static str)> = BTreeMap::new();
@@ -512,6 +533,7 @@ fn compare_types(target: &Bytecode, source: &Bytecode, prefix: Option<&str>) {
 
     let mut mismatches = 0;
     let mut field_type_mismatches = 0;
+    let mut field_order_mismatches = 0;
     let mut missing_in_source = 0;
     let mut extra_in_source = 0;
 
@@ -521,27 +543,54 @@ fn compare_types(target: &Bytecode, source: &Bytecode, prefix: Option<&str>) {
             Some((source_count, source_fields, source_field_types)) => {
                 let mut has_field_count_mismatch = false;
                 let mut field_type_diffs: Vec<(String, String, String)> = Vec::new();
+                let mut field_order_diffs: Vec<(usize, String, String, String, String)> = Vec::new();
 
                 if target_count != source_count {
                     has_field_count_mismatch = true;
                 }
 
                 // Check for field type mismatches on matching field names
+                // Skip equivalent virtuals (same fields, different order - order doesn't matter for virtuals)
                 for field_name in target_fields.iter() {
                     if let (Some(target_type), Some(source_type)) =
                         (target_field_types.get(field_name), source_field_types.get(field_name))
                     {
-                        if target_type != source_type {
+                        if target_type != source_type
+                            && !are_equivalent_virtual_strings(target_type, source_type)
+                        {
                             field_type_diffs.push((field_name.clone(), target_type.clone(), source_type.clone()));
                         }
                     }
                 }
 
-                if has_field_count_mismatch || !field_type_diffs.is_empty() {
+                // Check for field ORDER mismatches when counts match
+                if target_count == source_count {
+                    for (pos, (target_name, source_name)) in
+                        target_fields.iter().zip(source_fields.iter()).enumerate()
+                    {
+                        if target_name != source_name {
+                            let target_type = target_field_types.get(target_name)
+                                .map(|s| s.as_str()).unwrap_or("?");
+                            let source_type = source_field_types.get(source_name)
+                                .map(|s| s.as_str()).unwrap_or("?");
+                            field_order_diffs.push((
+                                pos,
+                                target_name.clone(),
+                                target_type.to_string(),
+                                source_name.clone(),
+                                source_type.to_string(),
+                            ));
+                        }
+                    }
+                }
+
+                if has_field_count_mismatch || !field_type_diffs.is_empty() || !field_order_diffs.is_empty() {
                     if has_field_count_mismatch {
                         println!("MISMATCH: {} - target has {} fields, source has {}",
                                  name, target_count, source_count);
                         mismatches += 1;
+                    } else if !field_order_diffs.is_empty() {
+                        println!("FIELD ORDER MISMATCH: {} ({} fields)", name, target_count);
                     } else {
                         println!("FIELD TYPE MISMATCH: {} ({} fields)", name, target_count);
                     }
@@ -563,6 +612,13 @@ fn compare_types(target: &Bytecode, source: &Bytecode, prefix: Option<&str>) {
                     for (field_name, target_type, source_type) in &field_type_diffs {
                         println!("  ! {}: target={}, source={}", field_name, target_type, source_type);
                         field_type_mismatches += 1;
+                    }
+
+                    // Show field order differences
+                    for (pos, target_name, target_type, source_name, source_type) in &field_order_diffs {
+                        println!("  ! field {}: target={}:{}, source={}:{}",
+                                 pos, target_name, target_type, source_name, source_type);
+                        field_order_mismatches += 1;
                     }
                     println!();
                 }
@@ -586,10 +642,11 @@ fn compare_types(target: &Bytecode, source: &Bytecode, prefix: Option<&str>) {
     println!("Summary:");
     println!("  Field count mismatches: {}", mismatches);
     println!("  Field type mismatches: {}", field_type_mismatches);
+    println!("  Field order mismatches: {}", field_order_mismatches);
     println!("  Missing in source: {}", missing_in_source);
     println!("  Extra in source: {}", extra_in_source);
 
-    if mismatches > 0 || field_type_mismatches > 0 {
+    if mismatches > 0 || field_type_mismatches > 0 || field_order_mismatches > 0 {
         println!();
         println!("WARNING: Type mismatches will cause substitution failures!");
         println!("Recompile your source library with matching type layouts.");
