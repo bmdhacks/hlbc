@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use hlbc::opcodes::Opcode;
 use hlbc::types::{
@@ -23,6 +23,9 @@ pub struct IndexRemap {
     /// Target construct count for each enum type: source_type_idx -> target_construct_count
     /// Used for Switch opcode remapping to size the offsets vector correctly
     pub enum_type_target_counts: HashMap<usize, usize>,
+    /// Fields in source types that don't exist in target: type_idx -> set of field indices
+    /// Used for validation during opcode remapping
+    pub missing_fields: HashMap<usize, HashSet<usize>>,
 }
 
 impl IndexRemap {
@@ -75,6 +78,20 @@ impl IndexRemap {
             }
         }
         src_field // No remap found, return as-is
+    }
+
+    /// Check if a field access would touch a field missing in target.
+    /// Returns Some(error_message) if invalid, None if OK.
+    pub fn validate_field_access(&self, src_type_idx: usize, src_field: RefField) -> Option<String> {
+        if let Some(missing) = self.missing_fields.get(&src_type_idx) {
+            if missing.contains(&src_field.0) {
+                return Some(format!(
+                    "Injected code accesses field {} on type {} which doesn't exist in target",
+                    src_field.0, src_type_idx
+                ));
+            }
+        }
+        None
     }
 
     /// Remap an enum construct index based on the source enum type

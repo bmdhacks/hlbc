@@ -9,6 +9,16 @@ use hlbc::{Bytecode, Resolve};
 
 use crate::remap::IndexRemap;
 
+/// Known stdlib function renames between Haxe versions.
+/// Maps (parent_type, source_name) -> target_name
+/// These allow code compiled with newer Haxe to run on older runtimes (and vice versa).
+const STDLIB_FUNCTION_REMAPS: &[(&str, &str, &str)] = &[
+    // Haxe 4.2+ renamed Std.is to Std.isOfType
+    // When source has isOfType but target has is, remap the call
+    ("$Std", "isOfType", "is"),
+    // Add more remaps here as needed for other Haxe version differences
+];
+
 /// Get the initialized string value for a String-type global, if any
 fn get_global_string_value<'a>(code: &'a Bytecode, global: RefGlobal) -> Option<&'a str> {
     // Check if global has a constant initializer
@@ -184,6 +194,16 @@ pub struct PoolMerger<'a> {
     pub unresolvable_natives: Vec<String>,
     /// Type layout mismatches detected (source type index -> mismatch info)
     pub type_mismatches: HashMap<usize, TypeMismatch>,
+    /// Fields in source types that don't exist in target: type_idx -> set of field indices
+    /// Used for validation during opcode remapping
+    pub missing_fields: HashMap<usize, HashSet<usize>>,
+    /// Stdlib functions that couldn't be injected due to version mismatch
+    /// (qualified_name, reason)
+    pub stdlib_mismatches: Vec<(String, String)>,
+    /// Source global indices that resulted in NEW globals being created in target
+    /// (not matched to existing). Maps source_global_idx -> target_global_idx.
+    /// These are the globals that need initialization code injection.
+    pub injected_globals: HashMap<usize, usize>,
 }
 
 impl<'a> PoolMerger<'a> {
@@ -199,6 +219,9 @@ impl<'a> PoolMerger<'a> {
             injected_natives: Vec::new(),
             unresolvable_natives: Vec::new(),
             type_mismatches: HashMap::new(),
+            missing_fields: HashMap::new(),
+            stdlib_mismatches: Vec::new(),
+            injected_globals: HashMap::new(),
         }
     }
 
@@ -215,6 +238,9 @@ impl<'a> PoolMerger<'a> {
             injected_natives: Vec::new(),
             unresolvable_natives: Vec::new(),
             type_mismatches: HashMap::new(),
+            missing_fields: HashMap::new(),
+            stdlib_mismatches: Vec::new(),
+            injected_globals: HashMap::new(),
         }
     }
 
@@ -857,8 +883,11 @@ impl<'a> PoolMerger<'a> {
             self.target.globals_initializers.insert(new_global, const_idx);
         }
 
-        // 6. Record the remap
+        // 7. Record the remap
         self.remap.globals.insert(src_ref.0, new_global.0);
+
+        // Note: String globals have ConstantDefs, so they don't need entry point init.
+        // We don't add them to injected_globals.
 
         new_global
     }
@@ -933,30 +962,11 @@ impl<'a> PoolMerger<'a> {
                 self.target.globals.push(remapped_type);
                 self.remap.globals.insert(src_ref.0, new_global_idx);
 
-                // Also need to copy the constant definition to initialize the enum
-                if let Some(&src_const_idx) = self.source.globals_initializers.get(&src_ref) {
-                    if let Some(constants) = self.source.constants.as_ref() {
-                        if let Some(src_const) = constants.get(src_const_idx) {
-                            // Create a new constant for this global
-                            let new_const = ConstantDef {
-                                global: RefGlobal(new_global_idx),
-                                fields: src_const.fields.clone(),
-                            };
-                            let new_const_idx = self
-                                .target
-                                .constants
-                                .get_or_insert_with(Vec::new)
-                                .len();
-                            self.target
-                                .constants
-                                .get_or_insert_with(Vec::new)
-                                .push(new_const);
-                            self.target
-                                .globals_initializers
-                                .insert(RefGlobal(new_global_idx), new_const_idx);
-                        }
-                    }
-                }
+                // Track this as an injected global (needs initialization code)
+                self.injected_globals.insert(src_ref.0, new_global_idx);
+
+                // Copy the constant definition to initialize the enum
+                self.copy_global_constant(src_ref, RefGlobal(new_global_idx));
 
                 let type_name = match self.target.get(remapped_type) {
                     Type::Enum { name, .. } => self.target.get(*name).to_string(),
@@ -992,6 +1002,9 @@ impl<'a> PoolMerger<'a> {
         self.target.globals.push(remapped_type);
         self.remap.globals.insert(src_ref.0, new_global_idx);
 
+        // Track this as an injected global (needs initialization code)
+        self.injected_globals.insert(src_ref.0, new_global_idx);
+
         // Get type name for logging
         let type_name = match self.target.get(remapped_type) {
             Type::Obj(obj) | Type::Struct(obj) => self.target.get(obj.name).to_string(),
@@ -1005,6 +1018,64 @@ impl<'a> PoolMerger<'a> {
         ));
 
         RefGlobal(new_global_idx)
+    }
+
+    /// Copy a ConstantDef from source to target for the given global.
+    /// Returns true if a constant was copied.
+    fn copy_global_constant(&mut self, src_global: RefGlobal, target_global: RefGlobal) -> bool {
+        let src_const_idx = match self.source.globals_initializers.get(&src_global) {
+            Some(&idx) => idx,
+            None => return false,
+        };
+
+        let src_const = match self.source.constants.as_ref().and_then(|c| c.get(src_const_idx)) {
+            Some(c) => c,
+            None => return false,
+        };
+
+        // Remap the field values - each field[i] is a pool index
+        // whose interpretation depends on the i-th field's type
+        let remapped_fields = self.remap_constant_fields(src_global, &src_const.fields);
+
+        let new_const = ConstantDef {
+            global: target_global,
+            fields: remapped_fields,
+        };
+
+        let constants = self.target.constants.get_or_insert_with(Vec::new);
+        let new_const_idx = constants.len();
+        constants.push(new_const);
+        self.target.globals_initializers.insert(target_global, new_const_idx);
+
+        true
+    }
+
+    /// Remap ConstantDef field values based on field types.
+    fn remap_constant_fields(&mut self, src_global: RefGlobal, src_fields: &[usize]) -> Vec<usize> {
+        let src_type = self.source.globals[src_global.0];
+
+        // Get field types from the object
+        let field_types: Vec<RefType> = match self.source.get(src_type) {
+            Type::Obj(obj) | Type::Struct(obj) => obj.fields.iter().map(|f| f.t).collect(),
+            Type::Enum { .. } => return src_fields.to_vec(), // Enum construct index, no remap
+            _ => return src_fields.to_vec(),
+        };
+
+        src_fields
+            .iter()
+            .enumerate()
+            .map(|(i, &value)| {
+                if i >= field_types.len() {
+                    return value;
+                }
+                match self.source.get(field_types[i]) {
+                    Type::I32 | Type::I64 => self.ensure_int(RefInt(value)).0,
+                    Type::F32 | Type::F64 => self.ensure_float(RefFloat(value)).0,
+                    Type::Bytes => self.ensure_string(RefString(value)).0,
+                    _ => value, // Other types: return as-is for now
+                }
+            })
+            .collect()
     }
 
     /// Ensure a function reference exists in target, return the remapped RefFun
@@ -1042,6 +1113,32 @@ impl<'a> PoolMerger<'a> {
                         if src_name == target_name && src_parent_name == target_parent_name {
                             self.remap.funs.insert(src_ref.0, target_func.findex.0);
                             return target_func.findex;
+                        }
+                    }
+
+                    // Check stdlib remaps - function might have been renamed between Haxe versions
+                    if let Some(parent) = &src_parent_name {
+                        for &(remap_parent, remap_src, remap_target) in STDLIB_FUNCTION_REMAPS {
+                            if parent == remap_parent && src_name == remap_src {
+                                // Look for the remapped function name in target
+                                for target_func in &self.target.functions {
+                                    let target_name = self.target.get(target_func.name).to_string();
+                                    let target_parent_name = target_func.parent.map(|p| {
+                                        self.target.get(p).get_type_obj()
+                                            .map(|obj| self.target.get(obj.name).to_string())
+                                    }).flatten();
+
+                                    if target_name == remap_target && target_parent_name.as_deref() == Some(remap_parent) {
+                                        // Found the remapped function - use it instead
+                                        self.remap.funs.insert(src_ref.0, target_func.findex.0);
+                                        self.warnings.push(format!(
+                                            "Stdlib remap: {}.{} -> {}.{} (Haxe version compatibility)",
+                                            parent, src_name, remap_parent, remap_target
+                                        ));
+                                        return target_func.findex;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1091,6 +1188,120 @@ impl<'a> PoolMerger<'a> {
         src_ref
     }
 
+    /// Check if a type name indicates a stdlib/runtime type that should not be injected
+    /// across different Haxe versions.
+    ///
+    /// Note: The `$` prefix is added by the Haxe compiler to ALL class types, so we can't
+    /// just check for `$` prefix. Instead we check for known stdlib type names.
+    fn is_stdlib_type(name: &str) -> bool {
+        // Strip the $ prefix if present for matching
+        let base_name = name.strip_prefix('$').unwrap_or(name);
+
+        // haxe.* namespace is stdlib
+        if base_name.starts_with("haxe.") {
+            return true;
+        }
+
+        // hl.* namespace is stdlib (HashLink runtime types)
+        if base_name.starts_with("hl.") {
+            return true;
+        }
+
+        // Known stdlib types that vary between Haxe versions
+        // These are the types where field layouts or method signatures change
+        matches!(base_name,
+            "Std" | "Sys" | "String" | "Array" | "Bytes" | "EReg" | "Date" | "Xml"
+            | "Math" | "Reflect" | "Type" | "StringBuf" | "StringTools"
+            | "Lambda" | "IntIterator" | "DateTools" | "SysError"
+        )
+    }
+
+    /// Check if a stdlib type exists in target and has compatible structure
+    /// Returns None if compatible or not a stdlib type, Some(reason) if incompatible
+    fn check_stdlib_compatibility(&self, parent_name: &str) -> Option<String> {
+        if !Self::is_stdlib_type(parent_name) {
+            return None;
+        }
+
+        // Find the source type
+        let src_type_idx = self.source.types.iter().enumerate().find_map(|(i, t)| {
+            if let Some(obj) = t.get_type_obj() {
+                if self.source.get(obj.name) == parent_name {
+                    return Some(i);
+                }
+            }
+            None
+        });
+
+        // Find the target type with the same name
+        let target_type_idx = self.target.types.iter().enumerate().find_map(|(i, t)| {
+            if let Some(obj) = t.get_type_obj() {
+                if self.target.get(obj.name) == parent_name {
+                    return Some(i);
+                }
+            }
+            None
+        });
+
+        match (src_type_idx, target_type_idx) {
+            (Some(src_idx), Some(target_idx)) => {
+                let src_type = &self.source.types[src_idx];
+                let target_type = &self.target.types[target_idx];
+
+                // Get field/method names from both
+                let src_fields: HashSet<String> = match src_type.get_type_obj() {
+                    Some(obj) => obj.fields.iter()
+                        .map(|f| self.source.get(f.name).to_string())
+                        .collect(),
+                    None => HashSet::new(),
+                };
+
+                let target_fields: HashSet<String> = match target_type.get_type_obj() {
+                    Some(obj) => obj.fields.iter()
+                        .map(|f| self.target.get(f.name).to_string())
+                        .collect(),
+                    None => HashSet::new(),
+                };
+
+                // Check if source has fields that target doesn't
+                let missing_in_target: Vec<_> = src_fields.difference(&target_fields).collect();
+                let extra_in_target: Vec<_> = target_fields.difference(&src_fields).collect();
+
+                if !missing_in_target.is_empty() || !extra_in_target.is_empty() {
+                    let mut reason = format!(
+                        "stdlib type '{}' has incompatible layout (source: {} fields, target: {} fields)",
+                        parent_name, src_fields.len(), target_fields.len()
+                    );
+                    if !missing_in_target.is_empty() {
+                        reason.push_str(&format!(
+                            ". Source has: {}",
+                            missing_in_target.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                        ));
+                    }
+                    if !extra_in_target.is_empty() {
+                        reason.push_str(&format!(
+                            ". Target has: {}",
+                            extra_in_target.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                        ));
+                    }
+                    reason.push_str(". Recompile source with matching Haxe version.");
+                    return Some(reason);
+                }
+
+                None // Compatible
+            }
+            (Some(_), None) => {
+                // Source has the stdlib type but target doesn't - can't inject
+                Some(format!(
+                    "stdlib type '{}' exists in source but not in target. \
+                     This indicates a Haxe version mismatch.",
+                    parent_name
+                ))
+            }
+            _ => None, // No source type or no parent, allow injection
+        }
+    }
+
     /// Inject a function from source into target
     /// This is called when a function is not found in target and injection is enabled
     fn inject_function(
@@ -1099,6 +1310,17 @@ impl<'a> PoolMerger<'a> {
         func_name: &str,
         parent_name: Option<&str>,
     ) -> RefFun {
+        // Check if this is a stdlib function with incompatible types
+        if let Some(parent) = parent_name {
+            if let Some(reason) = self.check_stdlib_compatibility(parent) {
+                let qualified_name = format!("{}.{}", parent, func_name);
+                self.stdlib_mismatches.push((qualified_name.clone(), reason));
+                // Return original ref - can't inject, but don't crash
+                // The error will be reported and substitution will fail
+                return src_ref;
+            }
+        }
+
         // Get the source function (we already know it's a Fun, not Native)
         let src_func = match self.source.get(src_ref) {
             hlbc::types::FunPtr::Fun(f) => f,
@@ -1524,6 +1746,140 @@ impl<'a> PoolMerger<'a> {
         }
     }
 
+    /// Force-map field types from source to target when both types exist.
+    /// This prevents source's field types from being created as new types when
+    /// a matching type already exists in both source and target.
+    ///
+    /// For example, if source's ObjectMap has a Virtual() field type and target's
+    /// ObjectMap has a Virtual(toString,set,keys,...) field type, this ensures
+    /// the source's field type maps to target's existing field type rather than
+    /// creating a new empty Virtual.
+    fn force_map_field_types(&mut self, src_type: RefType, target_type: RefType) {
+        let src_obj = match self.source.get(src_type) {
+            Type::Obj(obj) | Type::Struct(obj) => obj,
+            _ => return,
+        };
+        let target_obj = match self.target.get(target_type) {
+            Type::Obj(obj) | Type::Struct(obj) => obj,
+            _ => return,
+        };
+
+        // Build target field name -> field_type map
+        let target_fields: HashMap<String, RefType> = target_obj
+            .fields
+            .iter()
+            .map(|f| (self.target.get(f.name).to_string(), f.t))
+            .collect();
+
+        // Collect source field info to avoid borrowing issues
+        let src_field_info: Vec<(String, RefType)> = src_obj
+            .fields
+            .iter()
+            .map(|f| (self.source.get(f.name).to_string(), f.t))
+            .collect();
+
+        // For each source field with matching target field, force the type mapping
+        for (src_field_name, src_field_type) in src_field_info {
+            if let Some(&target_field_type) = target_fields.get(&src_field_name) {
+                // Only force-map if not already mapped and not a primitive
+                if !src_field_type.is_known()
+                    && !self.remap.types.contains_key(&src_field_type.0)
+                {
+                    self.force_map_type_recursive(src_field_type, target_field_type);
+                }
+            }
+        }
+    }
+
+    /// Recursively force-map source type to target type.
+    /// Handles wrapper types (Null, Ref, Packed) and Virtual types.
+    fn force_map_type_recursive(&mut self, src_type: RefType, target_type: RefType) {
+        if src_type.is_known() || self.remap.types.contains_key(&src_type.0) {
+            return;
+        }
+
+        let src = self.source.get(src_type);
+        let target = self.target.get(target_type);
+
+        // Must be same variant to force-map
+        if std::mem::discriminant(src) != std::mem::discriminant(target) {
+            return;
+        }
+
+        match (src, target) {
+            (
+                Type::Virtual { fields: src_fields },
+                Type::Virtual {
+                    fields: target_fields,
+                },
+            ) => {
+                // Clone the fields to avoid borrow issues
+                let src_fields = src_fields.clone();
+                let target_fields = target_fields.clone();
+
+                self.remap.types.insert(src_type.0, target_type.0);
+                self.build_virtual_field_remap_for_force_map(
+                    src_type,
+                    &src_fields,
+                    &target_fields,
+                );
+            }
+
+            (Type::Null(src_inner), Type::Null(target_inner))
+            | (Type::Ref(src_inner), Type::Ref(target_inner))
+            | (Type::Packed(src_inner), Type::Packed(target_inner)) => {
+                let src_inner = *src_inner;
+                let target_inner = *target_inner;
+                self.remap.types.insert(src_type.0, target_type.0);
+                self.force_map_type_recursive(src_inner, target_inner);
+            }
+
+            (Type::Obj(src_obj), Type::Obj(target_obj))
+            | (Type::Struct(src_obj), Type::Struct(target_obj)) => {
+                if self.source.get(src_obj.name) == self.target.get(target_obj.name) {
+                    self.remap.types.insert(src_type.0, target_type.0);
+                }
+            }
+
+            (Type::Fun(_), Type::Fun(_)) | (Type::Method(_), Type::Method(_)) => {
+                // For function types, we trust that they're compatible if they have
+                // the same discriminant. A more thorough check could compare args/ret.
+                self.remap.types.insert(src_type.0, target_type.0);
+            }
+
+            _ => {}
+        }
+    }
+
+    /// Build field index remap for a force-mapped Virtual type.
+    fn build_virtual_field_remap_for_force_map(
+        &mut self,
+        src_type: RefType,
+        src_fields: &[ObjField],
+        target_fields: &[ObjField],
+    ) {
+        let target_field_indices: HashMap<String, usize> = target_fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (self.target.get(f.name).to_string(), i))
+            .collect();
+
+        let mut field_map = HashMap::new();
+
+        for (src_idx, src_field) in src_fields.iter().enumerate() {
+            let field_name = self.source.get(src_field.name).to_string();
+            if let Some(&target_idx) = target_field_indices.get(&field_name) {
+                if src_idx != target_idx {
+                    field_map.insert(src_idx, target_idx);
+                }
+            }
+        }
+
+        if !field_map.is_empty() {
+            self.remap.type_fields.insert(src_type.0, field_map);
+        }
+    }
+
     /// Process field remapping for an Obj/Struct type
     /// Called by ensure_type after matching a type by name
     ///
@@ -1531,6 +1887,11 @@ impl<'a> PoolMerger<'a> {
     /// If source has fields that target doesn't, we record a mismatch.
     /// Injecting fields would corrupt the target's memory layout.
     fn process_type_fields(&mut self, src_type: RefType, target_type: RefType) {
+        // Force-map field types to target's field types BEFORE detecting mismatches
+        // This ensures that types appearing in both source and target use the same
+        // field type indices (e.g., Virtual types on ObjectMap fields)
+        self.force_map_field_types(src_type, target_type);
+
         // Detect field mismatches (don't inject - that corrupts memory layout)
         self.detect_field_mismatches(src_type, target_type);
 
@@ -1570,6 +1931,24 @@ impl<'a> PoolMerger<'a> {
             .difference(&target_field_names)
             .cloned()
             .collect();
+
+        // Track missing field indices for validation during opcode remapping
+        if !missing_in_target.is_empty() {
+            let missing_indices: HashSet<usize> = src_obj
+                .fields
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| {
+                    let name = self.source.get(f.name).to_string();
+                    missing_in_target.contains(&name)
+                })
+                .map(|(i, _)| i)
+                .collect();
+
+            if !missing_indices.is_empty() {
+                self.missing_fields.insert(src_type.0, missing_indices);
+            }
+        }
 
         // Find extra fields in target (target has but source doesn't) - less common
         let extra_in_target: Vec<String> = target_field_names
@@ -1745,12 +2124,47 @@ impl<'a> PoolMerger<'a> {
             flattened_fields.push_back(f.clone());
         }
 
+        // Create a global for this type if source has one
+        // NOTE: The global field in bytecode is 1-indexed (0 = no global, N = globals[N-1])
+        let new_global = if src_obj.global.0 > 0 {
+            // Convert from 1-indexed bytecode value to 0-indexed array index
+            let src_global_idx = src_obj.global.0 - 1;
+
+            // Check if this source global was already remapped (e.g., when $ClassName
+            // and ClassName share the same global and $ClassName was processed first)
+            if let Some(&existing_target_idx) = self.remap.globals.get(&src_global_idx) {
+                // Return as 1-indexed for the type's global field
+                RefGlobal(existing_target_idx + 1)
+            } else {
+                // Get the source global's type (likely $ClassName, not ClassName)
+                let src_global_type = self.source.globals[src_global_idx];
+                // Ensure that type exists in target (will copy $ClassName if needed)
+                let target_global_type = self.ensure_type(src_global_type);
+
+                // Create new global at the end of the target globals array
+                let target_global_idx = self.target.globals.len();
+                self.target.globals.push(target_global_type);
+                self.remap.globals.insert(src_global_idx, target_global_idx);
+
+                // Track this as an injected global (needs initialization code)
+                self.injected_globals.insert(src_global_idx, target_global_idx);
+
+                // Copy the ConstantDef if source has one (using 0-indexed RefGlobals)
+                self.copy_global_constant(RefGlobal(src_global_idx), RefGlobal(target_global_idx));
+
+                // Return as 1-indexed for the type's global field
+                RefGlobal(target_global_idx + 1)
+            }
+        } else {
+            RefGlobal(0)
+        };
+
         // Create the actual type
         let new_type = if is_struct {
             Type::Struct(hlbc::types::TypeObj {
                 name: name_ref,
                 super_: super_ref,
-                global: RefGlobal(0), // No global for created types
+                global: new_global,
                 own_fields: own_fields.clone(),
                 protos: Vec::new(),        // No protos for created types
                 bindings: HashMap::new(),  // No bindings for created types
@@ -1760,7 +2174,7 @@ impl<'a> PoolMerger<'a> {
             Type::Obj(hlbc::types::TypeObj {
                 name: name_ref,
                 super_: super_ref,
-                global: RefGlobal(0), // No global for created types
+                global: new_global,
                 own_fields: own_fields.clone(),
                 protos: Vec::new(),        // No protos for created types
                 bindings: HashMap::new(),  // No bindings for created types
@@ -1947,5 +2361,663 @@ impl<'a> PoolMerger<'a> {
             enum_name,
             injected_names.join(", ")
         ));
+    }
+
+    /// Extract initialization code for injected types from source entry point.
+    ///
+    /// This scans the source entry point function for:
+    /// 1. initClass() calls for injected $ClassName types
+    /// 2. GetGlobal + SetField sequences for static field initialization
+    /// 3. New + constructor calls that create values for static fields
+    ///
+    /// The extracted opcodes are remapped to use target pool indices.
+    /// This method MUST be called before dropping the merger, as it needs to
+    /// call ensure_fun() and ensure_type() for any references in the extracted code.
+    ///
+    /// Returns None if no initialization code is needed.
+    pub fn extract_init_code_for_injected_types(&mut self) -> Option<ExtractedInitCode> {
+        if self.injected_globals.is_empty() {
+            return None;
+        }
+
+        // Get source entry point function
+        let entry_func = self.source.get(self.source.entrypoint);
+        let entry_func = match entry_func {
+            hlbc::types::FunPtr::Fun(f) => f,
+            hlbc::types::FunPtr::Native(_) => return None, // Shouldn't happen
+        };
+
+        // Build set of injected source globals
+        let injected_src_globals: HashSet<usize> = self.injected_globals.keys().copied().collect();
+
+        // Collect type names of injected $ClassName types for initClass matching
+        let mut injected_class_names: HashSet<String> = HashSet::new();
+        for &src_global_idx in self.injected_globals.keys() {
+            let global_type = self.source.globals[src_global_idx];
+            if let Type::Obj(obj) = self.source.get(global_type) {
+                let name = self.source.get(obj.name).to_string();
+                injected_class_names.insert(name);
+            }
+        }
+
+        let ops = &entry_func.ops;
+        let regs = &entry_func.regs;
+
+        // Track which opcodes to extract
+        let mut extracted_indices: HashSet<usize> = HashSet::new();
+        // Track registers that hold objects we need to initialize (from New opcodes we include)
+        let mut initialized_registers: HashSet<u32> = HashSet::new();
+
+        // Pass 1: Find initClass calls for injected types by looking at the pattern:
+        //   Type reg = $ClassName
+        //   Type reg = ClassName
+        //   String reg = "full.ClassName"
+        //   Call3 initClass(reg, reg, reg)
+        //
+        // We identify these by checking if the String argument matches an injected class name
+        for (idx, op) in ops.iter().enumerate() {
+            if let Opcode::Call3 { fun, arg0, arg1, arg2, .. } = op {
+                let is_init_class = if let hlbc::types::FunPtr::Fun(f) = self.source.get(*fun) {
+                    self.source.get(f.name) == "initClass"
+                } else {
+                    false
+                };
+
+                if is_init_class && idx >= 3 {
+                    // Verify the pattern: Type, Type, String, Call3
+                    let type1_ok = matches!(&ops[idx - 3], Opcode::Type { dst, .. } if dst.0 == arg0.0);
+                    let type2_ok = matches!(&ops[idx - 2], Opcode::Type { dst, .. } if dst.0 == arg1.0);
+                    let string_ok = matches!(&ops[idx - 1], Opcode::String { dst, .. } if dst.0 == arg2.0);
+
+                    if type1_ok && type2_ok && string_ok {
+                        // Get the class name from the String opcode
+                        if let Opcode::String { ptr, .. } = &ops[idx - 1] {
+                            let class_name = self.source.get(*ptr);
+                            // Check if this is an injected class
+                            // initClass string is "uber.UberState", but injected_class_names
+                            // contains "uber.$UberState" ($ before class name, not package)
+                            // Convert "uber.UberState" -> "uber.$UberState"
+                            let dollar_name = if let Some(dot_pos) = class_name.rfind('.') {
+                                format!("{}.${}",
+                                    &class_name[..dot_pos],
+                                    &class_name[dot_pos + 1..])
+                            } else {
+                                format!("${}", class_name)
+                            };
+                            if injected_class_names.contains(&dollar_name) {
+                                // Extract the whole initClass sequence
+                                extracted_indices.insert(idx - 3); // Type $ClassName
+                                extracted_indices.insert(idx - 2); // Type ClassName
+                                extracted_indices.insert(idx - 1); // String "full.ClassName"
+                                extracted_indices.insert(idx);     // Call3 initClass
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pass 2: Find GetGlobal + SetField sequences for injected globals
+        // and track the value definitions we need to include
+        for (idx, op) in ops.iter().enumerate() {
+            if let Opcode::GetGlobal { global, .. } = op {
+                if injected_src_globals.contains(&global.0) {
+                    extracted_indices.insert(idx);
+
+                    // Look ahead for SetField operations on this register
+                    // The pattern is: GetGlobal reg = global; SetField reg.field = value
+                    if idx + 1 < ops.len() {
+                        if let Opcode::SetField { src, .. } = &ops[idx + 1] {
+                            extracted_indices.insert(idx + 1);
+
+                            // Find the definition of src and include it
+                            if let Some(def_idx) = find_def_before(ops, idx + 1, src.0) {
+                                include_def_with_constructor(
+                                    ops, def_idx, &mut extracted_indices, &mut initialized_registers
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if extracted_indices.is_empty() {
+            return None;
+        }
+
+        // Sort indices and extract opcodes in order
+        let mut sorted_indices: Vec<usize> = extracted_indices.into_iter().collect();
+        sorted_indices.sort();
+
+        // NEW: Pass 3 - Ensure all function and type references in extracted opcodes are mapped
+        // This MUST happen before we use the remap, so that functions like ObjectMap.__constructor__
+        // get added to the remap tables.
+        for &idx in &sorted_indices {
+            let op = &ops[idx];
+            match op {
+                // Function references
+                Opcode::Call0 { fun, .. }
+                | Opcode::Call1 { fun, .. }
+                | Opcode::Call2 { fun, .. }
+                | Opcode::Call3 { fun, .. }
+                | Opcode::Call4 { fun, .. }
+                | Opcode::CallN { fun, .. } => {
+                    self.ensure_fun(*fun);
+                }
+                // Type references
+                Opcode::Type { ty, .. } => {
+                    self.ensure_type(*ty);
+                }
+                // New opcodes - type comes from the register
+                Opcode::New { dst } => {
+                    let reg_type = regs[dst.0 as usize];
+                    self.ensure_type(reg_type);
+                }
+                // String references
+                Opcode::String { ptr, .. } => {
+                    self.ensure_string(*ptr);
+                }
+                // Global references
+                Opcode::GetGlobal { global, .. } | Opcode::SetGlobal { global, .. } => {
+                    self.ensure_global(*global);
+                }
+                // Int/Float references
+                Opcode::Int { ptr, .. } => {
+                    self.ensure_int(*ptr);
+                }
+                Opcode::Float { ptr, .. } => {
+                    self.ensure_float(*ptr);
+                }
+                _ => {}
+            }
+        }
+
+        // Build register remapping: old register -> new register
+        let mut old_to_new_reg: HashMap<u32, u32> = HashMap::new();
+        let mut next_reg: u32 = 0;
+
+        // First pass: collect all registers used
+        for &idx in &sorted_indices {
+            collect_registers(&ops[idx], &mut old_to_new_reg, &mut next_reg);
+        }
+
+        // Build source register type map for the registers we're using
+        let mut src_reg_types: HashMap<u32, RefType> = HashMap::new();
+        for (&old_reg, _) in &old_to_new_reg {
+            if (old_reg as usize) < regs.len() {
+                src_reg_types.insert(old_reg, regs[old_reg as usize]);
+            }
+        }
+
+        // Second pass: remap opcodes
+        let mut remapped_opcodes = Vec::new();
+        let initialized_globals: Vec<usize> = self.injected_globals.keys().copied().collect();
+
+        for &idx in &sorted_indices {
+            let op = &ops[idx];
+            // First remap pool references using the index remap
+            let pool_remapped = self.remap.remap_opcode_with_regs(op, regs);
+            // Then remap registers to the new contiguous range
+            let fully_remapped = remap_registers(&pool_remapped, &old_to_new_reg);
+            remapped_opcodes.push(fully_remapped);
+        }
+
+        // Build remapped register types
+        let mut remapped_reg_types: Vec<RefType> = vec![RefType(0); next_reg as usize];
+        for (&old_reg, &new_reg) in &old_to_new_reg {
+            if let Some(&src_type) = src_reg_types.get(&old_reg) {
+                // Remap the type reference
+                remapped_reg_types[new_reg as usize] = self.remap.remap_type(src_type);
+            }
+        }
+
+        Some(ExtractedInitCode {
+            opcodes: remapped_opcodes,
+            register_count: next_reg as usize,
+            initialized_globals,
+            register_types: remapped_reg_types,
+        })
+    }
+}
+
+/// Information about initialization code extracted from source entry point
+#[derive(Debug)]
+pub struct ExtractedInitCode {
+    /// Opcodes to inject, in order (already remapped)
+    pub opcodes: Vec<Opcode>,
+    /// Number of registers used by the extracted code
+    pub register_count: usize,
+    /// Source globals that were initialized
+    pub initialized_globals: Vec<usize>,
+    /// Register types for the extracted code (already remapped to target types)
+    pub register_types: Vec<RefType>,
+}
+
+/// Find the opcode that defines a register, looking backwards from idx
+fn find_def_before(ops: &[Opcode], idx: usize, reg: u32) -> Option<usize> {
+    for i in (0..idx).rev() {
+        if opcode_defines_reg(&ops[i], reg) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Check if an opcode defines (writes to) a register
+fn opcode_defines_reg(op: &Opcode, reg: u32) -> bool {
+    match op {
+        Opcode::Mov { dst, .. } |
+        Opcode::New { dst } |
+        Opcode::Null { dst } |
+        Opcode::Bool { dst, .. } |
+        Opcode::Int { dst, .. } |
+        Opcode::Float { dst, .. } |
+        Opcode::String { dst, .. } |
+        Opcode::Type { dst, .. } |
+        Opcode::GetGlobal { dst, .. } |
+        Opcode::Field { dst, .. } |
+        Opcode::Call0 { dst, .. } |
+        Opcode::Call1 { dst, .. } |
+        Opcode::Call2 { dst, .. } |
+        Opcode::Call3 { dst, .. } |
+        Opcode::Call4 { dst, .. } |
+        Opcode::CallN { dst, .. } => dst.0 == reg,
+        _ => false,
+    }
+}
+
+/// Include an opcode definition and its dependencies, including constructor calls
+fn include_def_with_constructor(
+    ops: &[Opcode],
+    def_idx: usize,
+    extracted: &mut HashSet<usize>,
+    initialized_regs: &mut HashSet<u32>,
+) {
+    if !extracted.insert(def_idx) {
+        return; // Already included
+    }
+
+    let op = &ops[def_idx];
+
+    // If this is a New opcode, look for the constructor call that follows
+    if let Opcode::New { dst } = op {
+        initialized_regs.insert(dst.0);
+
+        // Look ahead for Call1/CallN __constructor__ that takes this register as first arg
+        for i in (def_idx + 1)..ops.len().min(def_idx + 10) {
+            match &ops[i] {
+                Opcode::Call1 { fun, arg0, .. } if arg0.0 == dst.0 => {
+                    // Check if this is a constructor call
+                    // Constructor calls have the pattern Call1 __constructor__(obj)
+                    extracted.insert(i);
+                    break;
+                }
+                Opcode::CallN { fun: _, args, .. } if !args.is_empty() && args[0].0 == dst.0 => {
+                    extracted.insert(i);
+                    break;
+                }
+                _ => {
+                    // If we see another definition of dst, stop looking
+                    if opcode_defines_reg(&ops[i], dst.0) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Include dependencies for read registers
+    let read_regs = get_read_registers(op);
+    for reg in read_regs {
+        if let Some(dep_idx) = find_def_before(ops, def_idx, reg) {
+            include_def_with_constructor(ops, dep_idx, extracted, initialized_regs);
+        }
+    }
+}
+
+/// Get all registers that an opcode reads from
+fn get_read_registers(op: &Opcode) -> Vec<u32> {
+    match op {
+        Opcode::Mov { src, .. } => vec![src.0],
+        Opcode::Call0 { .. } => vec![],
+        Opcode::Call1 { arg0, .. } => vec![arg0.0],
+        Opcode::Call2 { arg0, arg1, .. } => vec![arg0.0, arg1.0],
+        Opcode::Call3 { arg0, arg1, arg2, .. } => vec![arg0.0, arg1.0, arg2.0],
+        Opcode::Call4 { arg0, arg1, arg2, arg3, .. } => vec![arg0.0, arg1.0, arg2.0, arg3.0],
+        Opcode::CallN { args, .. } => args.iter().map(|r| r.0).collect(),
+        Opcode::SetField { obj, src, .. } => vec![obj.0, src.0],
+        Opcode::GetGlobal { .. } => vec![],
+        Opcode::SetGlobal { src, .. } => vec![src.0],
+        Opcode::Field { obj, .. } => vec![obj.0],
+        Opcode::New { .. } => vec![],
+        Opcode::Type { .. } => vec![],
+        Opcode::Null { .. } => vec![],
+        Opcode::Bool { .. } => vec![],
+        Opcode::Int { .. } => vec![],
+        Opcode::Float { .. } => vec![],
+        Opcode::String { .. } => vec![],
+        _ => vec![], // Conservative: assume no reads
+    }
+}
+
+/// Collect all registers used by an opcode, assigning new indices as needed
+fn collect_registers(op: &Opcode, mapping: &mut HashMap<u32, u32>, next_reg: &mut u32) {
+    let regs = get_all_registers(op);
+    for reg in regs {
+        mapping.entry(reg).or_insert_with(|| {
+            let new = *next_reg;
+            *next_reg += 1;
+            new
+        });
+    }
+}
+
+/// Get all registers (read and written) by an opcode
+fn get_all_registers(op: &Opcode) -> Vec<u32> {
+    match op {
+        Opcode::Mov { dst, src } => vec![dst.0 as u32, src.0 as u32],
+        Opcode::Call0 { dst, .. } => vec![dst.0 as u32],
+        Opcode::Call1 { dst, arg0, .. } => vec![dst.0 as u32, arg0.0 as u32],
+        Opcode::Call2 { dst, arg0, arg1, .. } => vec![dst.0 as u32, arg0.0 as u32, arg1.0 as u32],
+        Opcode::Call3 { dst, arg0, arg1, arg2, .. } => {
+            vec![dst.0 as u32, arg0.0 as u32, arg1.0 as u32, arg2.0 as u32]
+        }
+        Opcode::Call4 { dst, arg0, arg1, arg2, arg3, .. } => {
+            vec![dst.0 as u32, arg0.0 as u32, arg1.0 as u32, arg2.0 as u32, arg3.0 as u32]
+        }
+        Opcode::CallN { dst, args, .. } => {
+            let mut v = vec![dst.0 as u32];
+            v.extend(args.iter().map(|r| r.0 as u32));
+            v
+        }
+        Opcode::SetField { obj, src, .. } => vec![obj.0 as u32, src.0 as u32],
+        Opcode::GetGlobal { dst, .. } => vec![dst.0 as u32],
+        Opcode::SetGlobal { src, .. } => vec![src.0 as u32],
+        Opcode::Field { dst, obj, .. } => vec![dst.0 as u32, obj.0 as u32],
+        Opcode::New { dst } => vec![dst.0 as u32],
+        Opcode::Type { dst, .. } => vec![dst.0 as u32],
+        Opcode::Null { dst } => vec![dst.0 as u32],
+        Opcode::Bool { dst, .. } => vec![dst.0 as u32],
+        Opcode::Int { dst, .. } => vec![dst.0 as u32],
+        Opcode::Float { dst, .. } => vec![dst.0 as u32],
+        Opcode::String { dst, .. } => vec![dst.0 as u32],
+        _ => vec![], // Conservative
+    }
+}
+
+/// Remap registers in an opcode using the given mapping
+fn remap_registers(op: &Opcode, mapping: &HashMap<u32, u32>) -> Opcode {
+    use hlbc::types::Reg;
+
+    let remap_reg = |r: Reg| -> Reg {
+        Reg(*mapping.get(&r.0).unwrap_or(&r.0))
+    };
+
+    match op.clone() {
+        Opcode::Mov { dst, src } => Opcode::Mov {
+            dst: remap_reg(dst),
+            src: remap_reg(src),
+        },
+        Opcode::Call0 { dst, fun } => Opcode::Call0 {
+            dst: remap_reg(dst),
+            fun,
+        },
+        Opcode::Call1 { dst, fun, arg0 } => Opcode::Call1 {
+            dst: remap_reg(dst),
+            fun,
+            arg0: remap_reg(arg0),
+        },
+        Opcode::Call2 { dst, fun, arg0, arg1 } => Opcode::Call2 {
+            dst: remap_reg(dst),
+            fun,
+            arg0: remap_reg(arg0),
+            arg1: remap_reg(arg1),
+        },
+        Opcode::Call3 { dst, fun, arg0, arg1, arg2 } => Opcode::Call3 {
+            dst: remap_reg(dst),
+            fun,
+            arg0: remap_reg(arg0),
+            arg1: remap_reg(arg1),
+            arg2: remap_reg(arg2),
+        },
+        Opcode::Call4 { dst, fun, arg0, arg1, arg2, arg3 } => Opcode::Call4 {
+            dst: remap_reg(dst),
+            fun,
+            arg0: remap_reg(arg0),
+            arg1: remap_reg(arg1),
+            arg2: remap_reg(arg2),
+            arg3: remap_reg(arg3),
+        },
+        Opcode::CallN { dst, fun, args } => Opcode::CallN {
+            dst: remap_reg(dst),
+            fun,
+            args: args.into_iter().map(remap_reg).collect(),
+        },
+        Opcode::SetField { obj, field, src } => Opcode::SetField {
+            obj: remap_reg(obj),
+            field,
+            src: remap_reg(src),
+        },
+        Opcode::GetGlobal { dst, global } => Opcode::GetGlobal {
+            dst: remap_reg(dst),
+            global,
+        },
+        Opcode::SetGlobal { global, src } => Opcode::SetGlobal {
+            global,
+            src: remap_reg(src),
+        },
+        Opcode::Field { dst, obj, field } => Opcode::Field {
+            dst: remap_reg(dst),
+            obj: remap_reg(obj),
+            field,
+        },
+        Opcode::New { dst } => Opcode::New {
+            dst: remap_reg(dst),
+        },
+        Opcode::Type { dst, ty } => Opcode::Type {
+            dst: remap_reg(dst),
+            ty,
+        },
+        Opcode::Null { dst } => Opcode::Null {
+            dst: remap_reg(dst),
+        },
+        Opcode::Bool { dst, value } => Opcode::Bool {
+            dst: remap_reg(dst),
+            value,
+        },
+        Opcode::Int { dst, ptr } => Opcode::Int {
+            dst: remap_reg(dst),
+            ptr,
+        },
+        Opcode::Float { dst, ptr } => Opcode::Float {
+            dst: remap_reg(dst),
+            ptr,
+        },
+        Opcode::String { dst, ptr } => Opcode::String {
+            dst: remap_reg(dst),
+            ptr,
+        },
+        other => other, // Pass through unchanged
+    }
+}
+
+/// Inject initialization opcodes into target entry point.
+///
+/// Inserts the extracted initialization code before the main() call in the target
+/// entry point function.
+///
+/// # Arguments
+/// * `target` - Target bytecode to modify
+/// * `init_code` - The extracted and remapped initialization code
+///
+/// Returns the number of opcodes injected.
+pub fn inject_init_into_entrypoint(
+    target: &mut Bytecode,
+    init_code: ExtractedInitCode,
+) -> usize {
+    if init_code.opcodes.is_empty() {
+        return 0;
+    }
+
+    // Find target entry point function
+    let entry_findex = target.entrypoint.0;
+
+    // Find the function in the functions array
+    let func_idx = target.functions.iter().position(|f| f.findex.0 == entry_findex);
+    let func_idx = match func_idx {
+        Some(idx) => idx,
+        None => return 0, // Entry point not found
+    };
+
+    // First pass: find insertion point while holding immutable borrows
+    // We need to find Call0 to "main" function
+    let ops_len = target.functions[func_idx].ops.len();
+    let mut insert_idx = ops_len; // Default: insert at end (before Ret)
+
+    for (idx, op) in target.functions[func_idx].ops.iter().enumerate().rev() {
+        match op {
+            Opcode::Call0 { fun, .. } => {
+                if let hlbc::types::FunPtr::Fun(f) = target.get(*fun) {
+                    if target.get(f.name) == "main" {
+                        insert_idx = idx;
+                        break;
+                    }
+                }
+            }
+            Opcode::Ret { .. } if insert_idx == ops_len => {
+                // Found Ret, insert before it if we haven't found main
+                insert_idx = idx;
+            }
+            _ => {}
+        }
+    }
+
+    // Now get mutable access to the function
+    let func = &mut target.functions[func_idx];
+
+    // Calculate register offset: we need to shift all extracted registers
+    // to start after the current max register
+    let current_max_reg = func.regs.len() as u32;
+    let shifted_ops: Vec<Opcode> = init_code.opcodes.into_iter()
+        .map(|op| shift_registers(op, current_max_reg))
+        .collect();
+
+    let count = shifted_ops.len();
+
+    // Add register types for the new registers (using actual types from source)
+    for reg_type in init_code.register_types {
+        func.regs.push(reg_type);
+    }
+
+    // Insert the opcodes
+    for (i, op) in shifted_ops.into_iter().enumerate() {
+        func.ops.insert(insert_idx + i, op);
+    }
+
+    // Update debug info if present
+    if let Some(ref mut debug_info) = func.debug_info {
+        // Insert placeholder debug entries for the new opcodes
+        for i in 0..count {
+            debug_info.insert(insert_idx + i, (0, 0));
+        }
+    }
+
+    count
+}
+
+/// Shift all registers in an opcode by a fixed offset
+fn shift_registers(op: Opcode, offset: u32) -> Opcode {
+    use hlbc::types::Reg;
+
+    let shift_reg = |r: Reg| -> Reg {
+        Reg(r.0.saturating_add(offset))
+    };
+
+    match op {
+        Opcode::Mov { dst, src } => Opcode::Mov {
+            dst: shift_reg(dst),
+            src: shift_reg(src),
+        },
+        Opcode::Call0 { dst, fun } => Opcode::Call0 {
+            dst: shift_reg(dst),
+            fun,
+        },
+        Opcode::Call1 { dst, fun, arg0 } => Opcode::Call1 {
+            dst: shift_reg(dst),
+            fun,
+            arg0: shift_reg(arg0),
+        },
+        Opcode::Call2 { dst, fun, arg0, arg1 } => Opcode::Call2 {
+            dst: shift_reg(dst),
+            fun,
+            arg0: shift_reg(arg0),
+            arg1: shift_reg(arg1),
+        },
+        Opcode::Call3 { dst, fun, arg0, arg1, arg2 } => Opcode::Call3 {
+            dst: shift_reg(dst),
+            fun,
+            arg0: shift_reg(arg0),
+            arg1: shift_reg(arg1),
+            arg2: shift_reg(arg2),
+        },
+        Opcode::Call4 { dst, fun, arg0, arg1, arg2, arg3 } => Opcode::Call4 {
+            dst: shift_reg(dst),
+            fun,
+            arg0: shift_reg(arg0),
+            arg1: shift_reg(arg1),
+            arg2: shift_reg(arg2),
+            arg3: shift_reg(arg3),
+        },
+        Opcode::CallN { dst, fun, args } => Opcode::CallN {
+            dst: shift_reg(dst),
+            fun,
+            args: args.into_iter().map(shift_reg).collect(),
+        },
+        Opcode::SetField { obj, field, src } => Opcode::SetField {
+            obj: shift_reg(obj),
+            field,
+            src: shift_reg(src),
+        },
+        Opcode::GetGlobal { dst, global } => Opcode::GetGlobal {
+            dst: shift_reg(dst),
+            global,
+        },
+        Opcode::SetGlobal { global, src } => Opcode::SetGlobal {
+            global,
+            src: shift_reg(src),
+        },
+        Opcode::Field { dst, obj, field } => Opcode::Field {
+            dst: shift_reg(dst),
+            obj: shift_reg(obj),
+            field,
+        },
+        Opcode::New { dst } => Opcode::New {
+            dst: shift_reg(dst),
+        },
+        Opcode::Type { dst, ty } => Opcode::Type {
+            dst: shift_reg(dst),
+            ty,
+        },
+        Opcode::Null { dst } => Opcode::Null {
+            dst: shift_reg(dst),
+        },
+        Opcode::Bool { dst, value } => Opcode::Bool {
+            dst: shift_reg(dst),
+            value,
+        },
+        Opcode::Int { dst, ptr } => Opcode::Int {
+            dst: shift_reg(dst),
+            ptr,
+        },
+        Opcode::Float { dst, ptr } => Opcode::Float {
+            dst: shift_reg(dst),
+            ptr,
+        },
+        Opcode::String { dst, ptr } => Opcode::String {
+            dst: shift_reg(dst),
+            ptr,
+        },
+        other => other, // Pass through unchanged
     }
 }

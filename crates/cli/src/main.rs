@@ -657,12 +657,43 @@ EXAMPLES
                 println!("unknown '{str}'");
             }
         }
-        Command::SearchFunction(str) => {
-            // TODO search for function
-            if let Some(f) = code.function_by_name(&str) {
-                println!("{}", f.display_header::<EnhancedFmt>(code));
-            } else {
-                println!("unknown");
+        Command::SearchFunction(pattern) => {
+            let pattern_lower = pattern.to_lowercase();
+            let mut found = false;
+
+            // Search through all functions
+            for func in &code.functions {
+                let method_name = code.get(func.name).to_string();
+                let parent_name = func.parent.and_then(|p| match &code.types[p.0] {
+                    Type::Obj(obj) | Type::Struct(obj) => Some(obj.name(code).to_string()),
+                    _ => None,
+                });
+
+                let qualified_name = match &parent_name {
+                    Some(p) => format!("{}.{}", p, method_name),
+                    None => method_name,
+                };
+
+                if qualified_name.to_lowercase().contains(&pattern_lower) {
+                    found = true;
+                    println!("{}", func.display_header::<EnhancedFmt>(code));
+                }
+            }
+
+            // Also search through natives
+            for native in &code.natives {
+                let name = native.name(code).to_string();
+                let lib = native.lib(code).to_string();
+                let qualified_name = format!("{}/{}", lib, name);
+
+                if qualified_name.to_lowercase().contains(&pattern_lower) {
+                    found = true;
+                    println!("{}", native.display::<EnhancedFmt>(code));
+                }
+            }
+
+            if !found {
+                println!("No functions matching '{}'", pattern);
             }
         }
         Command::InFile(foi) => {

@@ -66,6 +66,12 @@ pub struct SubstitutionResult {
     pub skipped_type_mismatch: Vec<(String, String)>,
     /// Type layout mismatches detected
     pub type_mismatches: Vec<TypeMismatchInfo>,
+    /// Stdlib functions that couldn't be injected due to Haxe version mismatch
+    /// (qualified_name, reason)
+    pub stdlib_mismatches: Vec<(String, String)>,
+    /// Number of initialization opcodes injected into entry point
+    /// for initializing static fields of injected types
+    pub injected_init_count: usize,
 }
 
 /// Information about a field type mismatch (same name, different type)
@@ -170,7 +176,9 @@ pub fn substitute_functions(
     }
 
     // Get the remap and collect results
-    let remap = merger.remap.clone();
+    let mut remap = merger.remap.clone();
+    // Copy missing_fields to remap for validation during opcode remapping
+    remap.missing_fields = merger.missing_fields.clone();
     let warnings = std::mem::take(&mut merger.warnings);
     let injected_functions = std::mem::take(&mut merger.injected_functions);
     let unresolvable_natives = std::mem::take(&mut merger.unresolvable_natives);
@@ -206,6 +214,10 @@ pub fn substitute_functions(
                 .collect(),
         });
     }
+
+    // Collect stdlib mismatches (fatal errors)
+    let stdlib_mismatches = std::mem::take(&mut merger.stdlib_mismatches);
+    result.stdlib_mismatches.extend(stdlib_mismatches);
 
     // Drop the merger to release the mutable borrow on target
     drop(merger);
@@ -466,8 +478,7 @@ pub fn substitute_functions_by_pattern_with_options(
         scan_and_ensure_refs(&mut merger, src_func);
     }
 
-    // Get the remap and collect results
-    let remap = merger.remap.clone();
+    // Collect results from merger
     let warnings = std::mem::take(&mut merger.warnings);
     let injected_functions = std::mem::take(&mut merger.injected_functions);
     let injected_natives = std::mem::take(&mut merger.injected_natives);
@@ -505,6 +516,26 @@ pub fn substitute_functions_by_pattern_with_options(
                 .collect(),
         });
     }
+
+    // Collect stdlib mismatches (fatal errors)
+    let stdlib_mismatches = std::mem::take(&mut merger.stdlib_mismatches);
+    result.stdlib_mismatches.extend(stdlib_mismatches);
+
+    // Extract init code BEFORE dropping merger, so it can call ensure_fun/ensure_type
+    // for any functions/types discovered in the extracted opcodes.
+    // This is critical: functions like ObjectMap.__constructor__ need to be ensured
+    // so they get properly remapped.
+    let init_code = if !merger.injected_globals.is_empty() {
+        merger.extract_init_code_for_injected_types()
+    } else {
+        None
+    };
+    let injected_globals_count = merger.injected_globals.len();
+
+    // Get the final remap (after any new functions/types were ensured during extraction)
+    let mut remap = merger.remap.clone();
+    // Copy missing_fields to remap for validation during opcode remapping
+    remap.missing_fields = merger.missing_fields.clone();
 
     // Drop the merger to release the mutable borrow on target
     drop(merger);
@@ -546,6 +577,19 @@ pub fn substitute_functions_by_pattern_with_options(
         target_func.assigns = remapped_assigns;
 
         result.replaced.push(name);
+    }
+
+    // Third pass: inject initialization code for injected types into entry point
+    // This initializes static fields of classes that were injected from source
+    if let Some(init_code) = init_code {
+        let init_count = merge::inject_init_into_entrypoint(target, init_code);
+        if init_count > 0 {
+            result.warnings.push(format!(
+                "Injected {} initialization opcode(s) into entry point for {} static type(s)",
+                init_count, injected_globals_count
+            ));
+            result.injected_init_count = init_count;
+        }
     }
 
     result

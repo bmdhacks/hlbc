@@ -256,45 +256,29 @@ fn main() -> Result<()> {
     // Report results
     println!("Substitution Results:");
     println!("  Replaced: {}", result.replaced.len());
-    if args.verbose || result.replaced.len() <= 20 {
-        for name in &result.replaced {
-            println!("    + {}", name);
-        }
-    } else {
-        for name in result.replaced.iter().take(10) {
-            println!("    + {}", name);
-        }
-        println!("    ... and {} more", result.replaced.len() - 10);
+    for name in &result.replaced {
+        println!("    + {}", name);
     }
 
     if !result.injected_functions.is_empty() {
         println!();
         println!("  Injected dependencies: {}", result.injected_functions.len());
-        if args.verbose || result.injected_functions.len() <= 10 {
-            for name in &result.injected_functions {
-                println!("    ^ {}", name);
-            }
-        } else {
-            for name in result.injected_functions.iter().take(10) {
-                println!("    ^ {}", name);
-            }
-            println!("    ... and {} more", result.injected_functions.len() - 10);
+        for name in &result.injected_functions {
+            println!("    ^ {}", name);
         }
     }
 
     if !result.injected_natives.is_empty() {
         println!();
         println!("  Injected natives: {}", result.injected_natives.len());
-        if args.verbose || result.injected_natives.len() <= 20 {
-            for name in &result.injected_natives {
-                println!("    @ {}", name);
-            }
-        } else {
-            for name in result.injected_natives.iter().take(20) {
-                println!("    @ {}", name);
-            }
-            println!("    ... and {} more", result.injected_natives.len() - 20);
+        for name in &result.injected_natives {
+            println!("    @ {}", name);
         }
+    }
+
+    if result.injected_init_count > 0 {
+        println!();
+        println!("  Entry point init: {} opcode(s) for static field initialization", result.injected_init_count);
     }
 
     if !result.not_found.is_empty() {
@@ -315,27 +299,71 @@ fn main() -> Result<()> {
     }
 
     if !result.type_mismatches.is_empty() {
-        println!();
-        println!("  Type layout mismatches: {}", result.type_mismatches.len());
-        for tm in &result.type_mismatches {
-            println!("    ~ {} (source: {} fields, target: {} fields)",
-                     tm.type_name, tm.source_fields, tm.target_fields);
-            if args.verbose && !tm.missing_fields.is_empty() {
-                println!("      missing: {}", tm.missing_fields.join(", "));
+        // Filter out virtual field mismatches that are handled by force-mapping
+        // A virtual mismatch is safe when source's fields are a subset of target's
+        let filter_safe_virtual_mismatches = |ftm: &hl_substitute::FieldTypeMismatchInfo| -> bool {
+            // Check if both are virtuals
+            let src_inner = ftm.source_type.strip_prefix("virtual(").and_then(|s| s.strip_suffix(")"));
+            let tgt_inner = ftm.target_type.strip_prefix("virtual(").and_then(|s| s.strip_suffix(")"));
+
+            if let (Some(src_fields_str), Some(tgt_fields_str)) = (src_inner, tgt_inner) {
+                // Parse field names - empty string means no fields
+                let src_fields: std::collections::HashSet<&str> = if src_fields_str.is_empty() {
+                    std::collections::HashSet::new()
+                } else {
+                    src_fields_str.split(',').collect()
+                };
+                let tgt_fields: std::collections::HashSet<&str> = if tgt_fields_str.is_empty() {
+                    std::collections::HashSet::new()
+                } else {
+                    tgt_fields_str.split(',').collect()
+                };
+
+                // Safe if source is a subset of target (force-mapping handles this)
+                if src_fields.is_subset(&tgt_fields) {
+                    return false; // Filter out - it's safe
+                }
             }
-            // Always show field type mismatches - these can cause runtime crashes
-            for ftm in &tm.field_type_mismatches {
-                println!("      ! {}: source={}, target={}",
-                         ftm.field_name, ftm.source_type, ftm.target_type);
+            true // Keep - it's a real mismatch
+        };
+
+        // Count significant mismatches (those not filtered out)
+        let significant_mismatches: Vec<_> = result.type_mismatches.iter()
+            .filter(|tm| {
+                // Keep if has field count mismatch, field order mismatch,
+                // or non-virtual field type mismatches
+                tm.source_fields != tm.target_fields
+                    || !tm.field_order_mismatches.is_empty()
+                    || tm.field_type_mismatches.iter().any(filter_safe_virtual_mismatches)
+            })
+            .collect();
+
+        if !significant_mismatches.is_empty() {
+            println!();
+            println!("  Type layout mismatches: {}", significant_mismatches.len());
+            for tm in &significant_mismatches {
+                println!("    ~ {} (source: {} fields, target: {} fields)",
+                         tm.type_name, tm.source_fields, tm.target_fields);
+                if args.verbose && !tm.missing_fields.is_empty() {
+                    println!("      missing: {}", tm.missing_fields.join(", "));
+                }
+                // Show non-virtual field type mismatches (filter out safe virtual ones)
+                for ftm in tm.field_type_mismatches.iter().filter(|f| filter_safe_virtual_mismatches(f)) {
+                    println!("      ! {}: source={}, target={}",
+                             ftm.field_name, ftm.source_type, ftm.target_type);
+                }
+                // Show field order mismatches - field indices won't match
+                for fom in &tm.field_order_mismatches {
+                    println!("      ! field {}: source={}, target={}",
+                             fom.position, fom.source_field, fom.target_field);
+                }
             }
-            // Show field order mismatches - field indices won't match
-            for fom in &tm.field_order_mismatches {
-                println!("      ! field {}: source={}, target={}",
-                         fom.position, fom.source_field, fom.target_field);
-            }
+            println!("    NOTE: Type mismatches may cause runtime errors.");
+            println!("    Use --compare-types to see details.");
+        } else if args.verbose {
+            println!();
+            println!("  Type layout mismatches: {} (all handled by force-mapping)", result.type_mismatches.len());
         }
-        println!("    NOTE: Type mismatches may cause runtime errors.");
-        println!("    Use --compare-types to see details.");
     }
 
     if !result.skipped_type_mismatch.is_empty() {
@@ -344,6 +372,21 @@ fn main() -> Result<()> {
         for (name, reason) in &result.skipped_type_mismatch {
             println!("    ~ {}: {}", name, reason);
         }
+    }
+
+    if !result.stdlib_mismatches.is_empty() {
+        println!();
+        println!("  STDLIB VERSION MISMATCH: {}", result.stdlib_mismatches.len());
+        println!("    Source was compiled with a different Haxe version than target.");
+        println!("    The following stdlib functions cannot be safely injected:");
+        println!();
+        for (name, reason) in &result.stdlib_mismatches {
+            println!("    ✗ {}", name);
+            println!("      {}", reason);
+        }
+        println!();
+        println!("    To fix: Recompile your source with the same Haxe version as the target.");
+        println!("    Dead Cells appears to use Haxe ~4.0-4.1 (has Std.is instead of Std.isOfType).");
     }
 
     if !result.errors.is_empty() {
@@ -362,8 +405,9 @@ fn main() -> Result<()> {
         }
     }
 
-    // Save if there were no errors
-    if result.errors.is_empty() && !result.replaced.is_empty() {
+    // Save if there were no errors (stdlib mismatches are fatal)
+    let has_fatal_errors = !result.errors.is_empty() || !result.stdlib_mismatches.is_empty();
+    if !has_fatal_errors && !result.replaced.is_empty() {
         let output = args.output.unwrap_or_else(|| {
             let stem = args.target.file_stem().unwrap().to_str().unwrap();
             args.target.with_file_name(format!("{}.patched.hl", stem))
@@ -384,7 +428,11 @@ fn main() -> Result<()> {
         println!("No functions were replaced - no output written");
     } else {
         println!();
-        println!("Errors occurred - no output written");
+        if !result.stdlib_mismatches.is_empty() {
+            println!("FATAL: Stdlib version mismatch prevents safe substitution - no output written");
+        } else {
+            println!("Errors occurred - no output written");
+        }
         std::process::exit(1);
     }
 
