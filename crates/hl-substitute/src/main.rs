@@ -96,6 +96,12 @@ struct Args {
     #[arg(long)]
     no_inject_natives: bool,
 
+    /// Inject new types from source when their parent class exists in target.
+    /// Enables adding new subclasses like `shader.UberSprite extends hxsl.Shader`.
+    /// This allows injecting methods for types that don't exist in target.
+    #[arg(long)]
+    inject_new_types: bool,
+
     /// Verbose output - show warnings and additional details
     #[arg(short, long)]
     verbose: bool,
@@ -249,9 +255,15 @@ fn main() -> Result<()> {
     // Perform substitution (both function and native injection enabled by default)
     let inject_deps = !args.no_inject_deps;
     let inject_natives = !args.no_inject_natives;
-    let result = substitute_functions_by_pattern_with_options(
-        &mut target, &source, &patterns, inject_deps, inject_natives
-    );
+    let result = if args.inject_new_types {
+        hl_substitute::substitute_functions_by_pattern_with_type_injection(
+            &mut target, &source, &patterns, inject_deps, inject_natives
+        )
+    } else {
+        substitute_functions_by_pattern_with_options(
+            &mut target, &source, &patterns, inject_deps, inject_natives
+        )
+    };
 
     // Report results
     println!("Substitution Results:");
@@ -273,6 +285,14 @@ fn main() -> Result<()> {
         println!("  Injected natives: {}", result.injected_natives.len());
         for name in &result.injected_natives {
             println!("    @ {}", name);
+        }
+    }
+
+    if !result.injected_types.is_empty() {
+        println!();
+        println!("  Injected types: {}", result.injected_types.len());
+        for name in &result.injected_types {
+            println!("    # {}", name);
         }
     }
 

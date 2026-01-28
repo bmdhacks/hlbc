@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use hlbc::opcodes::Opcode;
 use hlbc::types::{
-    ConstantDef, Function, ObjField, RefBytes, RefFloat, RefFun, RefGlobal, RefInt, RefString,
-    RefType, Type,
+    ConstantDef, Function, ObjField, ObjProto, RefBytes, RefField, RefFloat, RefFun, RefGlobal,
+    RefInt, RefString, RefType, Type,
 };
 use hlbc::{Bytecode, Resolve};
 
@@ -164,6 +164,16 @@ pub struct FieldOrderMismatch {
     pub target_field: String,      // "fieldName:Type"
 }
 
+/// Method signature mismatch: same name as parent method, different signature
+/// This causes vtable dispatch to fail silently - the child method won't be called.
+#[derive(Debug, Clone)]
+pub struct MethodSignatureMismatch {
+    pub method_name: String,
+    pub parent_class: String,
+    pub source_signature: String,
+    pub target_signature: String,
+}
+
 /// Information about type layout mismatches between source and target
 #[derive(Debug, Clone)]
 pub struct TypeMismatch {
@@ -174,6 +184,7 @@ pub struct TypeMismatch {
     pub extra_in_target: Vec<String>,              // fields in target but not source (less common)
     pub field_type_mismatches: Vec<FieldTypeMismatch>, // same name, different type
     pub field_order_mismatches: Vec<FieldOrderMismatch>, // different field at same position
+    pub method_signature_mismatches: Vec<MethodSignatureMismatch>, // override signature mismatch
 }
 
 /// Merges pools from source bytecode into target bytecode, building an IndexRemap
@@ -204,6 +215,17 @@ pub struct PoolMerger<'a> {
     /// (not matched to existing). Maps source_global_idx -> target_global_idx.
     /// These are the globals that need initialization code injection.
     pub injected_globals: HashMap<usize, usize>,
+    /// Whether to inject new types when their parent exists in target.
+    /// This enables adding new subclasses like `shader.UberSprite extends hxsl.Shader`.
+    pub inject_new_types: bool,
+    /// Types that were fully injected - maps src_type_idx -> target_type_idx
+    pub injected_types: HashMap<usize, usize>,
+    /// Pending protos to add after functions are injected.
+    /// Maps target_type_idx -> Vec<(proto_name, src_findex, pindex)>
+    pub pending_protos: HashMap<usize, Vec<(String, RefFun, i32)>>,
+    /// Pending bindings (field -> function mappings like __constructor__)
+    /// Maps target_type_idx -> Vec<(field_idx, src_findex)>
+    pub pending_bindings: HashMap<usize, Vec<(usize, RefFun)>>,
 }
 
 impl<'a> PoolMerger<'a> {
@@ -222,6 +244,10 @@ impl<'a> PoolMerger<'a> {
             missing_fields: HashMap::new(),
             stdlib_mismatches: Vec::new(),
             injected_globals: HashMap::new(),
+            inject_new_types: false,
+            injected_types: HashMap::new(),
+            pending_protos: HashMap::new(),
+            pending_bindings: HashMap::new(),
         }
     }
 
@@ -241,6 +267,34 @@ impl<'a> PoolMerger<'a> {
             missing_fields: HashMap::new(),
             stdlib_mismatches: Vec::new(),
             injected_globals: HashMap::new(),
+            inject_new_types: false,
+            injected_types: HashMap::new(),
+            pending_protos: HashMap::new(),
+            pending_bindings: HashMap::new(),
+        }
+    }
+
+    /// Create a merger with type injection enabled.
+    /// This enables adding new subclasses like `shader.UberSprite extends hxsl.Shader`.
+    pub fn with_type_injection(target: &'a mut Bytecode, source: &'a Bytecode, inject_deps: bool) -> Self {
+        Self {
+            target,
+            source,
+            remap: IndexRemap::new(),
+            warnings: Vec::new(),
+            inject_missing_functions: inject_deps,
+            inject_missing_natives: true, // Type injection requires native injection
+            injected_functions: Vec::new(),
+            injected_natives: Vec::new(),
+            unresolvable_natives: Vec::new(),
+            type_mismatches: HashMap::new(),
+            missing_fields: HashMap::new(),
+            stdlib_mismatches: Vec::new(),
+            injected_globals: HashMap::new(),
+            inject_new_types: true,
+            injected_types: HashMap::new(),
+            pending_protos: HashMap::new(),
+            pending_bindings: HashMap::new(),
         }
     }
 
@@ -1897,6 +1951,9 @@ impl<'a> PoolMerger<'a> {
 
         // Build the field index remap for fields that exist in both
         self.build_field_remap(src_type, target_type);
+
+        // Validate method override signatures
+        self.validate_method_overrides(src_type, target_type);
     }
 
     /// Detect fields that exist in source but not in target, and field type mismatches
@@ -2024,6 +2081,7 @@ impl<'a> PoolMerger<'a> {
                     extra_in_target,
                     field_type_mismatches: field_type_mismatches.clone(),
                     field_order_mismatches: field_order_mismatches.clone(),
+                    method_signature_mismatches: Vec::new(), // Filled in by validate_method_overrides
                 },
             );
 
@@ -2053,6 +2111,100 @@ impl<'a> PoolMerger<'a> {
                     field_order_mismatches.len()
                 ));
             }
+        }
+    }
+
+    /// Check for methods that appear to override parent methods but have incompatible signatures.
+    /// This causes vtable dispatch to fail silently - the child method won't be called.
+    fn validate_method_overrides(&mut self, src_type: RefType, target_type: RefType) {
+        let src_obj = match self.source.get(src_type) {
+            Type::Obj(obj) | Type::Struct(obj) => obj,
+            _ => return,
+        };
+        let target_obj = match self.target.get(target_type) {
+            Type::Obj(obj) | Type::Struct(obj) => obj,
+            _ => return,
+        };
+
+        let type_name = self.source.get(src_obj.name).to_string();
+        let mut method_mismatches = Vec::new();
+
+        // For each method (proto) in source type
+        for src_proto in &src_obj.protos {
+            let method_name = self.source.get(src_proto.name).to_string();
+
+            // Walk parent chain in target to find same-named method
+            let mut parent_ref = target_obj.super_;
+            while let Some(parent_type) = parent_ref {
+                if let Some(parent_obj) = self.target.get(parent_type).get_type_obj() {
+                    // Search parent's protos
+                    for parent_proto in &parent_obj.protos {
+                        let parent_method_name = self.target.get(parent_proto.name).to_string();
+                        if parent_method_name == method_name {
+                            // Found same-named method - compare signatures
+                            let src_sig = self.get_function_signature_str(self.source, src_proto.findex);
+                            let target_sig = self.get_function_signature_str(self.target, parent_proto.findex);
+
+                            if src_sig != target_sig {
+                                let parent_name = self.target.get(parent_obj.name).to_string();
+                                method_mismatches.push(MethodSignatureMismatch {
+                                    method_name: method_name.clone(),
+                                    parent_class: parent_name,
+                                    source_signature: src_sig,
+                                    target_signature: target_sig,
+                                });
+                            }
+                            // Found the override target, stop searching parents for this method
+                            break;
+                        }
+                    }
+                    parent_ref = parent_obj.super_;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Record mismatches if any
+        if !method_mismatches.is_empty() {
+            for mismatch in &method_mismatches {
+                self.warnings.push(format!(
+                    "Method '{}' in '{}' has signature '{}' but parent '{}' has '{}' - \
+                     override may not work correctly",
+                    mismatch.method_name, type_name, mismatch.source_signature,
+                    mismatch.parent_class, mismatch.target_signature
+                ));
+            }
+
+            // Add to type_mismatches if entry exists, or create new entry
+            if let Some(mismatch) = self.type_mismatches.get_mut(&src_type.0) {
+                mismatch.method_signature_mismatches = method_mismatches;
+            } else {
+                // Create a minimal TypeMismatch entry for method-only mismatches
+                let target_field_count = target_obj.fields.len();
+                let source_field_count = src_obj.fields.len();
+                self.type_mismatches.insert(
+                    src_type.0,
+                    TypeMismatch {
+                        type_name,
+                        target_field_count,
+                        source_field_count,
+                        missing_in_target: Vec::new(),
+                        extra_in_target: Vec::new(),
+                        field_type_mismatches: Vec::new(),
+                        field_order_mismatches: Vec::new(),
+                        method_signature_mismatches: method_mismatches,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Get a human-readable signature string for a function
+    fn get_function_signature_str(&self, code: &Bytecode, findex: RefFun) -> String {
+        match code.get(findex) {
+            hlbc::types::FunPtr::Fun(f) => format_type(code, f.t),
+            hlbc::types::FunPtr::Native(n) => format_type(code, n.t),
         }
     }
 
@@ -2159,6 +2311,27 @@ impl<'a> PoolMerger<'a> {
             RefGlobal(0)
         };
 
+        // Record protos for deferred processing when type injection is enabled.
+        // The function indices can't be remapped yet because the methods may not
+        // have been injected. We'll populate protos in finalize_injected_types().
+        if self.inject_new_types && !src_obj.protos.is_empty() {
+            let pending: Vec<(String, RefFun, i32)> = src_obj.protos
+                .iter()
+                .map(|p| (self.source.get(p.name).to_string(), p.findex, p.pindex))
+                .collect();
+            self.pending_protos.insert(new_type_idx, pending);
+            self.injected_types.insert(src_ref.0, new_type_idx);
+        }
+
+        // Similarly record bindings for deferred processing
+        if self.inject_new_types && !src_obj.bindings.is_empty() {
+            let pending: Vec<(usize, RefFun)> = src_obj.bindings
+                .iter()
+                .map(|(f, fun)| (f.0, *fun))
+                .collect();
+            self.pending_bindings.insert(new_type_idx, pending);
+        }
+
         // Create the actual type
         let new_type = if is_struct {
             Type::Struct(hlbc::types::TypeObj {
@@ -2166,8 +2339,8 @@ impl<'a> PoolMerger<'a> {
                 super_: super_ref,
                 global: new_global,
                 own_fields: own_fields.clone(),
-                protos: Vec::new(),        // No protos for created types
-                bindings: HashMap::new(),  // No bindings for created types
+                protos: Vec::new(),        // Populated later by finalize_injected_types()
+                bindings: HashMap::new(),  // Populated later by finalize_injected_types()
                 fields: flattened_fields.into(),
             })
         } else {
@@ -2176,8 +2349,8 @@ impl<'a> PoolMerger<'a> {
                 super_: super_ref,
                 global: new_global,
                 own_fields: own_fields.clone(),
-                protos: Vec::new(),        // No protos for created types
-                bindings: HashMap::new(),  // No bindings for created types
+                protos: Vec::new(),        // Populated later by finalize_injected_types()
+                bindings: HashMap::new(),  // Populated later by finalize_injected_types()
                 fields: flattened_fields.into(),
             })
         };
@@ -2186,6 +2359,74 @@ impl<'a> PoolMerger<'a> {
         self.target.types[new_type_idx] = new_type;
 
         RefType(new_type_idx)
+    }
+
+    /// Finalize injected types by populating protos with remapped function indices.
+    /// Must be called AFTER all functions are injected.
+    pub fn finalize_injected_types(&mut self) {
+
+        // Process pending protos
+        for (target_type_idx, pending) in std::mem::take(&mut self.pending_protos) {
+            let mut protos = Vec::new();
+
+            for (name, src_findex, pindex) in pending {
+                let target_findex = match self.remap.funs.get(&src_findex.0) {
+                    Some(&idx) => RefFun(idx),
+                    None => {
+                        self.warnings.push(format!(
+                            "Method '{}' not injected (src findex {}), skipping proto",
+                            name, src_findex.0
+                        ));
+                        continue;
+                    }
+                };
+
+                let name_ref = RefString(self.ensure_string_value(&name));
+                protos.push(ObjProto {
+                    name: name_ref,
+                    findex: target_findex,
+                    pindex,  // PRESERVED - critical for virtual method overrides
+                });
+            }
+
+            // Update the type with its protos
+            if let Type::Obj(obj) | Type::Struct(obj) = &mut self.target.types[target_type_idx] {
+                obj.protos = protos;
+            }
+        }
+
+        // Process pending bindings
+        for (target_type_idx, pending) in std::mem::take(&mut self.pending_bindings) {
+            let mut bindings = HashMap::new();
+            for (field_idx, src_findex) in pending {
+                if let Some(&target_idx) = self.remap.funs.get(&src_findex.0) {
+                    bindings.insert(RefField(field_idx), RefFun(target_idx));
+                } else {
+                    self.warnings.push(format!(
+                        "Binding function (src findex {}) not injected, skipping",
+                        src_findex.0
+                    ));
+                }
+            }
+            if let Type::Obj(obj) | Type::Struct(obj) = &mut self.target.types[target_type_idx] {
+                obj.bindings = bindings;
+            }
+        }
+    }
+
+    /// Get a list of injected type names for reporting
+    pub fn get_injected_type_names(&self) -> Vec<String> {
+        self.injected_types
+            .keys()
+            .filter_map(|&src_idx| {
+                match self.source.get(RefType(src_idx)) {
+                    Type::Obj(obj) | Type::Struct(obj) => {
+                        Some(self.source.get(obj.name).to_string())
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
     }
 
     /// Extend enum construct params when source has more params than target
