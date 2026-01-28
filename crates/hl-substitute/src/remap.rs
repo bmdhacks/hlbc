@@ -26,6 +26,8 @@ pub struct IndexRemap {
     /// Fields in source types that don't exist in target: type_idx -> set of field indices
     /// Used for validation during opcode remapping
     pub missing_fields: HashMap<usize, HashSet<usize>>,
+    /// Debug file index remapping: source_debug_file_idx -> target_debug_file_idx
+    pub debug_files: HashMap<usize, usize>,
 }
 
 impl IndexRemap {
@@ -67,6 +69,19 @@ impl IndexRemap {
 
     pub fn remap_enum_construct(&self, src: RefEnumConstruct) -> RefEnumConstruct {
         RefEnumConstruct(*self.enum_constructs.get(&src.0).unwrap_or(&src.0))
+    }
+
+    /// Remap a debug file index from source to target
+    pub fn remap_debug_file(&self, src_file_idx: usize) -> usize {
+        *self.debug_files.get(&src_file_idx).unwrap_or(&src_file_idx)
+    }
+
+    /// Remap debug info for a function (file_idx, line_num) pairs
+    pub fn remap_debug_info(&self, debug_info: &[(usize, usize)]) -> Vec<(usize, usize)> {
+        debug_info
+            .iter()
+            .map(|(file_idx, line_num)| (self.remap_debug_file(*file_idx), *line_num))
+            .collect()
     }
 
     /// Remap a field index based on the source type

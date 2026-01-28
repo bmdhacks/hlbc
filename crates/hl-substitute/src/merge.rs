@@ -366,6 +366,57 @@ impl<'a> PoolMerger<'a> {
         RefString(target_idx)
     }
 
+    /// Ensure a debug file exists in target, return the remapped file index.
+    /// Adds ".substituted" suffix to distinguish injected code from original.
+    pub fn ensure_debug_file(&mut self, src_file_idx: usize) -> usize {
+        if let Some(&target_idx) = self.remap.debug_files.get(&src_file_idx) {
+            return target_idx;
+        }
+
+        let Some(src_debug_files) = &self.source.debug_files else {
+            // Source has no debug files, return 0 as fallback
+            return 0;
+        };
+
+        let Some(src_file) = src_debug_files.get(src_file_idx) else {
+            // Invalid source index, return 0 as fallback
+            return 0;
+        };
+
+        // Create the substituted filename: "Foo.hx" -> "Foo.hx.substituted"
+        let substituted_name: hlbc::Str = format!("{}.substituted", src_file).into();
+
+        // Ensure target has debug_files vec
+        let debug_files = self.target.debug_files.get_or_insert_with(Vec::new);
+
+        // Check if this substituted filename already exists
+        if let Some(target_idx) = debug_files.iter().position(|s| s == &substituted_name) {
+            self.remap.debug_files.insert(src_file_idx, target_idx);
+            return target_idx;
+        }
+
+        // Add new debug file
+        let target_idx = debug_files.len();
+        debug_files.push(substituted_name);
+        self.remap.debug_files.insert(src_file_idx, target_idx);
+        target_idx
+    }
+
+    /// Ensure all debug files referenced in a function's debug info exist in target,
+    /// and return the remapped debug info.
+    pub fn remap_function_debug_info(
+        &mut self,
+        debug_info: &[(usize, usize)],
+    ) -> Vec<(usize, usize)> {
+        debug_info
+            .iter()
+            .map(|(file_idx, line_num)| {
+                let target_file_idx = self.ensure_debug_file(*file_idx);
+                (target_file_idx, *line_num)
+            })
+            .collect()
+    }
+
     /// Ensure bytes exist in target, return the remapped RefBytes
     pub fn ensure_bytes(&mut self, src_ref: RefBytes) -> RefBytes {
         if let Some(&target_idx) = self.remap.bytes.get(&src_ref.0) {
@@ -1412,6 +1463,7 @@ impl<'a> PoolMerger<'a> {
         let src_regs: Vec<RefType> = src_func.regs.clone();
         let src_ops: Vec<Opcode> = src_func.ops.clone();
         let src_assigns = src_func.assigns.clone();
+        let src_debug_info = src_func.debug_info.clone();
         let src_name_ref = src_func.name;
         let src_parent = src_func.parent;
 
@@ -1449,7 +1501,9 @@ impl<'a> PoolMerger<'a> {
             .iter()
             .map(|op| self.remap.remap_opcode_with_regs(op, &src_regs))
             .collect();
-        let nops = new_ops.len();
+
+        // 8. Remap debug info: preserve source file/line with ".substituted" suffix
+        let new_debug_info = src_debug_info.map(|di| self.remap_function_debug_info(&di));
 
         // Create the new function
         let new_func = Function {
@@ -1457,10 +1511,7 @@ impl<'a> PoolMerger<'a> {
             findex: new_findex,
             regs: new_regs,
             ops: new_ops,
-            // Create dummy debug_info - source file indices aren't valid in target
-            // Each opcode needs an entry (file_idx, line_num), use (0, 0) as placeholder
-            // TODO: remap debug file indices properly
-            debug_info: Some(vec![(0, 0); nops]),
+            debug_info: new_debug_info,
             assigns: new_assigns,
             name: new_name,
             parent: new_parent,

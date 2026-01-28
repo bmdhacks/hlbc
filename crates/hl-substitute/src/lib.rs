@@ -274,10 +274,11 @@ pub fn substitute_functions(
         // Keep original findex, name, parent - just replace the body
         target_func.t = remap.remap_type(src_func.t);
         target_func.regs = remapped_regs;
-        // Create dummy debug_info - source file indices aren't valid in target
-        // Each opcode needs an entry (file_idx, line_num), use (0, 0) as placeholder
-        // TODO: remap debug file indices properly
-        target_func.debug_info = Some(vec![(0, 0); remapped_ops.len()]);
+        // Remap debug info: preserve source file/line with ".substituted" suffix on filename
+        target_func.debug_info = src_func
+            .debug_info
+            .as_ref()
+            .map(|di| remap.remap_debug_info(di));
         target_func.ops = remapped_ops;
         target_func.assigns = remapped_assigns;
 
@@ -306,6 +307,13 @@ fn scan_and_ensure_refs(merger: &mut PoolMerger, func: &Function) {
     if let Some(assigns) = &func.assigns {
         for (s, _) in assigns {
             merger.ensure_string(*s);
+        }
+    }
+
+    // Ensure debug file references exist (for preserving source file info)
+    if let Some(debug_info) = &func.debug_info {
+        for (file_idx, _line) in debug_info {
+            merger.ensure_debug_file(*file_idx);
         }
     }
 }
@@ -602,9 +610,11 @@ pub fn substitute_functions_by_pattern_with_options(
         // Keep original findex, name, parent - just replace the body
         target_func.t = remap.remap_type(src_func.t);
         target_func.regs = remapped_regs;
-        // Create dummy debug_info - source file indices aren't valid in target
-        // Each opcode needs an entry (file_idx, line_num), use (0, 0) as placeholder
-        target_func.debug_info = Some(vec![(0, 0); remapped_ops.len()]);
+        // Remap debug info: preserve source file/line with ".substituted" suffix on filename
+        target_func.debug_info = src_func
+            .debug_info
+            .as_ref()
+            .map(|di| remap.remap_debug_info(di));
         target_func.ops = remapped_ops;
         target_func.assigns = remapped_assigns;
 
@@ -841,7 +851,11 @@ pub fn substitute_functions_by_pattern_with_type_injection(
         // Keep original findex, name, parent - just replace the body
         target_func.t = remap.remap_type(src_func.t);
         target_func.regs = remapped_regs;
-        target_func.debug_info = Some(vec![(0, 0); remapped_ops.len()]);
+        // Remap debug info: preserve source file/line with ".substituted" suffix on filename
+        target_func.debug_info = src_func
+            .debug_info
+            .as_ref()
+            .map(|di| remap.remap_debug_info(di));
         target_func.ops = remapped_ops;
         target_func.assigns = remapped_assigns;
 
