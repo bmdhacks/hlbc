@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use hlbc::opcodes::Opcode;
 use hlbc::types::{
-    RefBytes, RefEnumConstruct, RefField, RefFloat, RefFun, RefGlobal, RefInt, RefString, RefType,
+    Reg, RefBytes, RefEnumConstruct, RefField, RefFloat, RefFun, RefGlobal, RefInt, RefString,
+    RefType,
 };
 
 /// Mapping from source bytecode indexes to target bytecode indexes
@@ -28,6 +29,9 @@ pub struct IndexRemap {
     pub missing_fields: HashMap<usize, HashSet<usize>>,
     /// Debug file index remapping: source_debug_file_idx -> target_debug_file_idx
     pub debug_files: HashMap<usize, usize>,
+    /// Target findex -> pindex for virtual methods (pindex >= 0)
+    /// Used to convert Call[1-N] to CallMethod when the target has vtable overrides
+    pub virtual_funs: HashMap<usize, usize>,
 }
 
 impl IndexRemap {
@@ -150,35 +154,59 @@ impl IndexRemap {
                 dst,
                 fun: self.remap_fun(fun),
             },
-            Opcode::Call1 { dst, fun, arg0 } => Opcode::Call1 {
-                dst,
-                fun: self.remap_fun(fun),
-                arg0,
-            },
+            // Call1-CallN: convert to CallMethod for virtual dispatch, UNLESS
+            // arg0 is reg 0 (this) — that indicates a super.method() call where
+            // the compiler intentionally bypassed virtual dispatch.
+            Opcode::Call1 { dst, fun, arg0 } => {
+                let remapped = self.remap_fun(fun);
+                if arg0 != Reg(0) {
+                    if let Some(&pindex) = self.virtual_funs.get(&remapped.0) {
+                        return Opcode::CallMethod {
+                            dst,
+                            field: RefField(pindex),
+                            args: vec![arg0],
+                        };
+                    }
+                }
+                Opcode::Call1 { dst, fun: remapped, arg0 }
+            }
             Opcode::Call2 {
                 dst,
                 fun,
                 arg0,
                 arg1,
-            } => Opcode::Call2 {
-                dst,
-                fun: self.remap_fun(fun),
-                arg0,
-                arg1,
-            },
+            } => {
+                let remapped = self.remap_fun(fun);
+                if arg0 != Reg(0) {
+                    if let Some(&pindex) = self.virtual_funs.get(&remapped.0) {
+                        return Opcode::CallMethod {
+                            dst,
+                            field: RefField(pindex),
+                            args: vec![arg0, arg1],
+                        };
+                    }
+                }
+                Opcode::Call2 { dst, fun: remapped, arg0, arg1 }
+            }
             Opcode::Call3 {
                 dst,
                 fun,
                 arg0,
                 arg1,
                 arg2,
-            } => Opcode::Call3 {
-                dst,
-                fun: self.remap_fun(fun),
-                arg0,
-                arg1,
-                arg2,
-            },
+            } => {
+                let remapped = self.remap_fun(fun);
+                if arg0 != Reg(0) {
+                    if let Some(&pindex) = self.virtual_funs.get(&remapped.0) {
+                        return Opcode::CallMethod {
+                            dst,
+                            field: RefField(pindex),
+                            args: vec![arg0, arg1, arg2],
+                        };
+                    }
+                }
+                Opcode::Call3 { dst, fun: remapped, arg0, arg1, arg2 }
+            }
             Opcode::Call4 {
                 dst,
                 fun,
@@ -186,19 +214,32 @@ impl IndexRemap {
                 arg1,
                 arg2,
                 arg3,
-            } => Opcode::Call4 {
-                dst,
-                fun: self.remap_fun(fun),
-                arg0,
-                arg1,
-                arg2,
-                arg3,
-            },
-            Opcode::CallN { dst, fun, args } => Opcode::CallN {
-                dst,
-                fun: self.remap_fun(fun),
-                args,
-            },
+            } => {
+                let remapped = self.remap_fun(fun);
+                if arg0 != Reg(0) {
+                    if let Some(&pindex) = self.virtual_funs.get(&remapped.0) {
+                        return Opcode::CallMethod {
+                            dst,
+                            field: RefField(pindex),
+                            args: vec![arg0, arg1, arg2, arg3],
+                        };
+                    }
+                }
+                Opcode::Call4 { dst, fun: remapped, arg0, arg1, arg2, arg3 }
+            }
+            Opcode::CallN { dst, fun, args } => {
+                let remapped = self.remap_fun(fun);
+                if args.first() != Some(&Reg(0)) {
+                    if let Some(&pindex) = self.virtual_funs.get(&remapped.0) {
+                        return Opcode::CallMethod {
+                            dst,
+                            field: RefField(pindex),
+                            args,
+                        };
+                    }
+                }
+                Opcode::CallN { dst, fun: remapped, args }
+            }
             Opcode::StaticClosure { dst, fun } => Opcode::StaticClosure {
                 dst,
                 fun: self.remap_fun(fun),

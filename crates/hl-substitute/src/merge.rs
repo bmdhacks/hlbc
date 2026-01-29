@@ -221,8 +221,8 @@ pub struct PoolMerger<'a> {
     /// Types that were fully injected - maps src_type_idx -> target_type_idx
     pub injected_types: HashMap<usize, usize>,
     /// Pending protos to add after functions are injected.
-    /// Maps target_type_idx -> Vec<(proto_name, src_findex, pindex)>
-    pub pending_protos: HashMap<usize, Vec<(String, RefFun, i32)>>,
+    /// Maps target_type_idx -> (parent_ref, Vec<(proto_name, src_findex, pindex)>)
+    pub pending_protos: HashMap<usize, (Option<RefType>, Vec<(String, RefFun, i32)>)>,
     /// Pending bindings (field -> function mappings like __constructor__)
     /// Maps target_type_idx -> Vec<(field_idx, src_findex)>
     pub pending_bindings: HashMap<usize, Vec<(usize, RefFun)>>,
@@ -230,7 +230,7 @@ pub struct PoolMerger<'a> {
 
 impl<'a> PoolMerger<'a> {
     pub fn new(target: &'a mut Bytecode, source: &'a Bytecode, inject_deps: bool) -> Self {
-        Self {
+        let mut merger = Self {
             target,
             source,
             remap: IndexRemap::new(),
@@ -248,12 +248,14 @@ impl<'a> PoolMerger<'a> {
             injected_types: HashMap::new(),
             pending_protos: HashMap::new(),
             pending_bindings: HashMap::new(),
-        }
+        };
+        merger.build_virtual_method_map();
+        merger
     }
 
     /// Create a merger with native injection enabled
     pub fn with_native_injection(target: &'a mut Bytecode, source: &'a Bytecode, inject_deps: bool) -> Self {
-        Self {
+        let mut merger = Self {
             target,
             source,
             remap: IndexRemap::new(),
@@ -271,13 +273,15 @@ impl<'a> PoolMerger<'a> {
             injected_types: HashMap::new(),
             pending_protos: HashMap::new(),
             pending_bindings: HashMap::new(),
-        }
+        };
+        merger.build_virtual_method_map();
+        merger
     }
 
     /// Create a merger with type injection enabled.
     /// This enables adding new subclasses like `shader.UberSprite extends hxsl.Shader`.
     pub fn with_type_injection(target: &'a mut Bytecode, source: &'a Bytecode, inject_deps: bool) -> Self {
-        Self {
+        let mut merger = Self {
             target,
             source,
             remap: IndexRemap::new(),
@@ -295,7 +299,9 @@ impl<'a> PoolMerger<'a> {
             injected_types: HashMap::new(),
             pending_protos: HashMap::new(),
             pending_bindings: HashMap::new(),
-        }
+        };
+        merger.build_virtual_method_map();
+        merger
     }
 
     /// Ensure an int constant exists in target, return the remapped RefInt
@@ -1208,6 +1214,7 @@ impl<'a> PoolMerger<'a> {
 
                 if !is_anonymous_closure {
                     // Search target functions for a match
+                    let mut name_parent_match: Option<RefFun> = None;
                     for target_func in &self.target.functions {
                         let target_name = self.target.get(target_func.name).to_string();
                         let target_parent_name = target_func.parent.map(|p| {
@@ -1222,7 +1229,26 @@ impl<'a> PoolMerger<'a> {
                                 self.remap.funs.insert(src_ref.0, target_func.findex.0);
                                 return target_func.findex;
                             }
+                            // For class methods (both have parents), record as fallback.
+                            // Parentless functions (e.g., "String" wrappers) can collide
+                            // by name alone, so we only relax matching for class methods.
+                            if src_parent_name.is_some() && target_parent_name.is_some() {
+                                name_parent_match = Some(target_func.findex);
+                            }
                         }
+                    }
+
+                    // If no exact match found but name+parent matched, prefer the
+                    // target's existing function. Source stubs often have simplified
+                    // signatures that don't match the real target implementation.
+                    if let Some(target_findex) = name_parent_match {
+                        self.warnings.push(format!(
+                            "Function '{}.{}': matched by name+parent but signatures differ. \
+                             Using target's version (source has simplified stubs).",
+                            src_parent_name.as_deref().unwrap_or("?"), src_name
+                        ));
+                        self.remap.funs.insert(src_ref.0, target_findex.0);
+                        return target_findex;
                     }
 
                     // Check stdlib remaps - function might have been renamed between Haxe versions
@@ -1827,6 +1853,26 @@ impl<'a> PoolMerger<'a> {
         true
     }
 
+    /// Build a map of target findex -> pindex for virtual methods.
+    /// This allows Call[1-N] opcodes to be converted to CallMethod when the
+    /// target function is a virtual method (has a proto entry with pindex >= 0).
+    fn build_virtual_method_map(&mut self) {
+        for ty in &self.target.types {
+            let protos = match ty {
+                Type::Obj(obj) => &obj.protos,
+                Type::Struct(obj) => &obj.protos,
+                _ => continue,
+            };
+            for proto in protos {
+                if proto.pindex >= 0 {
+                    self.remap
+                        .virtual_funs
+                        .insert(proto.findex.0, proto.pindex as usize);
+                }
+            }
+        }
+    }
+
     /// Build a field index remap for a type
     /// Maps source field indices to target field indices by matching field names
     fn build_field_remap(&mut self, src_type: RefType, target_type: RefType) {
@@ -2385,7 +2431,7 @@ impl<'a> PoolMerger<'a> {
                 .iter()
                 .map(|p| (self.source.get(p.name).to_string(), p.findex, p.pindex))
                 .collect();
-            self.pending_protos.insert(new_type_idx, pending);
+            self.pending_protos.insert(new_type_idx, (super_ref, pending));
             self.injected_types.insert(src_ref.0, new_type_idx);
         }
 
@@ -2427,15 +2473,60 @@ impl<'a> PoolMerger<'a> {
         RefType(new_type_idx)
     }
 
+    /// Walk a target type's inheritance chain and return the highest pindex used.
+    /// Returns -1 if no protos exist in the chain.
+    fn get_max_pindex_for_type(&self, type_ref: RefType) -> i32 {
+        let mut max_pindex: i32 = -1;
+        let mut current = Some(type_ref);
+        while let Some(t) = current {
+            if let Some(obj) = self.target.get(t).get_type_obj() {
+                for proto in &obj.protos {
+                    if proto.pindex > max_pindex {
+                        max_pindex = proto.pindex;
+                    }
+                }
+                current = obj.super_;
+            } else {
+                break;
+            }
+        }
+        max_pindex
+    }
+
+    /// Search a target parent's inheritance chain for a method by name.
+    /// Returns its pindex if found (for override alignment).
+    fn find_parent_proto_pindex(&self, parent_ref: RefType, method_name: &str) -> Option<i32> {
+        let mut current = Some(parent_ref);
+        while let Some(t) = current {
+            if let Some(obj) = self.target.get(t).get_type_obj() {
+                for proto in &obj.protos {
+                    if self.target.get(proto.name) == method_name {
+                        return Some(proto.pindex);
+                    }
+                }
+                current = obj.super_;
+            } else {
+                break;
+            }
+        }
+        None
+    }
+
     /// Finalize injected types by populating protos with remapped function indices.
     /// Must be called AFTER all functions are injected.
     pub fn finalize_injected_types(&mut self) {
 
         // Process pending protos
-        for (target_type_idx, pending) in std::mem::take(&mut self.pending_protos) {
+        for (target_type_idx, (parent_ref, pending)) in std::mem::take(&mut self.pending_protos) {
             let mut protos = Vec::new();
 
-            for (name, src_findex, pindex) in pending {
+            // Determine the base pindex from the target parent's inheritance chain
+            let parent_max_pindex = parent_ref
+                .map(|pr| self.get_max_pindex_for_type(pr))
+                .unwrap_or(-1);
+            let mut next_new_pindex = parent_max_pindex + 1;
+
+            for (name, src_findex, src_pindex) in &pending {
                 let target_findex = match self.remap.funs.get(&src_findex.0) {
                     Some(&idx) => RefFun(idx),
                     None => {
@@ -2447,11 +2538,43 @@ impl<'a> PoolMerger<'a> {
                     }
                 };
 
-                let name_ref = RefString(self.ensure_string_value(&name));
+                let name_ref = RefString(self.ensure_string_value(name));
+
+                // Determine correct pindex for this method
+                let final_pindex = if *src_pindex < 0 {
+                    // Negative pindex means private/static - keep as-is
+                    *src_pindex
+                } else if let Some(parent) = parent_ref {
+                    // Check if this method overrides one in the parent chain
+                    if let Some(parent_pindex) = self.find_parent_proto_pindex(parent, name) {
+                        if parent_pindex != *src_pindex {
+                            self.warnings.push(format!(
+                                "Proto '{}': rebased pindex {} -> {} (override alignment with target parent)",
+                                name, src_pindex, parent_pindex
+                            ));
+                        }
+                        parent_pindex
+                    } else {
+                        // New method not in parent chain - assign next available slot
+                        let pindex = next_new_pindex;
+                        if pindex != *src_pindex {
+                            self.warnings.push(format!(
+                                "Proto '{}': rebased pindex {} -> {} (new vtable slot after target parent)",
+                                name, src_pindex, pindex
+                            ));
+                        }
+                        next_new_pindex += 1;
+                        pindex
+                    }
+                } else {
+                    // No parent - keep source pindex
+                    *src_pindex
+                };
+
                 protos.push(ObjProto {
                     name: name_ref,
                     findex: target_findex,
-                    pindex,  // PRESERVED - critical for virtual method overrides
+                    pindex: final_pindex,
                 });
             }
 
