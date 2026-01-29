@@ -7,7 +7,7 @@ use clap::Parser;
 use hlbc::{Bytecode, Resolve};
 
 use hl_substitute::merge::format_type;
-use hl_substitute::{list_matching_functions, substitute_functions_by_pattern_with_options};
+use hl_substitute::{list_matching_functions, substitute_by_pattern};
 
 #[derive(Parser, Debug)]
 #[command(name = "hl-substitute")]
@@ -17,6 +17,10 @@ use hl_substitute::{list_matching_functions, substitute_functions_by_pattern_wit
 
     *     matches any single segment
     **    matches zero or more segments
+
+    Prefix a pattern with '@' to enable TYPE INJECTION for that pattern.
+    This allows injecting new types (classes) that don't exist in target,
+    as long as their parent class exists.
 
 EXAMPLES:
     # Replace a specific function
@@ -28,8 +32,11 @@ EXAMPLES:
     # Replace all functions in a package (recursive)
     hl-substitute target.hl source.hl "hxsl.**"
 
-    # Replace multiple patterns
-    hl-substitute target.hl source.hl "h3d.impl.GlDriver.*" "hxsl.Linker.*"
+    # Inject a new type with all its methods (@ prefix)
+    hl-substitute target.hl source.hl "@shader.UberSprite.**"
+
+    # Mix regular replacement with type injection
+    hl-substitute target.hl source.hl "h3d.impl.GlDriver.resetStream" "@shader.UberSprite.**"
 
     # Dump types from target (for analysis/hxml generation)
     hl-substitute target.hl --dump-types h3d
@@ -95,12 +102,6 @@ struct Args {
     /// By default, SDL/GL natives from source that don't exist in target are injected.
     #[arg(long)]
     no_inject_natives: bool,
-
-    /// Inject new types from source when their parent class exists in target.
-    /// Enables adding new subclasses like `shader.UberSprite extends hxsl.Shader`.
-    /// This allows injecting methods for types that don't exist in target.
-    #[arg(long)]
-    inject_new_types: bool,
 
     /// Verbose output - show warnings and additional details
     #[arg(short, long)]
@@ -253,17 +254,12 @@ fn main() -> Result<()> {
     }
 
     // Perform substitution (both function and native injection enabled by default)
+    // Type injection is enabled per-pattern via @ prefix (e.g., "@shader.UberSprite.**")
     let inject_deps = !args.no_inject_deps;
     let inject_natives = !args.no_inject_natives;
-    let result = if args.inject_new_types {
-        hl_substitute::substitute_functions_by_pattern_with_type_injection(
-            &mut target, &source, &patterns, inject_deps, inject_natives
-        )
-    } else {
-        substitute_functions_by_pattern_with_options(
-            &mut target, &source, &patterns, inject_deps, inject_natives
-        )
-    };
+    let result = substitute_by_pattern(
+        &mut target, &source, &patterns, inject_deps, inject_natives
+    );
 
     // Report results
     println!("Substitution Results:");

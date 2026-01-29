@@ -6,7 +6,7 @@ use hlbc::opcodes::Opcode;
 use hlbc::types::{Function, RefType};
 use hlbc::{Bytecode, Resolve};
 
-use matching::{matches_pattern, FunctionIndex};
+use matching::{matches_pattern, is_type_injection_pattern, strip_type_prefix, FunctionIndex};
 use merge::PoolMerger;
 
 /// Get the source file path for a function (from its first opcode's debug info)
@@ -407,6 +407,7 @@ pub fn list_substitutable_functions(
 ///
 /// Returns a list of (function_name, exists_in_target) pairs.
 /// If patterns is empty, lists all functions in source.
+/// Patterns prefixed with `@` are stripped before matching (@ is a mode indicator).
 pub fn list_matching_functions(
     target: &Bytecode,
     source: &Bytecode,
@@ -415,15 +416,21 @@ pub fn list_matching_functions(
     let target_index = FunctionIndex::build(target);
     let source_index = FunctionIndex::build(source);
 
+    // Strip @ prefix from patterns for matching
+    let stripped_patterns: Vec<&str> = patterns
+        .iter()
+        .map(|p| strip_type_prefix(p))
+        .collect();
+
     source_index
         .iter()
         .filter(|(name, _)| {
             // If no patterns, match all (for --list without patterns)
-            if patterns.is_empty() {
+            if stripped_patterns.is_empty() {
                 // Skip anonymous closures
                 *name != "<none>" && !name.is_empty()
             } else {
-                patterns.iter().any(|pattern| matches_pattern(name, pattern))
+                stripped_patterns.iter().any(|pattern| matches_pattern(name, pattern))
             }
         })
         .map(|(name, _)| {
@@ -431,210 +438,6 @@ pub fn list_matching_functions(
             (name.to_string(), exists_in_target)
         })
         .collect()
-}
-
-/// Substitute functions from source bytecode into target bytecode using pattern matching
-///
-/// # Arguments
-/// * `target` - The bytecode to modify
-/// * `source` - The bytecode containing replacement functions
-/// * `patterns` - List of patterns to match function names against (supports * and ** wildcards)
-/// * `inject_deps` - If true, inject missing function dependencies from source
-///
-/// # Returns
-/// A result containing lists of replaced, not found, and error functions
-pub fn substitute_functions_by_pattern(
-    target: &mut Bytecode,
-    source: &Bytecode,
-    patterns: &[&str],
-    inject_deps: bool,
-) -> SubstitutionResult {
-    substitute_functions_by_pattern_with_options(target, source, patterns, inject_deps, false)
-}
-
-/// Substitute functions from source bytecode into target bytecode using pattern matching
-///
-/// # Arguments
-/// * `target` - The bytecode to modify
-/// * `source` - The bytecode containing replacement functions
-/// * `patterns` - List of patterns to match function names against (supports * and ** wildcards)
-/// * `inject_deps` - If true, inject missing function dependencies from source
-/// * `inject_natives` - If true, inject missing native declarations into target
-///
-/// # Returns
-/// A result containing lists of replaced, not found, and error functions
-pub fn substitute_functions_by_pattern_with_options(
-    target: &mut Bytecode,
-    source: &Bytecode,
-    patterns: &[&str],
-    inject_deps: bool,
-    inject_natives: bool,
-) -> SubstitutionResult {
-    let mut result = SubstitutionResult::default();
-
-    // Build indexes
-    let target_index = FunctionIndex::build(target);
-    let source_index = FunctionIndex::build(source);
-
-    // Find functions matching any pattern
-    let to_replace: Vec<(String, usize)> = source_index
-        .iter()
-        .filter(|(name, _)| patterns.iter().any(|pattern| matches_pattern(name, pattern)))
-        .map(|(name, idx)| (name.to_string(), idx))
-        .collect();
-
-    // Resolve target function indices and filter out not-found functions
-    let to_replace: Vec<(String, usize, usize)> = to_replace
-        .into_iter()
-        .filter_map(|(name, src_func_idx)| match target_index.find(&name) {
-            Some(target_func_idx) => Some((name, src_func_idx, target_func_idx)),
-            None => {
-                result.not_found.push(name);
-                None
-            }
-        })
-        .collect();
-
-    // Create a single pool merger for all substitutions to share type/global mappings
-    let mut merger = if inject_natives {
-        PoolMerger::with_native_injection(target, source, inject_deps)
-    } else {
-        PoolMerger::new(target, source, inject_deps)
-    };
-
-    // First pass: scan all functions to build complete remap
-    for (_name, src_func_idx, _target_func_idx) in &to_replace {
-        let src_func = &source.functions[*src_func_idx];
-        scan_and_ensure_refs(&mut merger, src_func);
-    }
-
-    // Collect results from merger
-    let warnings = std::mem::take(&mut merger.warnings);
-    let injected_functions = std::mem::take(&mut merger.injected_functions);
-    let injected_natives = std::mem::take(&mut merger.injected_natives);
-    let unresolvable_natives = std::mem::take(&mut merger.unresolvable_natives);
-    result.warnings.extend(warnings);
-    result.injected_functions.extend(injected_functions);
-    result.injected_natives.extend(injected_natives);
-    result.unresolvable_natives.extend(unresolvable_natives);
-
-    // Collect type mismatches
-    let type_mismatches = std::mem::take(&mut merger.type_mismatches);
-    for (_src_type_idx, mismatch) in &type_mismatches {
-        result.type_mismatches.push(TypeMismatchInfo {
-            type_name: mismatch.type_name.clone(),
-            target_fields: mismatch.target_field_count,
-            source_fields: mismatch.source_field_count,
-            missing_fields: mismatch.missing_in_target.clone(),
-            field_type_mismatches: mismatch
-                .field_type_mismatches
-                .iter()
-                .map(|ftm| FieldTypeMismatchInfo {
-                    field_name: ftm.field_name.clone(),
-                    source_type: ftm.source_type.clone(),
-                    target_type: ftm.target_type.clone(),
-                })
-                .collect(),
-            field_order_mismatches: mismatch
-                .field_order_mismatches
-                .iter()
-                .map(|fom| FieldOrderMismatchInfo {
-                    position: fom.position,
-                    source_field: fom.source_field.clone(),
-                    target_field: fom.target_field.clone(),
-                })
-                .collect(),
-            method_signature_mismatches: mismatch
-                .method_signature_mismatches
-                .iter()
-                .map(|msm| MethodSignatureMismatchInfo {
-                    method_name: msm.method_name.clone(),
-                    parent_class: msm.parent_class.clone(),
-                    source_signature: msm.source_signature.clone(),
-                    target_signature: msm.target_signature.clone(),
-                })
-                .collect(),
-        });
-    }
-
-    // Collect stdlib mismatches (fatal errors)
-    let stdlib_mismatches = std::mem::take(&mut merger.stdlib_mismatches);
-    result.stdlib_mismatches.extend(stdlib_mismatches);
-
-    // Extract init code BEFORE dropping merger, so it can call ensure_fun/ensure_type
-    // for any functions/types discovered in the extracted opcodes.
-    // This is critical: functions like ObjectMap.__constructor__ need to be ensured
-    // so they get properly remapped.
-    let init_code = if !merger.injected_globals.is_empty() {
-        merger.extract_init_code_for_injected_types()
-    } else {
-        None
-    };
-    let injected_globals_count = merger.injected_globals.len();
-
-    // Get the final remap (after any new functions/types were ensured during extraction)
-    let mut remap = merger.remap.clone();
-    // Copy missing_fields to remap for validation during opcode remapping
-    remap.missing_fields = merger.missing_fields.clone();
-
-    // Drop the merger to release the mutable borrow on target
-    drop(merger);
-
-    // Second pass: apply remaps to each function
-    for (name, src_func_idx, target_func_idx) in to_replace {
-        let src_func = &source.functions[src_func_idx];
-
-        // Remap the function opcodes (with field index remapping based on register types)
-        let remapped_ops: Vec<Opcode> = src_func
-            .ops
-            .iter()
-            .map(|op| remap.remap_opcode_with_regs(op, &src_func.regs))
-            .collect();
-
-        let remapped_regs: Vec<RefType> = src_func
-            .regs
-            .iter()
-            .map(|&r| remap.remap_type(r))
-            .collect();
-
-        let remapped_assigns = src_func.assigns.as_ref().map(|assigns| {
-            assigns
-                .iter()
-                .map(|(s, p)| (remap.remap_string(*s), *p))
-                .collect()
-        });
-
-        // Get mutable reference to target function - target_func_idx IS the correct array index
-        let target_func = &mut target.functions[target_func_idx];
-
-        // Keep original findex, name, parent - just replace the body
-        target_func.t = remap.remap_type(src_func.t);
-        target_func.regs = remapped_regs;
-        // Remap debug info: preserve source file/line with ".substituted" suffix on filename
-        target_func.debug_info = src_func
-            .debug_info
-            .as_ref()
-            .map(|di| remap.remap_debug_info(di));
-        target_func.ops = remapped_ops;
-        target_func.assigns = remapped_assigns;
-
-        result.replaced.push(name);
-    }
-
-    // Third pass: inject initialization code for injected types into entry point
-    // This initializes static fields of classes that were injected from source
-    if let Some(init_code) = init_code {
-        let init_count = merge::inject_init_into_entrypoint(target, init_code);
-        if init_count > 0 {
-            result.warnings.push(format!(
-                "Injected {} initialization opcode(s) into entry point for {} static type(s)",
-                init_count, injected_globals_count
-            ));
-            result.injected_init_count = init_count;
-        }
-    }
-
-    result
 }
 
 /// Check if a function can be injected (its parent type's parent exists in target)
@@ -664,23 +467,22 @@ fn can_inject_function_type(merger: &PoolMerger, func: &hlbc::types::Function) -
     })
 }
 
-/// Substitute functions from source bytecode into target bytecode using pattern matching,
-/// with support for injecting new types when their parent class exists in target.
+/// Substitute functions from source bytecode into target bytecode using pattern matching.
 ///
-/// This is the most advanced substitution function - it enables adding entirely new
-/// subclasses (like `shader.UberSprite extends hxsl.Shader`) that don't exist in target,
-/// as long as their parent class does exist.
+/// Supports per-pattern type injection via the `@` prefix:
+/// - Patterns prefixed with `@` (e.g., `@shader.UberSprite.**`) enable type injection
+///   for matching functions. New types with vtables will be created.
+/// - Regular patterns (e.g., `h3d.impl.GlDriver.resetStream`) only replace existing
+///   functions without any type injection logic.
 ///
 /// # Arguments
 /// * `target` - The bytecode to modify
 /// * `source` - The bytecode containing replacement functions
-/// * `patterns` - List of patterns to match function names against (supports * and ** wildcards)
+/// * `patterns` - List of patterns to match (supports `*` and `**` wildcards).
+///                Prefix with `@` to enable type injection for that pattern.
 /// * `inject_deps` - If true, inject missing function dependencies from source
 /// * `inject_natives` - If true, inject missing native declarations into target
-///
-/// # Returns
-/// A result containing lists of replaced, not found, injected functions and types
-pub fn substitute_functions_by_pattern_with_type_injection(
+pub fn substitute_by_pattern(
     target: &mut Bytecode,
     source: &Bytecode,
     patterns: &[&str],
@@ -689,24 +491,62 @@ pub fn substitute_functions_by_pattern_with_type_injection(
 ) -> SubstitutionResult {
     let mut result = SubstitutionResult::default();
 
+    // Partition patterns into type-injection vs regular
+    let (type_inject_patterns, regular_patterns): (Vec<&str>, Vec<&str>) = patterns
+        .iter()
+        .partition(|p| is_type_injection_pattern(p));
+
+    // Strip @ prefix from type-injection patterns for matching
+    let type_inject_patterns: Vec<&str> = type_inject_patterns
+        .iter()
+        .map(|p| strip_type_prefix(p))
+        .collect();
+
     // Build indexes
     let target_index = FunctionIndex::build(target);
     let source_index = FunctionIndex::build(source);
 
-    // Find functions matching any pattern
+    // Helper to check if a name matches a type-injection pattern
+    let matches_type_inject = |name: &str| -> bool {
+        type_inject_patterns.iter().any(|pattern| matches_pattern(name, pattern))
+    };
+
+    // Helper to check if a name matches a regular pattern
+    let matches_regular = |name: &str| -> bool {
+        regular_patterns.iter().any(|pattern| matches_pattern(name, pattern))
+    };
+
+    // Find functions matching any pattern (with @ stripped)
+    let all_patterns: Vec<&str> = regular_patterns
+        .iter()
+        .copied()
+        .chain(type_inject_patterns.iter().copied())
+        .collect();
+
     let to_replace: Vec<(String, usize)> = source_index
         .iter()
-        .filter(|(name, _)| patterns.iter().any(|pattern| matches_pattern(name, pattern)))
+        .filter(|(name, _)| all_patterns.iter().any(|pattern| matches_pattern(name, pattern)))
         .map(|(name, idx)| (name.to_string(), idx))
         .collect();
 
-    // Create a merger with type injection enabled
-    let mut merger = PoolMerger::with_type_injection(target, source, inject_deps);
+    // Create a merger - only enable type injection if we have @-prefixed patterns
+    let has_type_inject_patterns = !type_inject_patterns.is_empty();
+    let mut merger = if has_type_inject_patterns {
+        PoolMerger::with_type_injection(target, source, inject_deps)
+    } else {
+        if inject_natives {
+            PoolMerger::with_native_injection(target, source, inject_deps)
+        } else {
+            PoolMerger::new(target, source, inject_deps)
+        }
+    };
+
     if !inject_natives {
         merger.inject_missing_natives = false;
     }
 
     // Separate functions into those that exist in target vs source-only
+    // Only consider type injection for functions matching @-prefixed patterns
     let mut to_inject: Vec<(String, usize)> = Vec::new();
     let to_replace: Vec<(String, usize, usize)> = to_replace
         .into_iter()
@@ -714,11 +554,19 @@ pub fn substitute_functions_by_pattern_with_type_injection(
             match target_index.find(&name) {
                 Some(target_func_idx) => Some((name, src_func_idx, target_func_idx)),
                 None => {
-                    // Check if this function's parent type can be injected
-                    let src_func = &source.functions[src_func_idx];
-                    if can_inject_function_type(&merger, src_func) {
-                        to_inject.push((name, src_func_idx));
+                    // Function not in target - only consider injection if it matched a @-pattern
+                    if matches_type_inject(&name) {
+                        let src_func = &source.functions[src_func_idx];
+                        if can_inject_function_type(&merger, src_func) {
+                            to_inject.push((name, src_func_idx));
+                        } else {
+                            result.not_found.push(format!("{} (parent type not in target)", name));
+                        }
+                    } else if matches_regular(&name) {
+                        // Regular pattern - just report not found
+                        result.not_found.push(name);
                     } else {
+                        // Matched both patterns somehow, treat as not found
                         result.not_found.push(name);
                     }
                     None
@@ -734,6 +582,7 @@ pub fn substitute_functions_by_pattern_with_type_injection(
     }
 
     // Second pass: inject source-only functions (this creates their parent types too)
+    // Only happens for functions matching @-prefixed patterns
     for (name, src_func_idx) in &to_inject {
         let src_func = &source.functions[*src_func_idx];
         // ensure_fun will inject the function and its parent type if needed
@@ -741,8 +590,10 @@ pub fn substitute_functions_by_pattern_with_type_injection(
         result.injected_functions.push(name.clone());
     }
 
-    // Finalize protos AFTER all functions are injected
-    merger.finalize_injected_types();
+    // Finalize protos AFTER all functions are injected (only if we have type injection)
+    if has_type_inject_patterns {
+        merger.finalize_injected_types();
+    }
 
     // Collect injected type names
     let injected_type_names = merger.get_injected_type_names();

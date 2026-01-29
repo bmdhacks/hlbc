@@ -1216,8 +1216,12 @@ impl<'a> PoolMerger<'a> {
                         }).flatten();
 
                         if src_name == target_name && src_parent_name == target_parent_name {
-                            self.remap.funs.insert(src_ref.0, target_func.findex.0);
-                            return target_func.findex;
+                            // Also verify signature matches to avoid collisions when
+                            // multiple functions share the same name (e.g., "String" wrapper functions)
+                            if self.signatures_match(src_func, target_func) {
+                                self.remap.funs.insert(src_ref.0, target_func.findex.0);
+                                return target_func.findex;
+                            }
                         }
                     }
 
@@ -1234,13 +1238,16 @@ impl<'a> PoolMerger<'a> {
                                     }).flatten();
 
                                     if target_name == remap_target && target_parent_name.as_deref() == Some(remap_parent) {
-                                        // Found the remapped function - use it instead
-                                        self.remap.funs.insert(src_ref.0, target_func.findex.0);
-                                        self.warnings.push(format!(
-                                            "Stdlib remap: {}.{} -> {}.{} (Haxe version compatibility)",
-                                            parent, src_name, remap_parent, remap_target
-                                        ));
-                                        return target_func.findex;
+                                        // Also verify signature matches for stdlib remaps
+                                        if self.signatures_match(src_func, target_func) {
+                                            // Found the remapped function - use it instead
+                                            self.remap.funs.insert(src_ref.0, target_func.findex.0);
+                                            self.warnings.push(format!(
+                                                "Stdlib remap: {}.{} -> {}.{} (Haxe version compatibility)",
+                                                parent, src_name, remap_parent, remap_target
+                                            ));
+                                            return target_func.findex;
+                                        }
                                     }
                                 }
                             }
@@ -1291,6 +1298,14 @@ impl<'a> PoolMerger<'a> {
         }
 
         src_ref
+    }
+
+    /// Compare function signatures between source and target functions.
+    /// Returns true if the signatures match structurally (same parameter types and return type).
+    fn signatures_match(&self, src_func: &hlbc::types::Function, target_func: &hlbc::types::Function) -> bool {
+        let src_sig = format_type(self.source, src_func.t);
+        let target_sig = format_type(self.target, target_func.t);
+        src_sig == target_sig
     }
 
     /// Check if a type name indicates a stdlib/runtime type that should not be injected

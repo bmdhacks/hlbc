@@ -3,12 +3,33 @@ use std::collections::HashMap;
 use hlbc::types::{Function, Type};
 use hlbc::{Bytecode, Resolve};
 
+/// Check if pattern has @ prefix (type injection marker).
+///
+/// Patterns prefixed with `@` indicate that matching functions should be injected
+/// as new types with vtable modification, rather than just replacing existing functions.
+///
+/// Example: `@shader.UberSprite.**` will create the UberSprite type + vtable and inject all methods
+pub fn is_type_injection_pattern(pattern: &str) -> bool {
+    pattern.starts_with('@')
+}
+
+/// Strip @ prefix from pattern for matching.
+///
+/// The @ prefix is a mode indicator, not part of the actual pattern.
+/// This returns the pattern without the @ for use in name matching.
+pub fn strip_type_prefix(pattern: &str) -> &str {
+    pattern.strip_prefix('@').unwrap_or(pattern)
+}
+
 /// Match a qualified function name against a pattern with wildcard support.
 ///
 /// Patterns use `.` as segment separator and support:
 /// - `*` matches any single segment (e.g., `pkg.*.method` matches `pkg.Foo.method`)
 /// - `**` matches zero or more segments (e.g., `pkg.**` matches `pkg.Foo.bar.method`)
 /// - Exact match if no wildcards
+///
+/// Note: The `@` prefix (type injection marker) should be stripped before calling this function.
+/// Use `strip_type_prefix()` to remove it.
 ///
 /// Examples:
 /// - `h3d.impl.GlDriver.clear` - exact match
@@ -66,7 +87,25 @@ fn matches_parts(name: &[&str], pattern: &[&str]) -> bool {
 
 #[cfg(test)]
 mod pattern_tests {
-    use super::matches_pattern;
+    use super::{matches_pattern, is_type_injection_pattern, strip_type_prefix};
+
+    #[test]
+    fn test_type_injection_prefix() {
+        // @ prefix indicates type injection mode
+        assert!(is_type_injection_pattern("@shader.UberSprite.**"));
+        assert!(is_type_injection_pattern("@uber.UberParams.*"));
+        assert!(!is_type_injection_pattern("h3d.impl.GlDriver.resetStream"));
+        assert!(!is_type_injection_pattern("hxsl.**"));
+    }
+
+    #[test]
+    fn test_strip_type_prefix() {
+        assert_eq!(strip_type_prefix("@shader.UberSprite.**"), "shader.UberSprite.**");
+        assert_eq!(strip_type_prefix("@uber.UberParams.*"), "uber.UberParams.*");
+        // No @ prefix - returns unchanged
+        assert_eq!(strip_type_prefix("h3d.impl.GlDriver.resetStream"), "h3d.impl.GlDriver.resetStream");
+        assert_eq!(strip_type_prefix("hxsl.**"), "hxsl.**");
+    }
 
     #[test]
     fn test_exact_match() {
