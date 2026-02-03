@@ -30,34 +30,61 @@ fn get_global_string_value<'a>(code: &'a Bytecode, global: RefGlobal) -> Option<
     code.strings.get(string_idx).map(|s| s.as_ref())
 }
 
-/// Get the enum construct index for an enum-type global, if any
-/// Falls back to position-based matching if not in constants table
-fn get_global_enum_construct(code: &Bytecode, global: RefGlobal, enum_type: RefType) -> Option<usize> {
-    // First try: check if global has a constant initializer
+/// Build a map of global_idx -> enum construct index by scanning the entrypoint function.
+///
+/// The Haxe compiler initializes enum globals via entrypoint code like:
+///   Int reg = construct_index
+///   GetArray reg2 = evalues[reg]
+///   SafeCast reg3 = cast reg2
+///   SetGlobal global = reg3
+///
+/// This is the only path Haxe uses for enum globals (they never appear in the constants table).
+fn build_enum_construct_map(code: &Bytecode) -> HashMap<usize, usize> {
+    let mut map = HashMap::new();
+    let ops = &code.entrypoint().ops;
+
+    for i in 0..ops.len().saturating_sub(3) {
+        // Match: Int { dst: idx_reg, ptr } -> GetArray { index: idx_reg } -> SafeCast { dst: cast_reg } -> SetGlobal { src: cast_reg }
+        if let Opcode::Int { dst: idx_reg, ptr } = &ops[i] {
+            if let Opcode::GetArray { dst: _, array: _, index: ga_idx_reg } = &ops[i + 1] {
+                if ga_idx_reg == idx_reg {
+                    if let Opcode::SafeCast { dst: cast_reg, src: _ } = &ops[i + 2] {
+                        if let Opcode::SetGlobal { global, src: sg_reg } = &ops[i + 3] {
+                            if sg_reg == cast_reg {
+                                let construct_index = code.ints[ptr.0] as usize;
+                                map.insert(global.0, construct_index);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    map
+}
+
+/// Get the enum construct index for an enum-type global, if any.
+/// First tries the constants table (for non-Haxe or future compilers),
+/// then falls back to the entrypoint scan map (the path Haxe actually uses).
+fn get_global_enum_construct(
+    code: &Bytecode,
+    global: RefGlobal,
+    _enum_type: RefType,
+    enum_construct_map: &HashMap<usize, usize>,
+) -> Option<usize> {
+    // First try: constant initializer (for non-Haxe or future compilers)
     if let Some(&const_idx) = code.globals_initializers.get(&global) {
         if let Some(constants) = code.constants.as_ref() {
             if let Some(constant_def) = constants.get(const_idx) {
-                // For enums, fields[0] is the construct index
                 if let Some(&construct) = constant_def.fields.first() {
                     return Some(construct);
                 }
             }
         }
     }
-
-    // Second try: determine position among all globals of this enum type
-    // This assumes globals are created in construct order
-    let mut enum_globals: Vec<usize> = code
-        .globals
-        .iter()
-        .enumerate()
-        .filter(|(_, &t)| t == enum_type)
-        .map(|(i, _)| i)
-        .collect();
-    enum_globals.sort();
-
-    // Find position of this global in the sorted list
-    enum_globals.iter().position(|&g| g == global.0)
+    // Second: entrypoint scan (the path Haxe actually uses)
+    enum_construct_map.get(&global.0).copied()
 }
 
 /// Get the construct name for an enum global given its construct index
@@ -226,10 +253,16 @@ pub struct PoolMerger<'a> {
     /// Pending bindings (field -> function mappings like __constructor__)
     /// Maps target_type_idx -> Vec<(field_idx, src_findex)>
     pub pending_bindings: HashMap<usize, Vec<(usize, RefFun)>>,
+    /// Enum global -> construct index map for source bytecode (from entrypoint scan)
+    source_enum_constructs: HashMap<usize, usize>,
+    /// Enum global -> construct index map for target bytecode (from entrypoint scan)
+    target_enum_constructs: HashMap<usize, usize>,
 }
 
 impl<'a> PoolMerger<'a> {
     pub fn new(target: &'a mut Bytecode, source: &'a Bytecode, inject_deps: bool) -> Self {
+        let source_enum_constructs = build_enum_construct_map(source);
+        let target_enum_constructs = build_enum_construct_map(target);
         let mut merger = Self {
             target,
             source,
@@ -248,6 +281,8 @@ impl<'a> PoolMerger<'a> {
             injected_types: HashMap::new(),
             pending_protos: HashMap::new(),
             pending_bindings: HashMap::new(),
+            source_enum_constructs,
+            target_enum_constructs,
         };
         merger.build_virtual_method_map();
         merger
@@ -255,6 +290,8 @@ impl<'a> PoolMerger<'a> {
 
     /// Create a merger with native injection enabled
     pub fn with_native_injection(target: &'a mut Bytecode, source: &'a Bytecode, inject_deps: bool) -> Self {
+        let source_enum_constructs = build_enum_construct_map(source);
+        let target_enum_constructs = build_enum_construct_map(target);
         let mut merger = Self {
             target,
             source,
@@ -273,6 +310,8 @@ impl<'a> PoolMerger<'a> {
             injected_types: HashMap::new(),
             pending_protos: HashMap::new(),
             pending_bindings: HashMap::new(),
+            source_enum_constructs,
+            target_enum_constructs,
         };
         merger.build_virtual_method_map();
         merger
@@ -281,6 +320,8 @@ impl<'a> PoolMerger<'a> {
     /// Create a merger with type injection enabled.
     /// This enables adding new subclasses like `shader.UberSprite extends hxsl.Shader`.
     pub fn with_type_injection(target: &'a mut Bytecode, source: &'a Bytecode, inject_deps: bool) -> Self {
+        let source_enum_constructs = build_enum_construct_map(source);
+        let target_enum_constructs = build_enum_construct_map(target);
         let mut merger = Self {
             target,
             source,
@@ -299,6 +340,8 @@ impl<'a> PoolMerger<'a> {
             injected_types: HashMap::new(),
             pending_protos: HashMap::new(),
             pending_bindings: HashMap::new(),
+            source_enum_constructs,
+            target_enum_constructs,
         };
         merger.build_virtual_method_map();
         merger
@@ -1035,7 +1078,7 @@ impl<'a> PoolMerger<'a> {
         // Special handling for Enum-type globals - match by construct NAME
         if let Type::Enum { name, .. } = self.source.get(src_type) {
             let enum_name = self.source.get(*name).to_string();
-            if let Some(src_construct) = get_global_enum_construct(self.source, src_ref, src_type) {
+            if let Some(src_construct) = get_global_enum_construct(self.source, src_ref, src_type, &self.source_enum_constructs) {
                 let remapped_type = self.ensure_type(src_type);
 
                 // Get the source construct NAME - this is stable across compilations
@@ -1050,7 +1093,7 @@ impl<'a> PoolMerger<'a> {
                         for (i, &target_type) in self.target.globals.iter().enumerate() {
                             if target_type == remapped_type {
                                 if let Some(actual_target_construct) =
-                                    get_global_enum_construct(self.target, RefGlobal(i), remapped_type)
+                                    get_global_enum_construct(self.target, RefGlobal(i), remapped_type, &self.target_enum_constructs)
                                 {
                                     if actual_target_construct == target_construct_idx {
                                         self.remap.globals.insert(src_ref.0, i);

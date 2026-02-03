@@ -1,7 +1,6 @@
 //! Bytecode injection and patching module.
 //!
 //! This module provides tools for:
-//! - Injecting functions from one bytecode file into another
 //! - Inserting call opcodes at specific positions
 //! - Adjusting jump offsets after opcode insertion
 //!
@@ -9,27 +8,17 @@
 //!
 //! ```ignore
 //! use hlbc::Bytecode;
-//! use hlbc::inject::{FunctionInjector, FunctionPatcher, CallSpec};
+//! use hlbc::inject::{FunctionPatcher, CallSpec};
 //!
 //! let mut target = Bytecode::from_file("target.hl")?;
-//! let source = Bytecode::from_file("source.hl")?;
-//!
-//! // Inject a function from source
-//! let mut injector = FunctionInjector::new(&mut target, &source);
-//! let preload_fn = injector.inject_function("AstcLoader.preloadAll")?;
-//! injector.finish();
 //!
 //! // Insert a call at a specific location
 //! let mut patcher = FunctionPatcher::new(&mut target, "Main.init")?;
-//! patcher.insert_call_at(10, CallSpec::call0(preload_fn))?;
+//! patcher.insert_call_at(10, CallSpec::call0(some_fun))?;
 //! ```
 
 mod jumps;
 pub mod matching;
-pub mod merge;
-pub mod remap;
-
-use std::collections::HashMap;
 
 use crate::opcodes::Opcode;
 use crate::types::{Function, RefFun, RefType, Reg};
@@ -37,8 +26,6 @@ use crate::Bytecode;
 
 pub use jumps::{adjust_jumps_after_insert, adjust_jumps_after_remove};
 pub use matching::{matches_pattern, FunctionIndex, QualifiedName};
-pub use merge::{FieldTypeMismatch, PoolMerger, TypeMismatch};
-pub use remap::IndexRemap;
 
 /// Error type for injection and patching operations
 #[derive(Debug, Clone)]
@@ -83,120 +70,6 @@ impl std::fmt::Display for InjectionError {
 }
 
 impl std::error::Error for InjectionError {}
-
-/// Result of injecting functions
-#[derive(Debug, Default)]
-pub struct InjectionResult {
-    /// Functions successfully injected (by qualified name)
-    pub injected_functions: Vec<String>,
-    /// Native functions injected
-    pub injected_natives: Vec<String>,
-    /// Warnings during injection
-    pub warnings: Vec<String>,
-    /// Mapping from source function names to their new RefFun in target
-    pub function_map: HashMap<String, RefFun>,
-    /// Type mismatches detected (may cause runtime issues)
-    pub type_mismatches: Vec<TypeMismatch>,
-}
-
-/// Function injector - adds functions from source to target bytecode.
-///
-/// This wraps PoolMerger to provide a clean API for injecting functions
-/// without full substitution. Unlike hl-substitute, this only ADDS functions
-/// and never replaces existing ones.
-pub struct FunctionInjector<'a> {
-    merger: PoolMerger<'a>,
-    source_index: FunctionIndex,
-    injected: HashMap<String, RefFun>,
-}
-
-impl<'a> FunctionInjector<'a> {
-    /// Create a new injector.
-    ///
-    /// # Arguments
-    /// * `target` - Target bytecode to inject into (will be modified)
-    /// * `source` - Source bytecode containing functions to inject
-    pub fn new(target: &'a mut Bytecode, source: &'a Bytecode) -> Self {
-        let source_index = FunctionIndex::build(source);
-        let merger = PoolMerger::with_native_injection(target, source, true);
-        Self {
-            merger,
-            source_index,
-            injected: HashMap::new(),
-        }
-    }
-
-    /// Inject a function by its qualified name.
-    ///
-    /// The function and all its dependencies (types, strings, constants, called functions)
-    /// will be injected into the target bytecode.
-    ///
-    /// # Arguments
-    /// * `name` - Qualified function name (e.g., "AstcLoader.preloadAll")
-    ///
-    /// # Returns
-    /// The RefFun of the injected function in the target bytecode.
-    pub fn inject_function(&mut self, name: &str) -> Result<RefFun, InjectionError> {
-        // Check if already injected
-        if let Some(&fref) = self.injected.get(name) {
-            return Ok(fref);
-        }
-
-        // Find in source
-        let source_idx = self.source_index.find(name)
-            .ok_or_else(|| InjectionError::FunctionNotFoundInSource(name.to_string()))?;
-
-        // Get the source function's findex
-        let source_func = &self.merger.source.functions[source_idx];
-        let source_fref = source_func.findex;
-
-        // Inject via merger (this handles all dependencies)
-        let target_fref = self.merger.ensure_fun(source_fref);
-
-        // Record in our map
-        self.injected.insert(name.to_string(), target_fref);
-
-        Ok(target_fref)
-    }
-
-    /// Inject all functions matching a pattern.
-    ///
-    /// # Arguments
-    /// * `pattern` - Pattern to match (e.g., "AstcLoader.*", "h3d.impl.**")
-    ///
-    /// # Returns
-    /// Vector of (name, RefFun) pairs for all injected functions.
-    pub fn inject_matching(&mut self, pattern: &str) -> Result<Vec<(String, RefFun)>, InjectionError> {
-        let mut results = Vec::new();
-
-        // Collect matching function names first (to avoid borrow issues)
-        let matches: Vec<String> = self.source_index
-            .iter()
-            .filter(|(name, _)| matches_pattern(name, pattern))
-            .map(|(name, _)| name.to_string())
-            .collect();
-
-        for name in matches {
-            let fref = self.inject_function(&name)?;
-            results.push((name, fref));
-        }
-
-        Ok(results)
-    }
-
-    /// Finish injection and return the result.
-    ///
-    /// This consumes the injector and returns information about what was injected.
-    pub fn finish(self) -> InjectionResult {
-        InjectionResult {
-            injected_functions: self.merger.injected_functions,
-            injected_natives: self.merger.injected_natives,
-            warnings: self.merger.warnings,
-            function_map: self.injected,
-            type_mismatches: self.merger.type_mismatches.into_values().collect(),
-        }
-    }
-}
 
 /// Specification for a call opcode to insert.
 #[derive(Debug, Clone)]
