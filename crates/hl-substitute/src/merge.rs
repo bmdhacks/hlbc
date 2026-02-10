@@ -275,12 +275,30 @@ pub struct PoolMerger<'a> {
     source_enum_constructs: HashMap<usize, usize>,
     /// Enum global -> construct index map for target bytecode (from entrypoint scan)
     target_enum_constructs: HashMap<usize, usize>,
+    /// Reverse lookup: target int value -> index (avoids O(n) scan in ensure_int)
+    target_int_lookup: HashMap<i32, usize>,
+    /// Reverse lookup: target float bits -> index (avoids O(n) scan in ensure_float)
+    target_float_lookup: HashMap<u64, usize>,
+    /// Reverse lookup: target string -> index (avoids O(n) scan in ensure_string)
+    target_string_lookup: HashMap<String, usize>,
 }
 
 impl<'a> PoolMerger<'a> {
+    /// Build reverse-lookup HashMaps for target pools (int/float/string).
+    fn build_pool_lookups(target: &Bytecode) -> (HashMap<i32, usize>, HashMap<u64, usize>, HashMap<String, usize>) {
+        let int_lookup: HashMap<i32, usize> = target.ints.iter()
+            .enumerate().map(|(i, &v)| (v, i)).collect();
+        let float_lookup: HashMap<u64, usize> = target.floats.iter()
+            .enumerate().map(|(i, &v)| (v.to_bits(), i)).collect();
+        let string_lookup: HashMap<String, usize> = target.strings.iter()
+            .enumerate().map(|(i, s)| (s.to_string(), i)).collect();
+        (int_lookup, float_lookup, string_lookup)
+    }
+
     pub fn new(target: &'a mut Bytecode, source: &'a Bytecode, inject_deps: bool) -> Self {
         let source_enum_constructs = build_enum_construct_map(source);
         let target_enum_constructs = build_enum_construct_map(target);
+        let (target_int_lookup, target_float_lookup, target_string_lookup) = Self::build_pool_lookups(target);
         let mut merger = Self {
             target,
             source,
@@ -302,6 +320,9 @@ impl<'a> PoolMerger<'a> {
             pending_bindings: HashMap::new(),
             source_enum_constructs,
             target_enum_constructs,
+            target_int_lookup,
+            target_float_lookup,
+            target_string_lookup,
         };
         merger.build_virtual_method_map();
         merger
@@ -311,6 +332,7 @@ impl<'a> PoolMerger<'a> {
     pub fn with_native_injection(target: &'a mut Bytecode, source: &'a Bytecode, inject_deps: bool) -> Self {
         let source_enum_constructs = build_enum_construct_map(source);
         let target_enum_constructs = build_enum_construct_map(target);
+        let (target_int_lookup, target_float_lookup, target_string_lookup) = Self::build_pool_lookups(target);
         let mut merger = Self {
             target,
             source,
@@ -332,6 +354,9 @@ impl<'a> PoolMerger<'a> {
             pending_bindings: HashMap::new(),
             source_enum_constructs,
             target_enum_constructs,
+            target_int_lookup,
+            target_float_lookup,
+            target_string_lookup,
         };
         merger.build_virtual_method_map();
         merger
@@ -342,6 +367,7 @@ impl<'a> PoolMerger<'a> {
     pub fn with_type_injection(target: &'a mut Bytecode, source: &'a Bytecode, inject_deps: bool) -> Self {
         let source_enum_constructs = build_enum_construct_map(source);
         let target_enum_constructs = build_enum_construct_map(target);
+        let (target_int_lookup, target_float_lookup, target_string_lookup) = Self::build_pool_lookups(target);
         let mut merger = Self {
             target,
             source,
@@ -363,6 +389,9 @@ impl<'a> PoolMerger<'a> {
             pending_bindings: HashMap::new(),
             source_enum_constructs,
             target_enum_constructs,
+            target_int_lookup,
+            target_float_lookup,
+            target_string_lookup,
         };
         merger.build_virtual_method_map();
         merger
@@ -376,8 +405,8 @@ impl<'a> PoolMerger<'a> {
 
         let src_val = self.source.ints[src_ref.0];
 
-        // Check if already exists in target
-        if let Some(target_idx) = self.target.ints.iter().position(|&v| v == src_val) {
+        // O(1) lookup via HashMap
+        if let Some(&target_idx) = self.target_int_lookup.get(&src_val) {
             self.remap.ints.insert(src_ref.0, target_idx);
             return RefInt(target_idx);
         }
@@ -385,6 +414,7 @@ impl<'a> PoolMerger<'a> {
         // Add new int
         let target_idx = self.target.ints.len();
         self.target.ints.push(src_val);
+        self.target_int_lookup.insert(src_val, target_idx);
         self.remap.ints.insert(src_ref.0, target_idx);
         RefInt(target_idx)
     }
@@ -397,13 +427,8 @@ impl<'a> PoolMerger<'a> {
 
         let src_val = self.source.floats[src_ref.0];
 
-        // Check if already exists in target (use bitwise comparison for floats)
-        if let Some(target_idx) = self
-            .target
-            .floats
-            .iter()
-            .position(|&v| v.to_bits() == src_val.to_bits())
-        {
+        // O(1) lookup via HashMap (bitwise comparison for floats)
+        if let Some(&target_idx) = self.target_float_lookup.get(&src_val.to_bits()) {
             self.remap.floats.insert(src_ref.0, target_idx);
             return RefFloat(target_idx);
         }
@@ -411,6 +436,7 @@ impl<'a> PoolMerger<'a> {
         // Add new float
         let target_idx = self.target.floats.len();
         self.target.floats.push(src_val);
+        self.target_float_lookup.insert(src_val.to_bits(), target_idx);
         self.remap.floats.insert(src_ref.0, target_idx);
         RefFloat(target_idx)
     }
@@ -423,8 +449,8 @@ impl<'a> PoolMerger<'a> {
 
         let src_str = &self.source.strings[src_ref.0];
 
-        // Check if already exists in target
-        if let Some(target_idx) = self.target.strings.iter().position(|s| s == src_str) {
+        // O(1) lookup via HashMap
+        if let Some(&target_idx) = self.target_string_lookup.get(src_str.as_ref()) {
             self.remap.strings.insert(src_ref.0, target_idx);
             return RefString(target_idx);
         }
@@ -432,6 +458,7 @@ impl<'a> PoolMerger<'a> {
         // Add new string
         let target_idx = self.target.strings.len();
         self.target.strings.push(src_str.clone());
+        self.target_string_lookup.insert(src_str.to_string(), target_idx);
         self.remap.strings.insert(src_ref.0, target_idx);
         RefString(target_idx)
     }
