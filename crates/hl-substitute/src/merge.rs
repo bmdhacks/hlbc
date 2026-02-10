@@ -201,6 +201,22 @@ pub struct MethodSignatureMismatch {
     pub target_signature: String,
 }
 
+/// Information about an enum construct parameter type mismatch
+#[derive(Debug, Clone)]
+pub struct EnumConstructParamMismatch {
+    pub construct_name: String,
+    pub param_index: usize,
+    pub source_type: String,
+    pub target_type: String,
+}
+
+/// Information about enum construct mismatches between source and target
+#[derive(Debug, Clone)]
+pub struct EnumMismatch {
+    pub enum_name: String,
+    pub construct_param_mismatches: Vec<EnumConstructParamMismatch>,
+}
+
 /// Information about type layout mismatches between source and target
 #[derive(Debug, Clone)]
 pub struct TypeMismatch {
@@ -232,6 +248,8 @@ pub struct PoolMerger<'a> {
     pub unresolvable_natives: Vec<String>,
     /// Type layout mismatches detected (source type index -> mismatch info)
     pub type_mismatches: HashMap<usize, TypeMismatch>,
+    /// Enum construct param type mismatches detected (source type index -> mismatch info)
+    pub enum_mismatches: HashMap<usize, EnumMismatch>,
     /// Fields in source types that don't exist in target: type_idx -> set of field indices
     /// Used for validation during opcode remapping
     pub missing_fields: HashMap<usize, HashSet<usize>>,
@@ -274,6 +292,7 @@ impl<'a> PoolMerger<'a> {
             injected_natives: Vec::new(),
             unresolvable_natives: Vec::new(),
             type_mismatches: HashMap::new(),
+            enum_mismatches: HashMap::new(),
             missing_fields: HashMap::new(),
             stdlib_mismatches: Vec::new(),
             injected_globals: HashMap::new(),
@@ -303,6 +322,7 @@ impl<'a> PoolMerger<'a> {
             injected_natives: Vec::new(),
             unresolvable_natives: Vec::new(),
             type_mismatches: HashMap::new(),
+            enum_mismatches: HashMap::new(),
             missing_fields: HashMap::new(),
             stdlib_mismatches: Vec::new(),
             injected_globals: HashMap::new(),
@@ -333,6 +353,7 @@ impl<'a> PoolMerger<'a> {
             injected_natives: Vec::new(),
             unresolvable_natives: Vec::new(),
             type_mismatches: HashMap::new(),
+            enum_mismatches: HashMap::new(),
             missing_fields: HashMap::new(),
             stdlib_mismatches: Vec::new(),
             injected_globals: HashMap::new(),
@@ -552,8 +573,17 @@ impl<'a> PoolMerger<'a> {
                             // Check if constructs match structurally
                             // For anonymous enums (closures), we need exact structural match
                             // For named enums, we allow source to have more constructs (superset)
-                            if !self.enum_constructs_match(&src_name, constructs, target_constructs) {
+                            // and tolerate param type mismatches with warnings
+                            let (matched, param_mismatches) = self.enum_constructs_match(&src_name, constructs, target_constructs);
+                            if !matched {
                                 continue; // Try next enum with same name
+                            }
+                            // Store param type mismatches if any (e.g. Dynamic vs concrete)
+                            if !param_mismatches.is_empty() {
+                                self.enum_mismatches.insert(src_ref.0, EnumMismatch {
+                                    enum_name: src_name.to_string(),
+                                    construct_param_mismatches: param_mismatches,
+                                });
                             }
 
                             self.remap.types.insert(src_ref.0, i);
@@ -1805,16 +1835,17 @@ impl<'a> PoolMerger<'a> {
     /// This is used to find the correct enum type when there are multiple with the same name
     ///
     /// For anonymous enums (closures), requires exact structural match.
-    /// For named enums, allows source to have MORE constructs than target (superset matching).
+    /// For named enums, allows source to have MORE constructs than target (superset matching),
+    /// and tolerates param type mismatches (e.g. Dynamic vs concrete) with warnings.
     fn enum_constructs_match(
         &self,
         enum_name: &str,
         src_constructs: &[hlbc::types::EnumConstruct],
         target_constructs: &[hlbc::types::EnumConstruct],
-    ) -> bool {
+    ) -> (bool, Vec<EnumConstructParamMismatch>) {
         // Anonymous enums (closures) need exact structural matching
         if enum_name == "<none>" {
-            return self.enum_constructs_match_exact(src_constructs, target_constructs);
+            return (self.enum_constructs_match_exact(src_constructs, target_constructs), Vec::new());
         }
 
         // Named enums use relaxed matching: target constructs must exist in source
@@ -1858,12 +1889,16 @@ impl<'a> PoolMerger<'a> {
     }
 
     /// Relaxed matching for named enums: all TARGET constructs must exist in source
-    /// Source can have additional constructs that will be injected into target
+    /// Source can have additional constructs that will be injected into target.
+    /// Param type mismatches are recorded as warnings but don't prevent matching —
+    /// a named enum where all construct names match is unambiguously the right type.
     fn enum_constructs_match_relaxed(
         &self,
         src_constructs: &[hlbc::types::EnumConstruct],
         target_constructs: &[hlbc::types::EnumConstruct],
-    ) -> bool {
+    ) -> (bool, Vec<EnumConstructParamMismatch>) {
+        let mut mismatches = Vec::new();
+
         // For each target construct, find a matching source construct by name
         for target_c in target_constructs {
             let target_name = self.target.get(target_c.name);
@@ -1876,7 +1911,7 @@ impl<'a> PoolMerger<'a> {
             match src_match {
                 None => {
                     // Target construct doesn't exist in source - can't match
-                    return false;
+                    return (false, mismatches);
                 }
                 Some(src_c) => {
                     // Check param types match for the minimum common count
@@ -1886,14 +1921,19 @@ impl<'a> PoolMerger<'a> {
                         let src_type = self.source.get(src_c.params[i]);
                         let target_type = self.target.get(target_c.params[i]);
                         if !self.types_match(src_type, target_type) {
-                            return false;
+                            mismatches.push(EnumConstructParamMismatch {
+                                construct_name: target_name.to_string(),
+                                param_index: i,
+                                source_type: format_type(self.source, src_c.params[i]),
+                                target_type: format_type(self.target, target_c.params[i]),
+                            });
                         }
                     }
                 }
             }
         }
 
-        true
+        (true, mismatches)
     }
 
     /// Build a map of target findex -> pindex for virtual methods.

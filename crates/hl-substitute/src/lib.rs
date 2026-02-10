@@ -66,6 +66,8 @@ pub struct SubstitutionResult {
     pub skipped_type_mismatch: Vec<(String, String)>,
     /// Type layout mismatches detected
     pub type_mismatches: Vec<TypeMismatchInfo>,
+    /// Enum construct param type mismatches detected
+    pub enum_mismatches: Vec<EnumMismatchInfo>,
     /// Stdlib functions that couldn't be injected due to Haxe version mismatch
     /// (qualified_name, reason)
     pub stdlib_mismatches: Vec<(String, String)>,
@@ -99,6 +101,22 @@ pub struct MethodSignatureMismatchInfo {
     pub parent_class: String,
     pub source_signature: String,
     pub target_signature: String,
+}
+
+/// Information about an enum construct parameter type mismatch
+#[derive(Debug, Clone)]
+pub struct EnumConstructParamMismatchInfo {
+    pub construct_name: String,
+    pub param_index: usize,
+    pub source_type: String,
+    pub target_type: String,
+}
+
+/// Information about enum construct mismatches between source and target
+#[derive(Debug, Clone)]
+pub struct EnumMismatchInfo {
+    pub enum_name: String,
+    pub construct_param_mismatches: Vec<EnumConstructParamMismatchInfo>,
 }
 
 /// Information about a type layout mismatch
@@ -232,6 +250,24 @@ pub fn substitute_functions(
                     parent_class: msm.parent_class.clone(),
                     source_signature: msm.source_signature.clone(),
                     target_signature: msm.target_signature.clone(),
+                })
+                .collect(),
+        });
+    }
+
+    // Collect enum construct param mismatches
+    let enum_mismatches = std::mem::take(&mut merger.enum_mismatches);
+    for (_src_type_idx, mismatch) in &enum_mismatches {
+        result.enum_mismatches.push(EnumMismatchInfo {
+            enum_name: mismatch.enum_name.clone(),
+            construct_param_mismatches: mismatch
+                .construct_param_mismatches
+                .iter()
+                .map(|pm| EnumConstructParamMismatchInfo {
+                    construct_name: pm.construct_name.clone(),
+                    param_index: pm.param_index,
+                    source_type: pm.source_type.clone(),
+                    target_type: pm.target_type.clone(),
                 })
                 .collect(),
         });
@@ -648,6 +684,24 @@ pub fn substitute_by_pattern(
                     parent_class: msm.parent_class.clone(),
                     source_signature: msm.source_signature.clone(),
                     target_signature: msm.target_signature.clone(),
+                })
+                .collect(),
+        });
+    }
+
+    // Collect enum construct param mismatches
+    let enum_mismatches = std::mem::take(&mut merger.enum_mismatches);
+    for (_src_type_idx, mismatch) in &enum_mismatches {
+        result.enum_mismatches.push(EnumMismatchInfo {
+            enum_name: mismatch.enum_name.clone(),
+            construct_param_mismatches: mismatch
+                .construct_param_mismatches
+                .iter()
+                .map(|pm| EnumConstructParamMismatchInfo {
+                    construct_name: pm.construct_name.clone(),
+                    param_index: pm.param_index,
+                    source_type: pm.source_type.clone(),
+                    target_type: pm.target_type.clone(),
                 })
                 .collect(),
         });

@@ -382,6 +382,20 @@ fn main() -> Result<()> {
         }
     }
 
+    if !result.enum_mismatches.is_empty() {
+        println!();
+        println!("  Enum construct param mismatches: {}", result.enum_mismatches.len());
+        for em in &result.enum_mismatches {
+            println!("    ~ {} (enum)", em.enum_name);
+            for pm in &em.construct_param_mismatches {
+                println!("      ! {}[{}]: source={}, target={}",
+                         pm.construct_name, pm.param_index, pm.source_type, pm.target_type);
+            }
+        }
+        println!("    NOTE: Source stubs have degraded enum param types (Dynamic instead of concrete).");
+        println!("    Recompile stubs with correct types to fix. Matching proceeded anyway.");
+    }
+
     if !result.skipped_type_mismatch.is_empty() {
         println!();
         println!("  Skipped (type mismatch): {}", result.skipped_type_mismatch.len());
