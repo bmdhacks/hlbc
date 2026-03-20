@@ -101,6 +101,18 @@ impl<'a> PatternMatcher<'a> {
         self.ensure_dominance();
         let dominators = self.region_dominators.as_ref().unwrap();
 
+        // Collect loop headers and back-edge sources as barriers.
+        // This prevents the branch collector from crossing back-edges and
+        // absorbing loop body nodes from the next iteration.
+        // - Loop headers: don't enter the header from a branch
+        // - Back-edge sources: nodes whose only purpose is jumping to the header
+        let loop_header_cfgs: HashSet<NodeIndex> = self.analysis.loops.iter()
+            .map(|l| l.header)
+            .collect();
+        let back_edge_cfgs: HashSet<NodeIndex> = self.analysis.loops.iter()
+            .flat_map(|l| l.back_edge_sources.iter().copied())
+            .collect();
+
         let mut nodes = HashSet::new();
         let mut worklist = vec![start];
         let mut visited = HashSet::new();
@@ -114,6 +126,18 @@ impl<'a> PatternMatcher<'a> {
             if visited.contains(&node) || node == merge || node == condition {
                 continue;
             }
+
+            // Don't traverse into loop headers or back-edge sources (unless
+            // it's the start node). These are loop structural nodes — including
+            // them in a branch would absorb loop structure before loop detection.
+            if node != start {
+                if let Some(cfg_node) = self.region_graph.get_node(node).and_then(|n| n.as_block()) {
+                    if loop_header_cfgs.contains(&cfg_node) || back_edge_cfgs.contains(&cfg_node) {
+                        continue;
+                    }
+                }
+            }
+
             visited.insert(node);
 
             // Check dominance using region-level dominators

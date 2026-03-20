@@ -86,12 +86,34 @@ pub fn reduce_to_region_with_exceptions(
     // expansion-internal jumps are ignored during CFG construction, so the
     // structurer never sees the capacity-check branches.
 
+    let debug_reduce = std::env::var("HLBC_DEBUG_REDUCE").is_ok();
+
     while !graph.is_fully_reduced() && iterations < MAX_ITERATIONS {
         iterations += 1;
+
+        if debug_reduce {
+            eprintln!("[reducer] iter {}, {} nodes:", iterations, graph.node_count());
+            for ni in graph.node_indices() {
+                if let Some(node) = graph.get_node(ni) {
+                    let desc = match node {
+                        crate::structurer::region_graph::RegionNode::Block(cfg_idx) => {
+                            let block = &cfg.graph[*cfg_idx];
+                            format!("Block(ops {}..{})", block.start, block.end)
+                        },
+                        crate::structurer::region_graph::RegionNode::Collapsed(_) => "Collapsed".to_string(),
+                    };
+                    let succs: Vec<_> = graph.successors(ni).iter().map(|n| n.index()).collect();
+                    eprintln!("  N[{}]: {} → {:?}", ni.index(), desc, succs);
+                }
+            }
+        }
 
         let made_progress = reduce_one_step(&mut graph, cfg, analysis, ctx, exception_analysis);
 
         if !made_progress {
+            if debug_reduce {
+                eprintln!("[reducer] no progress at iter {}", iterations);
+            }
             // No patterns found - try to make the graph reducible
             if graph.node_count() > 1 {
                 virtualize_edge(&mut graph);
@@ -151,39 +173,53 @@ fn reduce_one_step(
     // These need to be detected BEFORE regular if patterns because each individual
     // condition block in an OR chain can't be collapsed alone (the shared target
     // isn't dominated by any single condition).
+    let debug_reduce = std::env::var("HLBC_DEBUG_REDUCE").is_ok();
+
+    // Build a map from CFG node → loop body for checking loop containment
+    let loop_bodies: Vec<&HashSet<NodeIndex>> = analysis.loops.iter().map(|l| &l.body).collect();
+
     let or_chain_patterns = find_or_chain_patterns(graph, cfg, analysis, ctx);
     if let Some(ocp) = or_chain_patterns.into_iter().next() {
+        if debug_reduce { eprintln!("  → P1: OR chain"); }
         made_progress = collapse_or_chain(graph, cfg, &ocp);
     } else {
-        // Priority 2: Collapse if-then-else patterns that are INSIDE loops first
-        // This ensures nested if-else structures are reduced before their containing loops.
-        // Skip patterns whose condition is a loop header (those are loop conditions, not inner if-else).
-        // Also skip patterns with empty branches (no nodes to collapse beyond condition).
         let if_patterns = find_if_patterns(graph, cfg, analysis);
         if let Some(ip) = if_patterns
             .into_iter()
             .find(|p| {
-                // Skip if the condition node is a loop header
                 let is_loop_header = graph
                     .get_node(p.condition_node)
                     .and_then(|n| n.as_block())
                     .map(|cfg_node| loop_headers.contains(&cfg_node))
                     .unwrap_or(false);
 
-                // Skip if both branches are empty (collapsing would not reduce node count)
-                // Exception: early-return patterns have then_exit_target set even when then_nodes is empty
                 let has_branch_nodes = !p.then_nodes.is_empty() || !p.else_nodes.is_empty();
                 let is_early_return = p.then_exit_target.is_some();
 
-                !is_loop_header && (has_branch_nodes || is_early_return)
+                // Only match if-patterns where the condition is inside a loop body.
+                // Outer conditions that span loops should wait until after loop collapse.
+                let is_inside_loop = graph.get_node(p.condition_node)
+                    .and_then(|n| n.as_block())
+                    .map(|cfg_node| loop_bodies.iter().any(|body| body.contains(&cfg_node)))
+                    .unwrap_or(false);
+
+                !is_loop_header && is_inside_loop && (has_branch_nodes || is_early_return)
             })
         {
+            if debug_reduce {
+                eprintln!("  → P2: if-in-loop cond={:?} then={:?} else={:?} merge={:?}",
+                    ip.condition_node, ip.then_nodes, ip.else_nodes, ip.merge);
+            }
             made_progress = collapse_if(graph, cfg, &ip);
         } else {
-            // Priority 3: Collapse innermost loops
-            // This ensures nested loops are reduced from inside out
             let loop_patterns = find_loop_patterns(graph, cfg, analysis, ctx);
-            // Try each loop pattern until one makes progress
+            if debug_reduce {
+                eprintln!("  → P3: {} loop patterns", loop_patterns.len());
+                for lp in &loop_patterns {
+                    eprintln!("    header={:?} body={:?} exit={:?} kind={:?}",
+                        lp.header, lp.body_nodes.iter().map(|n| n.index()).collect::<Vec<_>>(), lp.exit, lp.kind);
+                }
+            }
             let loop_progress = loop_patterns
                 .into_iter()
                 .find_map(|lp| {
