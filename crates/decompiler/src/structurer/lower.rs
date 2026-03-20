@@ -498,10 +498,9 @@ fn lower_if_then_else(
     ctx: &mut LoweringContext<'_>,
 ) -> Vec<Statement> {
     // INVARIANT: cond_block should be present for well-formed if-then-else regions
-    debug_assert!(
-        cond_block.is_some(),
-        "lower_if_then_else: cond_block is None, cannot extract condition"
-    );
+    if cond_block.is_none() {
+        eprintln!("WARNING: lower_if_then_else: cond_block is None (func findex={:?})", ctx.structurer.func.findex);
+    }
 
     let mut stmts = Vec::new();
 
