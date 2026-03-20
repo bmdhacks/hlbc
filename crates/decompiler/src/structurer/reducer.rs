@@ -240,15 +240,21 @@ fn reduce_one_step(
                     !p.then_nodes.is_empty() || !p.else_nodes.is_empty() || p.then_exit_target.is_some()
                 })
                 {
+                    if debug_reduce {
+                        eprintln!("  → P4: if-else cond={:?} then={:?} else={:?} merge={:?} exit={:?}",
+                            ip.condition_node, ip.then_nodes, ip.else_nodes, ip.merge, ip.then_exit_target);
+                    }
                     made_progress = collapse_if(graph, cfg, &ip);
                 } else {
                     // Priority 5: Collapse switch patterns
                     let switch_patterns = find_switch_patterns(graph, cfg, analysis, ctx);
                     if let Some(sp) = switch_patterns.into_iter().next() {
+                        if debug_reduce { eprintln!("  → P5: switch"); }
                         collapse_switch(graph, cfg, &sp, ctx);
                         made_progress = true;
                     } else {
                         // Priority 6: Collapse linear sequences
+                        if debug_reduce { eprintln!("  → P6: sequences"); }
                         made_progress = collapse_sequences(graph);
                     }
                 }
@@ -448,13 +454,28 @@ fn collapse_if(graph: &mut RegionGraph, cfg: &Cfg, pattern: &IfPattern) -> bool 
         // the collapsed region whose conditional jump leads to the then/else targets.
         // This happens when a sequence of code ending in a conditional gets collapsed
         // (e.g., OR chain + downcast ending in JNull check).
+        //
+        // IMPORTANT: When multiple blocks qualify (e.g., a loop with both header and
+        // body blocks having external exits), pick the one with the HIGHEST start op
+        // (latest in execution). This avoids picking a loop header whose opcodes would
+        // be emitted twice (once inside the loop body, once in the if-else preamble).
         let cfg_nodes = graph.get_cfg_nodes(pattern.condition_node);
         cfg_nodes.and_then(|nodes| {
-            nodes.iter().find(|&&cfg_node| {
-                let succs = cfg.successors(cfg_node);
-                // The exit block has successors outside the collapsed region
-                succs.len() == 2 && succs.iter().any(|s| !nodes.contains(s))
-            }).copied()
+            let mut candidates: Vec<NodeIndex> = nodes.iter()
+                .filter(|&&cfg_node| {
+                    let succs = cfg.successors(cfg_node);
+                    // The exit block has successors outside the collapsed region
+                    succs.len() == 2 && succs.iter().any(|s| !nodes.contains(s))
+                })
+                .copied()
+                .collect();
+            // Sort by start op index (descending) to pick the latest block
+            candidates.sort_by(|a, b| {
+                let a_start = cfg.graph[*a].start;
+                let b_start = cfg.graph[*b].start;
+                b_start.cmp(&a_start)
+            });
+            candidates.first().copied()
         })
     } else {
         None
@@ -1124,12 +1145,26 @@ fn build_region_from_nodes(
     Region::sequence(regions)
 }
 
+/// Get a deterministic sort key for a region graph node.
+///
+/// Returns the minimum CFG node index contained in this region node,
+/// which corresponds to the earliest opcode in the original bytecode.
+/// This ensures deterministic ordering regardless of HashMap iteration order.
+fn region_node_sort_key(graph: &RegionGraph, node: NodeIndex) -> usize {
+    graph.get_cfg_nodes(node)
+        .and_then(|cfg_nodes| cfg_nodes.iter().map(|n| n.index()).min())
+        .unwrap_or(node.index())
+}
+
 /// Order nodes by following the control flow edges using topological sort.
 ///
 /// Returns nodes in execution order (respecting dominance/flow).
 /// Uses Kahn's algorithm with in-degree tracking to ensure proper ordering.
+/// All tie-breaking uses deterministic sort keys (minimum CFG node index)
+/// to avoid non-deterministic output from HashMap iteration order.
 fn order_nodes_by_flow(graph: &RegionGraph, nodes: &HashSet<NodeIndex>) -> Vec<NodeIndex> {
-    use std::collections::VecDeque;
+    use std::collections::BinaryHeap;
+    use std::cmp::Reverse;
 
     if nodes.is_empty() {
         return Vec::new();
@@ -1148,18 +1183,22 @@ fn order_nodes_by_flow(graph: &RegionGraph, nodes: &HashSet<NodeIndex>) -> Vec<N
         })
         .collect();
 
-    // Initialize queue with nodes that have no predecessors in the set
-    let mut queue: VecDeque<NodeIndex> = in_degree
+    // Initialize queue with nodes that have no predecessors in the set.
+    // Use a min-heap keyed by CFG sort key for deterministic ordering.
+    let mut queue: BinaryHeap<Reverse<(usize, NodeIndex)>> = in_degree
         .iter()
         .filter(|(_, &deg)| deg == 0)
-        .map(|(&n, _)| n)
+        .map(|(&n, _)| Reverse((region_node_sort_key(graph, n), n)))
         .collect();
 
     // If no node has in-degree 0, find the one with minimum in-degree
-    // (handles cycles or disconnected components)
+    // (handles cycles or disconnected components).
+    // Use deterministic tie-breaking by sort key.
     if queue.is_empty() {
-        if let Some((&min_node, _)) = in_degree.iter().min_by_key(|(_, &deg)| deg) {
-            queue.push_back(min_node);
+        if let Some((&min_node, _)) = in_degree.iter()
+            .min_by_key(|(&n, &deg)| (deg, region_node_sort_key(graph, n)))
+        {
+            queue.push(Reverse((region_node_sort_key(graph, min_node), min_node)));
             in_degree.insert(min_node, 0); // Mark as processed
         }
     }
@@ -1167,7 +1206,7 @@ fn order_nodes_by_flow(graph: &RegionGraph, nodes: &HashSet<NodeIndex>) -> Vec<N
     let mut ordered = Vec::new();
     let mut visited = HashSet::new();
 
-    while let Some(node) = queue.pop_front() {
+    while let Some(Reverse((_, node))) = queue.pop() {
         if visited.contains(&node) {
             continue;
         }
@@ -1179,18 +1218,20 @@ fn order_nodes_by_flow(graph: &RegionGraph, nodes: &HashSet<NodeIndex>) -> Vec<N
             if let Some(deg) = in_degree.get_mut(&succ) {
                 *deg = deg.saturating_sub(1);
                 if *deg == 0 && !visited.contains(&succ) {
-                    queue.push_back(succ);
+                    queue.push(Reverse((region_node_sort_key(graph, succ), succ)));
                 }
             }
         }
     }
 
     // Add any remaining nodes not yet visited (cycles or disconnected)
-    for &node in nodes {
-        if !visited.contains(&node) {
-            ordered.push(node);
-        }
-    }
+    // Sort deterministically by sort key
+    let mut remaining: Vec<_> = nodes.iter()
+        .filter(|n| !visited.contains(n))
+        .copied()
+        .collect();
+    remaining.sort_by_key(|&n| region_node_sort_key(graph, n));
+    ordered.extend(remaining);
 
     ordered
 }
