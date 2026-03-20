@@ -21,8 +21,9 @@ use crate::ast::{Constant, Expr};
 use crate::exception_analysis::ExceptionAnalysis;
 use crate::lifter::Cfg;
 use crate::structurer::patterns::{
-    find_if_patterns, find_loop_patterns, find_or_chain_patterns, find_switch_patterns,
-    IfPattern, LoopPattern, OrChainPattern, PatternContext, SwitchPattern,
+    find_and_chain_patterns, find_if_patterns, find_loop_patterns, find_or_chain_patterns,
+    find_switch_patterns, AndChainPattern, IfPattern, LoopPattern, OrChainPattern,
+    PatternContext, SwitchPattern,
 };
 use crate::structurer::region::{Region, SwitchCase};
 use crate::structurer::{InlineExpansionCfgMapping, StringSwitchCfgMapping};
@@ -182,6 +183,9 @@ fn reduce_one_step(
     if let Some(ocp) = or_chain_patterns.into_iter().next() {
         if debug_reduce { eprintln!("  → P1: OR chain"); }
         made_progress = collapse_or_chain(graph, cfg, &ocp);
+    } else if let Some(acp) = find_and_chain_patterns(graph, cfg, analysis).into_iter().next() {
+        if debug_reduce { eprintln!("  → P1b: AND chain ({} conditions)", acp.condition_nodes.len()); }
+        made_progress = collapse_and_chain(graph, cfg, &acp);
     } else {
         let if_patterns = find_if_patterns(graph, cfg, analysis);
         if let Some(ip) = if_patterns
@@ -714,6 +718,46 @@ fn collapse_or_chain(graph: &mut RegionGraph, cfg: &Cfg, pattern: &OrChainPatter
         } else {
             false
         }
+    }
+}
+
+/// Collapse an AND chain pattern into a Region::AndChain.
+///
+/// AND chains like `if (a && b && c) { return X; }` compile to multiple condition
+/// blocks that all share the same TRUE target (skip). We collapse the condition
+/// blocks plus the body into a single AndChain region. The skip target becomes
+/// the continuation (successor of the collapsed node).
+///
+/// Returns true if progress was made (nodes were reduced).
+fn collapse_and_chain(graph: &mut RegionGraph, cfg: &Cfg, pattern: &AndChainPattern) -> bool {
+    let condition_cfg_nodes: Vec<NodeIndex> = pattern.condition_nodes.iter()
+        .filter_map(|&node| graph.get_node(node).and_then(|n| n.as_block()))
+        .collect();
+
+    // Build body region
+    let body_region = match graph.get_node(pattern.body) {
+        Some(RegionNode::Block(cfg_idx)) => Region::Block(*cfg_idx),
+        Some(RegionNode::Collapsed(r)) => r.clone(),
+        None => Region::Empty,
+    };
+
+    let and_region = Region::AndChain {
+        condition_blocks: condition_cfg_nodes,
+        body: Box::new(body_region),
+        continuation: pattern.skip_target,
+        last_condition_inverted: pattern.last_condition_inverted,
+    };
+
+    // Collapse: conditions + body. Skip target stays as continuation.
+    let mut nodes_to_collapse = HashSet::new();
+    nodes_to_collapse.extend(pattern.condition_nodes.iter().copied());
+    nodes_to_collapse.insert(pattern.body);
+
+    if nodes_to_collapse.len() >= 2 {
+        graph.collapse(&nodes_to_collapse, and_region);
+        true
+    } else {
+        false
     }
 }
 

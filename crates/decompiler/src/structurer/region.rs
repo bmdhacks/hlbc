@@ -198,6 +198,26 @@ pub enum Region {
         nested_and_chains: std::collections::HashMap<usize, Vec<NodeIndex>>,
     },
 
+    /// An AND chain region: `if (a && b && c) { body }`
+    ///
+    /// This captures multiple consecutive condition blocks where each jumps to
+    /// the skip_target on TRUE (condition fails). The body is executed when all
+    /// conditions pass (the fall-through of the last condition).
+    ///
+    /// This is the dual of OrChain: OR chains share a TRUE target (body),
+    /// AND chains share a TRUE target (skip).
+    AndChain {
+        /// CFG blocks containing the conditions (in order).
+        /// Each block ends with a conditional jump to the skip target on failure.
+        condition_blocks: Vec<NodeIndex>,
+        /// The region executed when all conditions pass.
+        body: Box<Region>,
+        /// Where control goes after the AND chain (the shared skip target).
+        continuation: NodeIndex,
+        /// Whether the last condition is inverted (jumps to body on TRUE).
+        last_condition_inverted: bool,
+    },
+
     /// A goto to handle irreducible control flow.
     /// This is the fallback when proper structuring isn't possible.
     /// During lowering, this emits a labeled statement and goto.
@@ -228,6 +248,7 @@ impl Region {
             }
             Region::TryCatch { try_body, .. } => try_body.entry_node(),
             Region::OrChain { condition_blocks, .. } => condition_blocks.first().copied(),
+            Region::AndChain { condition_blocks, .. } => condition_blocks.first().copied(),
             Region::Goto { target } => Some(*target),
             Region::Empty => None,
         }
@@ -246,6 +267,7 @@ impl Region {
                 merge.or_else(|| catch_body.exit_node())
             }
             Region::OrChain { continuation, .. } => Some(*continuation),
+            Region::AndChain { continuation, .. } => Some(*continuation),
             Region::Goto { target } => Some(*target),
             Region::Empty => None,
         }
@@ -300,6 +322,10 @@ impl Region {
                 // OR chain terminates if the then_region terminates (e.g., throw)
                 // and we know all conditions can be true
                 then_region.terminates(cfg)
+            }
+            Region::AndChain { body, .. } => {
+                // AND chain terminates if the body terminates (e.g., return)
+                body.terminates(cfg)
             }
             Region::Goto { .. } => false,
             Region::Empty => false,
@@ -362,6 +388,10 @@ impl Region {
                     else_r.collect_nodes(nodes);
                 }
             }
+            Region::AndChain { condition_blocks, body, .. } => {
+                nodes.extend(condition_blocks.iter().copied());
+                body.collect_nodes(nodes);
+            }
             Region::Goto { .. } | Region::Empty => {}
         }
     }
@@ -404,6 +434,9 @@ impl Region {
                     .sum();
                 let else_count = else_region.as_ref().map_or(0, |r| r.block_count());
                 condition_blocks.len() + nested_count + then_region.block_count() + else_count
+            }
+            Region::AndChain { condition_blocks, body, .. } => {
+                condition_blocks.len() + body.block_count()
             }
             Region::Goto { .. } | Region::Empty => 0,
         }

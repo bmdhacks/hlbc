@@ -509,6 +509,197 @@ pub struct OrChainPattern {
     pub nested_and_chains: HashMap<usize, Vec<NodeIndex>>,
 }
 
+/// A detected AND chain pattern ready for collapse.
+///
+/// AND chains occur when multiple consecutive condition blocks all jump to the same
+/// "skip" target on TRUE (any condition fails → skip body) while chaining their
+/// FALSE targets (continue checking). This is the dual of OR chains.
+///
+/// `if (a && b && c) { body }; skip_target` compiles to:
+/// ```text
+/// Block 0: if !a jump to SKIP else Block 1
+/// Block 1: if !b jump to SKIP else Block 2
+/// Block 2: if c jump to BODY else SKIP  (last condition may be inverted)
+/// BODY: ...
+/// SKIP: continuation
+/// ```
+///
+/// Example: `if (x == b.x && y == b.y) { return "b"; }` compiles to:
+/// ```text
+/// Block 0: JNotEq x != b.x → SKIP     (TRUE = fail → skip)
+/// Block 1: JNotEq y != b.y → SKIP     (TRUE = fail → skip)
+/// BODY: return "b"                      (fall-through = all passed)
+/// SKIP: next check...
+/// ```
+#[derive(Debug, Clone)]
+pub struct AndChainPattern {
+    /// All condition nodes in the chain (in order).
+    pub condition_nodes: Vec<NodeIndex>,
+
+    /// The shared "skip" target (where failed conditions go).
+    /// This becomes the continuation after the if-and block.
+    pub skip_target: NodeIndex,
+
+    /// The body node (the fall-through of the last condition = success path).
+    pub body: NodeIndex,
+
+    /// Whether the last condition is inverted (jumps to body on TRUE instead of skip).
+    pub last_condition_inverted: bool,
+}
+
+/// Find AND chain patterns in the graph.
+///
+/// AND chains occur when multiple consecutive condition blocks all share the same
+/// "skip" target on TRUE while chaining their FALSE targets. This is the dual of
+/// OR chains: `if (a && b) { body }` vs `if (a || b) { body }`.
+///
+/// Returns patterns with the most condition nodes first (longest chains).
+pub fn find_and_chain_patterns(
+    region_graph: &RegionGraph,
+    cfg: &Cfg,
+    analysis: &CfgAnalysis,
+) -> Vec<AndChainPattern> {
+    let mut patterns = Vec::new();
+    let mut used_nodes: HashSet<NodeIndex> = HashSet::new();
+
+    for start_node in region_graph.node_indices() {
+        if region_graph.get_node(start_node).map_or(true, |n| n.is_collapsed()) {
+            continue;
+        }
+        if used_nodes.contains(&start_node) {
+            continue;
+        }
+
+        if let Some(pattern) = try_build_and_chain(region_graph, cfg, analysis, start_node, &used_nodes) {
+            if pattern.condition_nodes.len() >= 2 {
+                for &node in &pattern.condition_nodes {
+                    used_nodes.insert(node);
+                }
+                patterns.push(pattern);
+            }
+        }
+    }
+
+    patterns.sort_by(|a, b| b.condition_nodes.len().cmp(&a.condition_nodes.len()));
+    patterns
+}
+
+/// Try to build an AND chain starting from a given node.
+fn try_build_and_chain(
+    region_graph: &RegionGraph,
+    cfg: &Cfg,
+    analysis: &CfgAnalysis,
+    start_node: NodeIndex,
+    used_nodes: &HashSet<NodeIndex>,
+) -> Option<AndChainPattern> {
+    let start_cfg_node = region_graph.get_node(start_node)?.as_block()?;
+
+    let succs = cfg.successors_with_edges(start_cfg_node);
+    if succs.len() != 2 {
+        return None;
+    }
+
+    let (true_target, false_target, _) = identify_branches(&succs)?;
+
+    // The true_target is where failed conditions jump (skip target)
+    let skip_target_cfg = true_target;
+
+    // Build the chain: follow false_targets as long as they share the same skip target
+    let mut condition_nodes = vec![start_node];
+    let mut current_false_target = false_target;
+    let mut last_condition_inverted = false;
+
+    loop {
+        let current_region_node = region_graph.get_region_node(current_false_target)?;
+
+        if used_nodes.contains(&current_region_node) {
+            break;
+        }
+        if region_graph.get_node(current_region_node).map_or(true, |n| n.is_collapsed()) {
+            break;
+        }
+
+        let next_succs = cfg.successors_with_edges(current_false_target);
+        if next_succs.len() != 2 {
+            // Not a conditional — this is the body (fall-through of last condition)
+            break;
+        }
+
+        let (next_true_target, next_false_target, _) = match identify_branches(&next_succs) {
+            Some(b) => b,
+            None => break,
+        };
+
+        if next_true_target == skip_target_cfg {
+            // Same skip target — extend the chain
+            condition_nodes.push(current_region_node);
+            current_false_target = next_false_target;
+            last_condition_inverted = false;
+        } else if next_false_target == skip_target_cfg {
+            // Inverted last condition: TRUE → body, FALSE → skip
+            condition_nodes.push(current_region_node);
+            current_false_target = next_true_target; // body is on the true path
+            last_condition_inverted = true;
+            break;
+        } else {
+            // Different targets — end of chain, current_false_target is the body
+            break;
+        }
+    }
+
+    if condition_nodes.len() < 2 {
+        return None;
+    }
+
+    // Reject AND chains where skip_target is a loop back-edge source
+    let back_edge_sources: HashSet<NodeIndex> = analysis.loops.iter()
+        .flat_map(|l| l.back_edge_sources.iter().copied())
+        .collect();
+    if back_edge_sources.contains(&skip_target_cfg) {
+        return None;
+    }
+
+    // The body is the final false_target (where all conditions passed)
+    let body = region_graph.get_region_node(current_false_target)?;
+    let skip_target = region_graph.get_region_node(skip_target_cfg)?;
+
+    // Require the body to terminate (return/throw). Non-terminating AND chain
+    // bodies need merge point handling which the if-pattern detector handles better.
+    let body_terminates = region_graph.get_node(body)
+        .map(|n| n.terminates(cfg))
+        .unwrap_or(false);
+    if !body_terminates {
+        return None;
+    }
+
+    // Reject if the body is the same as the skip_target
+    if body == skip_target {
+        return None;
+    }
+
+    // Verify this is a genuine AND chain, not a misidentified OR chain.
+    // In a genuine AND chain, the body is only reachable from the last condition
+    // in the chain (it's the "success" code). If the body has predecessors from
+    // OUTSIDE the chain (e.g., it's a shared return block), this is likely an
+    // OR chain where TRUE→body means success, not failure.
+    let body_cfg = current_false_target;
+    let chain_cfg_nodes: HashSet<NodeIndex> = condition_nodes.iter()
+        .filter_map(|&n| region_graph.get_node(n).and_then(|n| n.as_block()))
+        .collect();
+    let body_preds = cfg.predecessors(body_cfg);
+    let has_external_preds = body_preds.iter().any(|pred| !chain_cfg_nodes.contains(pred));
+    if has_external_preds {
+        return None;
+    }
+
+    Some(AndChainPattern {
+        condition_nodes,
+        skip_target,
+        body,
+        last_condition_inverted,
+    })
+}
+
 /// Find loop patterns in the graph that can be collapsed.
 ///
 /// Uses the NaturalLoop information from the analyzer. We look for loops

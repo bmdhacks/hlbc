@@ -89,6 +89,12 @@ fn lower_region_inner(region: &Region, ctx: &mut LoweringContext<'_>) -> Vec<Sta
             last_condition_inverted,
             nested_and_chains,
         } => lower_or_chain(condition_blocks, then_region, else_region.as_deref(), *continuation, *last_condition_inverted, nested_and_chains, ctx),
+        Region::AndChain {
+            condition_blocks,
+            body,
+            continuation: _,
+            last_condition_inverted,
+        } => lower_and_chain(condition_blocks, body, *last_condition_inverted, ctx),
         Region::Goto { target } => lower_goto(*target, ctx),
         Region::Empty => Vec::new(),
     }
@@ -974,6 +980,60 @@ fn lower_or_chain(
         cond: compound_cond,
         if_: then_stmts,
         else_: else_stmts,
+    });
+
+    stmts
+}
+
+/// Lower an AND chain region to statements.
+///
+/// AND chains are the dual of OR chains: `if (a && b && c) { body }`.
+/// Each condition jumps to the skip target on TRUE (failure), so we NEGATE
+/// each condition to get the AND semantics. The last condition may be inverted
+/// (jumps to body on TRUE), in which case it's NOT negated.
+fn lower_and_chain(
+    condition_blocks: &[NodeIndex],
+    body: &Region,
+    last_condition_inverted: bool,
+    ctx: &mut LoweringContext<'_>,
+) -> Vec<Statement> {
+    let mut stmts = Vec::new();
+
+    // Collect preamble statements and conditions from each condition block
+    let mut conditions: Vec<Expr> = Vec::new();
+    let num_conditions = condition_blocks.len();
+
+    for (i, &block_node) in condition_blocks.iter().enumerate() {
+        let preamble = ctx.lower_block_opcodes(block_node);
+        stmts.extend(preamble);
+
+        let cond = ctx.extract_condition(block_node);
+
+        if last_condition_inverted && i == num_conditions - 1 {
+            // Last condition is inverted: TRUE → body (direct condition, no negation)
+            conditions.push(cond);
+        } else {
+            // Normal AND condition: TRUE → skip (failure). Negate to get success condition.
+            conditions.push(not(cond));
+        }
+    }
+
+    // Build compound AND condition: cond0 && cond1 && cond2 && ...
+    let compound_cond = if conditions.is_empty() {
+        Expr::Constant(crate::ast::Constant::Bool(true))
+    } else {
+        conditions.into_iter().reduce(|acc, cond| {
+            Expr::Op(crate::ast::Operation::LogicalAnd(Box::new(acc), Box::new(cond)))
+        }).unwrap()
+    };
+
+    // Lower the body
+    let body_stmts = lower_region_inner(body, ctx);
+
+    stmts.push(Statement::IfElse {
+        cond: compound_cond,
+        if_: body_stmts,
+        else_: Vec::new(),
     });
 
     stmts
