@@ -221,6 +221,7 @@ fn reduce_one_step(
     }
 
     // INVARIANT: If we claimed progress, node count must have decreased
+    #[cfg(debug_assertions)]
     debug_assert!(
         !made_progress || graph.node_count() < node_count_before,
         "reduce_one_step claimed progress but node count didn't decrease: {} -> {}",
@@ -340,7 +341,7 @@ fn collapse_loop(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &LoopPattern) -> 
 
 /// Collapse an if-then-else pattern into a Region::IfThenElse node.
 /// Returns true if progress was made (nodes were reduced).
-fn collapse_if(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &IfPattern) -> bool {
+fn collapse_if(graph: &mut RegionGraph, cfg: &Cfg, pattern: &IfPattern) -> bool {
     // INVARIANT: then and else nodes should not overlap
     #[cfg(debug_assertions)]
     {
@@ -406,6 +407,19 @@ fn collapse_if(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &IfPattern) -> bool
     // This is used during lowering to extract the actual condition and emit preamble.
     let cond_block = if let Some(RegionNode::Block(cfg_idx)) = graph.get_node(pattern.condition_node) {
         Some(*cfg_idx)
+    } else if let Some(RegionNode::Collapsed(_)) = graph.get_node(pattern.condition_node) {
+        // For collapsed condition nodes, find the exit block: the CFG block within
+        // the collapsed region whose conditional jump leads to the then/else targets.
+        // This happens when a sequence of code ending in a conditional gets collapsed
+        // (e.g., OR chain + downcast ending in JNull check).
+        let cfg_nodes = graph.get_cfg_nodes(pattern.condition_node);
+        cfg_nodes.and_then(|nodes| {
+            nodes.iter().find(|&&cfg_node| {
+                let succs = cfg.successors(cfg_node);
+                // The exit block has successors outside the collapsed region
+                succs.len() == 2 && succs.iter().any(|s| !nodes.contains(s))
+            }).copied()
+        })
     } else {
         None
     };
@@ -415,9 +429,18 @@ fn collapse_if(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &IfPattern) -> bool
     // from cond_block's terminating conditional jump.
     let cond = Expr::Constant(crate::ast::Constant::Bool(true));
 
+    // For collapsed condition nodes, extract the preamble region so the lowering
+    // phase can emit the collapsed region's statements before the if-statement.
+    let cond_preamble = if let Some(RegionNode::Collapsed(region)) = graph.get_node(pattern.condition_node) {
+        Some(Box::new(region.clone()))
+    } else {
+        None
+    };
+
     let if_region = Region::IfThenElse {
         cond,
         cond_block,
+        cond_preamble,
         then_region: Box::new(then_region),
         else_region: else_region.map(Box::new),
         merge: pattern.merge,
@@ -532,21 +555,18 @@ fn collapse_or_chain(graph: &mut RegionGraph, cfg: &Cfg, pattern: &OrChainPatter
             None => return false,
         };
 
-        // Build then region (shared_target to merge)
-        let then_region = match graph.get_node(pattern.shared_target) {
-            Some(RegionNode::Block(cfg_idx)) => Region::Block(*cfg_idx),
-            Some(RegionNode::Collapsed(r)) => r.clone(),
-            None => Region::Empty,
+        let merge_region_node = match graph.get_region_node(merge_cfg) {
+            Some(n) => n,
+            None => return false,
         };
 
-        // Build else region (continuation to merge)
-        let else_region = match graph.get_node(pattern.continuation) {
-            Some(RegionNode::Block(cfg_idx)) => Region::Block(*cfg_idx),
-            Some(RegionNode::Collapsed(r)) => r.clone(),
-            None => Region::Empty,
-        };
+        // Collect all nodes in the then-branch (shared_target → merge)
+        let then_nodes = collect_path_nodes(graph, pattern.shared_target, merge_region_node);
+        let then_region = build_region_from_nodes(graph, &then_nodes, NodeIndex::new(0));
 
-        let merge = merge_cfg;
+        // Collect all nodes in the else-branch (continuation → merge)
+        let else_nodes = collect_path_nodes(graph, pattern.continuation, merge_region_node);
+        let else_region = build_region_from_nodes(graph, &else_nodes, NodeIndex::new(0));
 
         let if_region = Region::OrChain {
             condition_blocks: condition_cfg_nodes,
@@ -557,14 +577,12 @@ fn collapse_or_chain(graph: &mut RegionGraph, cfg: &Cfg, pattern: &OrChainPatter
             nested_and_chains,
         };
 
-        // Collapse: conditions + shared_target + continuation + merge
+        // Collapse: conditions + then branch + else branch + merge
         let mut nodes_to_collapse = HashSet::new();
         nodes_to_collapse.extend(pattern.condition_nodes.iter().copied());
-        nodes_to_collapse.insert(pattern.shared_target);
-        nodes_to_collapse.insert(pattern.continuation);
-        if let Some(merge_region) = graph.get_region_node(merge) {
-            nodes_to_collapse.insert(merge_region);
-        }
+        nodes_to_collapse.extend(then_nodes.iter().copied());
+        nodes_to_collapse.extend(else_nodes.iter().copied());
+        nodes_to_collapse.insert(merge_region_node);
 
         // Include nested AND chain nodes
         for and_chain in pattern.nested_and_chains.values() {
@@ -874,6 +892,36 @@ fn collapse_string_switch(graph: &mut RegionGraph, _cfg: &Cfg, ss: &StringSwitch
     if !nodes_to_collapse.is_empty() {
         graph.collapse(&nodes_to_collapse, switch_region);
     }
+}
+
+/// Collect all nodes on the path from `start` to `merge` (exclusive of merge).
+/// Used to find all nodes in a branch of an if-else OR chain.
+fn collect_path_nodes(
+    graph: &RegionGraph,
+    start: NodeIndex,
+    merge: NodeIndex,
+) -> HashSet<NodeIndex> {
+    let mut nodes = HashSet::new();
+    let mut queue = vec![start];
+    let mut visited = HashSet::new();
+    visited.insert(merge); // Don't include merge
+
+    while let Some(node) = queue.pop() {
+        if !visited.insert(node) {
+            continue;
+        }
+        if !graph.contains(node) {
+            continue;
+        }
+        nodes.insert(node);
+        for succ in graph.successors(node) {
+            if !visited.contains(&succ) {
+                queue.push(succ);
+            }
+        }
+    }
+
+    nodes
 }
 
 /// Collapse an inline expansion's CFG nodes into a single Sequence region.

@@ -98,6 +98,12 @@ pub enum Region {
         /// any preamble statements before the if-statement.
         cond_block: Option<NodeIndex>,
 
+        /// Optional preamble region to lower before the condition.
+        /// Present when the condition block is part of a larger collapsed region
+        /// (e.g., an OR chain followed by a conditional check). The preamble
+        /// contains all the preceding structured code that must execute first.
+        cond_preamble: Option<Box<Region>>,
+
         /// The "then" branch region (executed when cond is true).
         then_region: Box<Region>,
 
@@ -431,6 +437,7 @@ impl Region {
         Region::IfThenElse {
             cond,
             cond_block,
+            cond_preamble: None,
             then_region: Box::new(then_region),
             else_region: else_region.map(Box::new),
             merge,

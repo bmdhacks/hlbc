@@ -55,11 +55,12 @@ fn lower_region_inner(region: &Region, ctx: &mut LoweringContext<'_>) -> Vec<Sta
         Region::IfThenElse {
             cond,
             cond_block,
+            cond_preamble,
             then_region,
             else_region,
             merge,
             negated,
-        } => lower_if_then_else(cond, *cond_block, then_region, else_region.as_deref(), *merge, *negated, ctx),
+        } => lower_if_then_else(cond, *cond_block, cond_preamble.as_deref(), then_region, else_region.as_deref(), *merge, *negated, ctx),
         Region::Loop {
             kind,
             header,
@@ -429,6 +430,7 @@ fn find_innermost_exit_merge(region: &Region, ctx: &LoweringContext<'_>) -> Opti
 fn lower_if_then_else(
     _cond: &Expr,
     cond_block: Option<NodeIndex>,
+    cond_preamble: Option<&Region>,
     then_region: &Region,
     else_region: Option<&Region>,
     _merge: NodeIndex,
@@ -442,6 +444,14 @@ fn lower_if_then_else(
     );
 
     let mut stmts = Vec::new();
+
+    // If the condition is from a collapsed region, lower the preamble first.
+    // This handles cases like: OR chain → downcast → JNull check, where the
+    // OR chain and downcast are preamble and the JNull is the condition.
+    if let Some(preamble_region) = cond_preamble {
+        let preamble_stmts = lower_region(preamble_region, ctx);
+        stmts.extend(preamble_stmts);
+    }
 
     // Lower the condition block's preamble (non-control-flow opcodes) first.
     // This ensures any setup code runs before the if-statement.

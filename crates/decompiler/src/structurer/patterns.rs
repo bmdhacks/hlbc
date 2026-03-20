@@ -153,21 +153,30 @@ impl<'a> PatternMatcher<'a> {
     ///
     /// This is the region-aware version of `match_if_pattern`.
     pub fn match_if_pattern_region(&mut self, node: NodeIndex) -> Option<IfPattern> {
-        // Get the corresponding CFG node (for opcode lookup only)
-        let cfg_node = self.region_graph.get_node(node)?.as_block()?;
+        let region_node = self.region_graph.get_node(node)?;
+        let is_collapsed = region_node.is_collapsed();
 
-        // Must have exactly 2 successors in the CFG
-        let cfg_succs = self.cfg.successors_with_edges(cfg_node);
-        if cfg_succs.len() != 2 {
-            return None;
-        }
-
-        // Identify then and else branches
-        let (then_cfg_target, else_cfg_target, negated) = identify_branches(&cfg_succs)?;
-
-        // Map CFG targets to RegionGraph nodes
-        let then_target = self.region_graph.cfg_owner(then_cfg_target)?;
-        let else_target = self.region_graph.cfg_owner(else_cfg_target)?;
+        // Get then/else targets and negation flag
+        let (then_target, else_target, negated, then_cfg_target_opt) = if !is_collapsed {
+            // Block node: use CFG edges for branch identification
+            let cfg_node = region_node.as_block()?;
+            let cfg_succs = self.cfg.successors_with_edges(cfg_node);
+            if cfg_succs.len() != 2 {
+                return None;
+            }
+            let (then_cfg_target, else_cfg_target, negated) = identify_branches(&cfg_succs)?;
+            let then_target = self.region_graph.cfg_owner(then_cfg_target)?;
+            let else_target = self.region_graph.cfg_owner(else_cfg_target)?;
+            (then_target, else_target, negated, Some(then_cfg_target))
+        } else {
+            // Collapsed node: use region graph edges for branch identification
+            let region_succs = self.region_graph.successors_with_edges(node);
+            if region_succs.len() != 2 {
+                return None;
+            }
+            let (then_target, else_target, negated) = identify_branches(&region_succs)?;
+            (then_target, else_target, negated, None)
+        };
 
         // Check termination using RegionGraph nodes
         let then_terminates = self.region_graph.get_node(then_target)
@@ -267,7 +276,7 @@ impl<'a> PatternMatcher<'a> {
             && then_terminates
             && is_one_branch_early_return
         {
-            Some(then_cfg_target)
+            then_cfg_target_opt
         } else {
             None
         };
@@ -868,12 +877,7 @@ pub fn find_if_patterns(
     let nodes = region_graph.nodes_in_reverse_postorder();
 
     for node in nodes {
-        // Skip already-collapsed nodes
-        if region_graph.get_node(node).map_or(true, |n| n.is_collapsed()) {
-            continue;
-        }
-
-        // Use the new region-aware pattern matching
+        // Use the new region-aware pattern matching (handles both blocks and collapsed nodes)
         if let Some(pattern) = matcher.match_if_pattern_region(node) {
             patterns.push(pattern);
         }
