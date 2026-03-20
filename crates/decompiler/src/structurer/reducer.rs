@@ -461,15 +461,27 @@ fn collapse_if(graph: &mut RegionGraph, cfg: &Cfg, pattern: &IfPattern) -> bool 
         // be emitted twice (once inside the loop body, once in the if-else preamble).
         let cfg_nodes = graph.get_cfg_nodes(pattern.condition_node);
         cfg_nodes.and_then(|nodes| {
+            // Primary: blocks with 2 successors where at least one exits the region
             let mut candidates: Vec<NodeIndex> = nodes.iter()
                 .filter(|&&cfg_node| {
                     let succs = cfg.successors(cfg_node);
-                    // The exit block has successors outside the collapsed region
                     succs.len() == 2 && succs.iter().any(|s| !nodes.contains(s))
                 })
                 .copied()
                 .collect();
-            // Sort by start op index (descending) to pick the latest block
+
+            // Fallback: when all successors are internal (deeply nested collapses),
+            // find any block with 2 CFG successors (i.e., ends in a conditional jump).
+            if candidates.is_empty() {
+                candidates = nodes.iter()
+                    .filter(|&&cfg_node| cfg.successors(cfg_node).len() == 2)
+                    .copied()
+                    .collect();
+            }
+
+            // Sort by start op index (descending) to pick the latest block.
+            // This avoids picking a loop header whose opcodes would be emitted
+            // twice (once inside the loop body, once in the if-else preamble).
             candidates.sort_by(|a, b| {
                 let a_start = cfg.graph[*a].start;
                 let b_start = cfg.graph[*b].start;
