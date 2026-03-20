@@ -921,7 +921,16 @@ impl Constant {
                 Ok(())
             }
             Float(c) => {
-                EnhancedFmt.fmt_reffloat(f, code, c)?;
+                // Ensure float literals always contain a decimal point for Haxe.
+                // Rust's Display for f64 outputs "0" instead of "0.0" for integer-valued
+                // floats, which makes Haxe infer the type as Int instead of Float.
+                let val = code[c];
+                let formatted = format!("{}", val);
+                if val.is_finite() && !formatted.contains('.') && !formatted.contains('e') && !formatted.contains('E') {
+                    write!(f, "{}.0", formatted)?;
+                } else {
+                    write!(f, "{}", formatted)?;
+                }
                 if show_indices {
                     write!(f, " /* float@{} */", c.0)?;
                 }

@@ -1704,23 +1704,52 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::SetMem { bytes, index, src } => {
-                // Always unshift the index if it was tracked
-                let index_expr = if let Some((orig_expr, _shift)) = self.shifted_indices.get(index).cloned() {
-                    orig_expr
-                } else {
-                    self.reg_to_expr(*index)
-                };
-
                 let value_expr = self.reg_to_expr(*src);
+
+                // Check src register type to determine the correct Bytes method
+                let src_type = &self.code[self.get_type_ref(*src)];
+                let is_float = matches!(src_type, hlbc::types::Type::F64 | hlbc::types::Type::F32);
 
                 // Determine the target (array or raw bytes)
                 // Use the stored expression which has the correct SSA version
                 if let Some(array_expr) = self.array_bytes_source.get(bytes).cloned() {
                     // Bytes came from an array - use array[index] = value syntax
+                    // Always unshift the index for array element access
+                    let index_expr = if let Some((orig_expr, _shift)) = self.shifted_indices.get(index).cloned() {
+                        orig_expr
+                    } else {
+                        self.reg_to_expr(*index)
+                    };
                     let target = Expr::Array(Box::new(array_expr), Box::new(index_expr));
                     Some(self.make_assign(target, value_expr))
+                } else if is_float {
+                    // Float SetMem to raw bytes — use setDouble/setFloat with byte offset.
+                    // Reconstruct byte offset from shifted_indices if available.
+                    let byte_index_expr = if let Some((orig_expr, shift)) = self.shifted_indices.get(index).cloned() {
+                        // Reconstruct: orig_expr << shift
+                        Expr::Op(crate::ast::Operation::Shl(
+                            Box::new(orig_expr),
+                            Box::new(Expr::Constant(Constant::InlineInt(shift as usize))),
+                        ))
+                    } else {
+                        self.reg_to_expr(*index)
+                    };
+                    let bytes_expr = self.reg_to_expr(*bytes);
+                    let method_name = if matches!(src_type, hlbc::types::Type::F64) {
+                        "setDouble"
+                    } else {
+                        "setFloat"
+                    };
+                    let method = Expr::Field(Box::new(bytes_expr), method_name.into());
+                    let call = Call::new(method, vec![byte_index_expr, value_expr]);
+                    Some(Statement::ExprStatement(Expr::Call(Box::new(call))))
                 } else {
-                    // Raw bytes - use bytes.set(index, value) syntax
+                    // Integer SetMem to raw bytes - use bytes.set(index, value) syntax
+                    let index_expr = if let Some((orig_expr, _shift)) = self.shifted_indices.get(index).cloned() {
+                        orig_expr
+                    } else {
+                        self.reg_to_expr(*index)
+                    };
                     let bytes_expr = self.reg_to_expr(*bytes);
                     let method = Expr::Field(Box::new(bytes_expr), "set".into());
                     let call = Call::new(method, vec![index_expr, value_expr]);
