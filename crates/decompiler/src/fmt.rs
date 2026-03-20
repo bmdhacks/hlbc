@@ -595,6 +595,8 @@ pub fn to_haxe_type<'a>(ty: &Type, ctx: &'a Bytecode) -> Str {
                 "hl.types.ArrayBytes_Float" | "hl.types.ArrayBytes_Single" | "hl.types.ArrayBytes_hl_F64" | "hl.types.ArrayBytes_hl_F32" => Str::from_static("Array<Float>"),
                 "hl.types.ArrayObj" => Str::from_static("Array<Dynamic>"),
                 "hl.types.ArrayDyn" => Str::from_static("Array<Dynamic>"),
+                "hl.Class" => Str::from_static("Class<Dynamic>"),
+                "hl.Enum" => Str::from_static("Enum<Dynamic>"),
                 _ => {
                     // Fix nested type names with underscore-prefixed module containers
                     // E.g., "hxsl._Splitter.VarProps" → "hxsl.Splitter.VarProps"
@@ -888,12 +890,7 @@ impl Method {
                     let name_idx = i - skip_params;
                     let arg_name = fun.arg_name(ctx, name_idx).unwrap_or(Str::from("_"));
                     let type_str = to_haxe_type_in_context(&ctx[*arg], ctx, current_class);
-                    // Omit ": Dynamic" since that's the default in Haxe
-                    if type_str == "Dynamic" {
-                        arg_name.to_string()
-                    } else {
-                        format!("{}: {}", arg_name, type_str)
-                    }
+                    format!("{}: {}", arg_name, type_str)
                 }))}
             ")" if let Some(ref ret_type) = ret_type_str { ": "{ret_type} } " {"
 

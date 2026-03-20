@@ -20,8 +20,9 @@ use petgraph::graph::NodeIndex;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
+use hlbc::opcodes::Opcode;
 use hlbc::types::{Function, Reg, RefFun, RefString, RefType, Type};
-use hlbc::{Bytecode, Str};
+use hlbc::{Bytecode, Resolve, Str};
 
 use crate::analyzer::CfgAnalysis;
 use crate::ast::Expr;
@@ -96,6 +97,15 @@ pub(crate) struct StringSwitchRegion {
     pub(crate) cases: Vec<StringSwitchCase>,
     /// Opcode index of the default case handler
     pub(crate) default_op: usize,
+}
+
+/// CFG-level mapping for an inline expansion (addByte, addInt32, downcast).
+/// Maps the opcode range to the set of CFG nodes it spans, so the reducer
+/// can pre-collapse them before the main reduction loop.
+#[derive(Debug, Clone)]
+pub struct InlineExpansionCfgMapping {
+    /// All CFG nodes that contain opcodes from this expansion
+    pub nodes: HashSet<NodeIndex>,
 }
 
 /// CFG-level mapping for a string switch region
@@ -216,6 +226,10 @@ pub struct Structurer<'a> {
     /// When New is seen, we store the info here instead of emitting.
     /// When the constructor Call is seen, we emit the full new Type(args) statement.
     pub(crate) pending_constructors: HashMap<Reg, (RefType, usize)>,
+    /// Detected inline expansion patterns (addByte, addInt32, downcast, etc.)
+    pub(crate) inline_expansions: Vec<idioms::InlineExpansion>,
+    /// Opcodes that are part of inline expansions (to suppress during block lowering)
+    pub(crate) inline_expansion_opcodes: HashSet<usize>,
 }
 
 impl<'a> Structurer<'a> {
@@ -291,6 +305,11 @@ impl<'a> Structurer<'a> {
             }
         };
 
+        let inline_expansions = idioms::detect_inline_expansions(code, func);
+        let inline_expansion_opcodes: HashSet<usize> = inline_expansions.iter()
+            .flat_map(|e| e.start_op..=e.end_op)
+            .collect();
+
         Structurer {
             code,
             func,
@@ -322,14 +341,16 @@ impl<'a> Structurer<'a> {
             current_ssa_dst: None,
             current_ssa_uses: Vec::new(),
             string_switches: Self::detect_string_switches(code, func),
-            string_switch_cfg_mappings: Vec::new(),  // Populated by build_string_switch_cfg_mappings after CFG is available
-            string_switch_opcodes: HashSet::new(),  // Populated by build_string_switch_cfg_mappings
+            string_switch_cfg_mappings: Vec::new(),
+            string_switch_opcodes: HashSet::new(),
             current_loop_header: None,
             inline_exprs: RefCell::new(HashMap::new()),
             suppressed_ops: HashSet::new(),
             enum_param_bindings: HashMap::new(),
             actually_used_vars: HashSet::new(),
             pending_constructors: HashMap::new(),
+            inline_expansions,
+            inline_expansion_opcodes,
         }
     }
 
@@ -432,6 +453,126 @@ impl<'a> Structurer<'a> {
             default_node,
             switch_arg_reg: ss.switch_arg_reg,
         })
+    }
+
+    /// Build CFG-level mappings for detected inline expansions.
+    /// Only includes CFG blocks that are FULLY contained within the expansion range.
+    /// Blocks that partially overlap (e.g., a GetThis before the NullCheck) are excluded
+    /// to prevent absorbing non-expansion code.
+    pub fn build_inline_expansion_cfg_mappings(&self) -> Vec<InlineExpansionCfgMapping> {
+        self.inline_expansions.iter().map(|exp| {
+            let mut candidate_nodes = HashSet::new();
+            for op_idx in exp.start_op..=exp.end_op {
+                if let Some(&cfg_node) = self.cfg.op_to_block.get(&op_idx) {
+                    candidate_nodes.insert(cfg_node);
+                }
+            }
+
+            // Filter: only keep nodes whose ALL ops are within the expansion range
+            let nodes = candidate_nodes.into_iter().filter(|&cfg_node| {
+                if let Some(block) = self.cfg.graph.node_weight(cfg_node) {
+                    block.start >= exp.start_op && block.end <= exp.end_op
+                } else {
+                    false
+                }
+            }).collect();
+
+            InlineExpansionCfgMapping { nodes }
+        }).collect()
+    }
+
+    /// Emit a synthetic method call for a detected inline expansion.
+    ///
+    /// Replaces the inlined bytecode with a clean method call like `buf.addByte(value)`.
+    pub(crate) fn emit_inline_expansion_call(&mut self, exp: &idioms::InlineExpansion) -> Vec<crate::ast::Statement> {
+        use crate::ast::{Call, Expr, Statement};
+
+        match &exp.kind {
+            idioms::InlineExpansionKind::AddByte | idioms::InlineExpansionKind::AddInt32 => {
+                let method_name = match &exp.kind {
+                    idioms::InlineExpansionKind::AddByte => "addByte",
+                    idioms::InlineExpansionKind::AddInt32 => "addInt32",
+                    _ => unreachable!(),
+                };
+                // Resolve obj_reg from the first Field op in the expansion (which uses buf as obj)
+                // and value_reg from the end (where the written value is in scope).
+                // Skip NullCheck at start since it may not have SSA uses for the reg.
+                let saved_op = self.current_op;
+
+                // Find the first Field op that uses obj_reg
+                let field_op = (exp.start_op..=exp.end_op).find(|&op_idx| {
+                    matches!(self.func.ops.get(op_idx), Some(Opcode::Field { obj, .. }) if *obj == exp.obj_reg)
+                }).unwrap_or(exp.start_op);
+                self.current_op = field_op;
+                if let Some((dst, uses)) = self.ssa.get_instr_for_op(field_op) {
+                    self.current_ssa_dst = dst;
+                    self.current_ssa_uses = uses.to_vec();
+                }
+                let obj = self.reg_to_expr(exp.obj_reg);
+
+                self.current_op = exp.end_op;
+                if let Some((dst, uses)) = self.ssa.get_instr_for_op(exp.end_op) {
+                    self.current_ssa_dst = dst;
+                    self.current_ssa_uses = uses.to_vec();
+                }
+                let val = if let Some(ref_int) = exp.value_const {
+                    Expr::Constant(crate::ast::Constant::Int(ref_int))
+                } else {
+                    self.reg_to_expr(exp.value_reg)
+                };
+
+                self.current_op = saved_op;
+                let call = Call {
+                    fun: Expr::Field(Box::new(obj), method_name.into()),
+                    args: vec![val],
+                };
+                vec![Statement::ExprStatement(Expr::Call(Box::new(call)))]
+            }
+            idioms::InlineExpansionKind::Downcast { class_global, result_reg } => {
+                let saved_op = self.current_op;
+
+                // Resolve value_reg from the Call2 op (exp.start_op + 1)
+                self.current_op = exp.start_op + 1;
+                if let Some((dst, uses)) = self.ssa.get_instr_for_op(self.current_op) {
+                    self.current_ssa_dst = dst;
+                    self.current_ssa_uses = uses.to_vec();
+                }
+                let val = self.reg_to_expr(exp.value_reg);
+
+                // Resolve result_reg from the cast op (exp.start_op + 3)
+                // where the result register is defined with its debug name
+                self.current_op = exp.start_op + 3;
+                if let Some((dst, uses)) = self.ssa.get_instr_for_op(self.current_op) {
+                    self.current_ssa_dst = dst;
+                    self.current_ssa_uses = uses.to_vec();
+                }
+                let var = self.reg_to_expr_dst(*result_reg);
+
+                self.current_op = saved_op;
+
+                // Get the class name from the global's type
+                let class_name = if let Some(type_ref) = self.code.globals.get(class_global.0) {
+                    if let Some(Type::Obj(obj)) = self.code.types.get(type_ref.0) {
+                        let name = self.code.get(obj.name);
+                        // Strip $ prefix from companion type name
+                        let clean = name.replace(".$", ".").replace('$', "");
+                        clean
+                    } else {
+                        "Dynamic".to_string()
+                    }
+                } else {
+                    "Dynamic".to_string()
+                };
+                let call = Call {
+                    fun: Expr::Field(
+                        Box::new(Expr::Ident("Std".into())),
+                        "downcast".into(),
+                    ),
+                    args: vec![val, Expr::Ident(class_name.into())],
+                };
+                vec![self.make_assign(var, Expr::Call(Box::new(call)))]
+            }
+        }
     }
 }
 

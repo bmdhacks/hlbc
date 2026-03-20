@@ -12,11 +12,12 @@
 use std::collections::{HashMap, HashSet};
 
 use hlbc::opcodes::Opcode;
-use hlbc::types::{Function, Reg, RefFun, RefField, RefString, RefType, Type};
+use hlbc::types::{Function, Reg, RefFun, RefField, RefString, RefType, RefGlobal, Type};
 use hlbc::{Bytecode, Resolve};
 
 use crate::ast::{Constant, Expr};
 use crate::ssa::get_dst_reg as get_opcode_dst;
+use hlbc::types::RefInt;
 
 use super::{StringSwitchCase, StringSwitchRegion, Structurer};
 
@@ -619,4 +620,481 @@ impl<'a> Structurer<'a> {
         // If we didn't find any use within the search range, it's probably safe
         false
     }
+}
+
+// ============================================================================
+// Inline Expansion Detection
+// ============================================================================
+
+/// A detected inlined stdlib method expansion.
+/// These represent compiler-generated inline expansions of methods like
+/// BytesBuffer.addByte() that should be lifted back to method calls.
+#[derive(Debug, Clone)]
+pub(crate) struct InlineExpansion {
+    /// First opcode index of the expansion
+    pub start_op: usize,
+    /// Last opcode index (inclusive)
+    pub end_op: usize,
+    /// The kind of inlined method
+    pub kind: InlineExpansionKind,
+    /// Register holding the buffer/object
+    pub obj_reg: Reg,
+    /// Register holding the value being written (or result for downcast)
+    pub value_reg: Reg,
+    /// If the value is a constant loaded inside the expansion (Int opcode),
+    /// store the RefInt here so we can emit it directly.
+    pub value_const: Option<RefInt>,
+}
+
+/// The kind of inlined expansion detected.
+#[derive(Debug, Clone)]
+pub(crate) enum InlineExpansionKind {
+    /// BytesBuffer.addByte(value) — ~12 ops with JNotEq capacity check
+    AddByte,
+    /// BytesBuffer.addInt32(value) — ~16 ops with JSGte capacity check
+    AddInt32,
+    /// Std.downcast(value, Class) — 7 ops with check + conditional cast
+    Downcast { class_global: RefGlobal, result_reg: Reg },
+}
+
+/// Detect inlined stdlib method expansions in a function's bytecode.
+///
+/// Scans the opcode stream for known patterns emitted by the Haxe compiler
+/// when inlining BytesBuffer.addByte(), addInt32(), Std.downcast(), etc.
+///
+/// Returns detected expansions sorted by start_op (ascending).
+pub(crate) fn detect_inline_expansions(code: &Bytecode, func: &Function) -> Vec<InlineExpansion> {
+    let mut expansions = Vec::new();
+    let ops = &func.ops;
+
+    let mut i = 0;
+    while i < ops.len() {
+        // Try each pattern in order. On match, skip past the expansion.
+        if let Some(exp) = try_detect_add_byte_at(code, func, i) {
+            let end = exp.end_op;
+            expansions.push(exp);
+            i = end + 1;
+        } else if let Some(exp) = try_detect_add_int32_at(code, func, i) {
+            let end = exp.end_op;
+            expansions.push(exp);
+            i = end + 1;
+        } else if let Some(exp) = try_detect_downcast_at(code, func, i) {
+            let end = exp.end_op;
+            expansions.push(exp);
+            i = end + 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    expansions
+}
+
+/// Check if a register's type is haxe.io.BytesBuffer.
+fn is_bytes_buffer_type(code: &Bytecode, func: &Function, reg: Reg) -> bool {
+    let reg_idx = reg.0 as usize;
+    if reg_idx >= func.regs.len() {
+        return false;
+    }
+    let type_ref = func.regs[reg_idx];
+    if let Some(Type::Obj(obj)) = code.types.get(type_ref.0) {
+        let name = code.get(obj.name);
+        name.as_ref() == "haxe.io.BytesBuffer"
+    } else {
+        false
+    }
+}
+
+/// Check if a function reference is named "__expand".
+fn is_expand_fn(code: &Bytecode, fun: RefFun) -> bool {
+    if let Some(func) = fun.as_fn(code) {
+        if let Some(name) = code.strings.get(func.name.0) {
+            return name == "__expand";
+        }
+    }
+    false
+}
+
+/// Try to detect BytesBuffer.addByte(value) inline expansion at position `i`.
+///
+/// Pattern (12 ops, optional NullCheck before):
+/// ```text
+/// [NullCheck  bufReg]                    ; optional, included if present
+/// Field       posReg = bufReg.pos
+/// Field       sizeReg = bufReg.size
+/// JNotEq      if posReg != sizeReg → SKIP
+/// Int         tmpReg = 0
+/// Call2       _ = __expand(bufReg, tmpReg)
+/// SKIP:
+/// Field       bytesReg = bufReg.b
+/// Field       posReg2 = bufReg.pos
+/// Mov         idxReg = posReg2
+/// Incr        posReg2++
+/// SetField    bufReg.pos = posReg2
+/// SetI8       bytesReg[idxReg] = valueReg
+/// ```
+fn try_detect_add_byte_at(code: &Bytecode, func: &Function, i: usize) -> Option<InlineExpansion> {
+    let ops = &func.ops;
+
+    // Check for optional leading NullCheck
+    let (start, j) = if let Some(Opcode::NullCheck { reg }) = ops.get(i) {
+        // NullCheck must target a BytesBuffer register
+        if is_bytes_buffer_type(code, func, *reg) {
+            (i, i + 1)
+        } else {
+            (i, i) // Not our NullCheck, start pattern at i
+        }
+    } else {
+        (i, i)
+    };
+
+    // Need at least 12 ops from j
+    if j + 11 >= ops.len() {
+        return None;
+    }
+
+    // Op j+0: Field posReg = bufReg.pos
+    let (pos_reg, buf_reg) = match &ops[j] {
+        Opcode::Field { dst, obj, .. } => (*dst, *obj),
+        _ => return None,
+    };
+
+    // Verify bufReg is BytesBuffer
+    if !is_bytes_buffer_type(code, func, buf_reg) {
+        return None;
+    }
+
+    // Op j+1: Field sizeReg = bufReg.size (same buf)
+    let size_reg = match &ops[j + 1] {
+        Opcode::Field { dst, obj, .. } if *obj == buf_reg => *dst,
+        _ => return None,
+    };
+
+    // Op j+2: JNotEq posReg != sizeReg → skip over Int+Call2 (offset=2, target = j+2+2+1 = j+5)
+    match &ops[j + 2] {
+        Opcode::JNotEq { a, b, offset } => {
+            if !({*a == pos_reg && *b == size_reg} || {*a == size_reg && *b == pos_reg}) {
+                return None;
+            }
+            if *offset != 2 {
+                return None; // Unexpected jump distance
+            }
+        }
+        _ => return None,
+    }
+
+    // Op j+3: Int tmpReg = 0
+    match &ops[j + 3] {
+        Opcode::Int { .. } => {} // Value must be 0, but we trust the pattern shape
+        _ => return None,
+    }
+
+    // Op j+4: Call2 _ = __expand(bufReg, tmpReg)
+    match &ops[j + 4] {
+        Opcode::Call2 { fun, arg0, .. } if *arg0 == buf_reg && is_expand_fn(code, *fun) => {}
+        _ => return None,
+    }
+
+    // Op j+5: Field bytesReg = bufReg.b
+    let bytes_reg = match &ops[j + 5] {
+        Opcode::Field { dst, obj, .. } if *obj == buf_reg => *dst,
+        _ => return None,
+    };
+
+    // Op j+6: Field posReg2 = bufReg.pos
+    let pos_reg2 = match &ops[j + 6] {
+        Opcode::Field { dst, obj, .. } if *obj == buf_reg => *dst,
+        _ => return None,
+    };
+
+    // Op j+7: Mov idxReg = posReg2
+    let idx_reg = match &ops[j + 7] {
+        Opcode::Mov { dst, src } if *src == pos_reg2 => *dst,
+        _ => return None,
+    };
+
+    // Op j+8: Incr posReg2++
+    match &ops[j + 8] {
+        Opcode::Incr { dst } if *dst == pos_reg2 => {}
+        _ => return None,
+    }
+
+    // Op j+9: SetField bufReg.pos = posReg2
+    match &ops[j + 9] {
+        Opcode::SetField { obj, src, .. } if *obj == buf_reg && *src == pos_reg2 => {}
+        _ => return None,
+    }
+
+    // Op j+10: SetI8 directly, or Int (value load) followed by SetI8 at j+11.
+    // The compiler may load a constant value right before the SetI8.
+    if let Some(Opcode::SetI8 { bytes, index, src }) = ops.get(j + 10) {
+        if *bytes == bytes_reg && *index == idx_reg {
+            return Some(InlineExpansion {
+                start_op: start,
+                end_op: j + 10,
+                kind: InlineExpansionKind::AddByte,
+                obj_reg: buf_reg,
+                value_reg: *src,
+                value_const: None,
+            });
+        }
+    }
+
+    // Try j+10: Int (value constant), j+11: SetI8
+    if j + 11 < ops.len() {
+        if let Opcode::Int { dst: _, ptr } = &ops[j + 10] {
+            if let Some(Opcode::SetI8 { bytes, index, src }) = ops.get(j + 11) {
+                if *bytes == bytes_reg && *index == idx_reg {
+                    return Some(InlineExpansion {
+                        start_op: start,
+                        end_op: j + 11,
+                        kind: InlineExpansionKind::AddByte,
+                        obj_reg: buf_reg,
+                        value_reg: *src,
+                        value_const: Some(*ptr),
+                    });
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Try to detect BytesBuffer.addInt32(value) inline expansion at position `i`.
+///
+/// Pattern (~16 ops):
+/// ```text
+/// [NullCheck  bufReg]
+/// Field       posReg = bufReg.pos
+/// Int         fourReg = 4
+/// Add         sumReg = posReg + fourReg
+/// Field       sizeReg = bufReg.size
+/// JSGte       if sizeReg >= sumReg → SKIP
+/// Int         tmpReg = 0
+/// Call2       _ = __expand(bufReg, tmpReg)
+/// SKIP:
+/// Field       bytesReg = bufReg.b
+/// Field       posReg2 = bufReg.pos
+/// SetMem      bytesReg[posReg2] = valueReg
+/// Field       posReg3 = bufReg.pos
+/// Int         fourReg2 = 4
+/// Add         newPosReg = posReg3 + fourReg2
+/// SetField    bufReg.pos = newPosReg
+/// ```
+fn try_detect_add_int32_at(code: &Bytecode, func: &Function, i: usize) -> Option<InlineExpansion> {
+    let ops = &func.ops;
+
+    // Check for optional leading NullCheck
+    let (start, j) = if let Some(Opcode::NullCheck { reg }) = ops.get(i) {
+        if is_bytes_buffer_type(code, func, *reg) {
+            (i, i + 1)
+        } else {
+            (i, i)
+        }
+    } else {
+        (i, i)
+    };
+
+    // Need at least 15 ops from j
+    if j + 14 >= ops.len() {
+        return None;
+    }
+
+    // Op j+0: Field posReg = bufReg.pos
+    let (pos_reg, buf_reg) = match &ops[j] {
+        Opcode::Field { dst, obj, .. } => (*dst, *obj),
+        _ => return None,
+    };
+
+    if !is_bytes_buffer_type(code, func, buf_reg) {
+        return None;
+    }
+
+    // Op j+1: Int fourReg = 4
+    let four_reg = match &ops[j + 1] {
+        Opcode::Int { dst, .. } => *dst, // Trust the value is 4
+        _ => return None,
+    };
+
+    // Op j+2: Add sumReg = posReg + fourReg
+    let sum_reg = match &ops[j + 2] {
+        Opcode::Add { dst, a, b } if *a == pos_reg && *b == four_reg => *dst,
+        _ => return None,
+    };
+
+    // Op j+3: Field sizeReg = bufReg.size
+    let size_reg = match &ops[j + 3] {
+        Opcode::Field { dst, obj, .. } if *obj == buf_reg => *dst,
+        _ => return None,
+    };
+
+    // Op j+4: JSGte if sizeReg >= sumReg → SKIP (offset=2, target = j+4+2+1 = j+7)
+    match &ops[j + 4] {
+        Opcode::JSGte { a, b, offset } if *a == size_reg && *b == sum_reg && *offset == 2 => {}
+        _ => return None,
+    }
+
+    // Op j+5: Int tmpReg = 0
+    match &ops[j + 5] {
+        Opcode::Int { .. } => {}
+        _ => return None,
+    }
+
+    // Op j+6: Call2 _ = __expand(bufReg, _)
+    match &ops[j + 6] {
+        Opcode::Call2 { fun, arg0, .. } if *arg0 == buf_reg && is_expand_fn(code, *fun) => {}
+        _ => return None,
+    }
+
+    // Op j+7: Field bytesReg = bufReg.b
+    let bytes_reg = match &ops[j + 7] {
+        Opcode::Field { dst, obj, .. } if *obj == buf_reg => *dst,
+        _ => return None,
+    };
+
+    // Op j+8: Field posReg2 = bufReg.pos
+    let pos_reg2 = match &ops[j + 8] {
+        Opcode::Field { dst, obj, .. } if *obj == buf_reg => *dst,
+        _ => return None,
+    };
+
+    // Op j+9: SetMem bytesReg[posReg2] = valueReg
+    let value_reg = match &ops[j + 9] {
+        Opcode::SetMem { bytes, index, src } if *bytes == bytes_reg && *index == pos_reg2 => *src,
+        _ => return None,
+    };
+
+    // Op j+10: Field posReg3 = bufReg.pos
+    match &ops[j + 10] {
+        Opcode::Field { obj, .. } if *obj == buf_reg => {}
+        _ => return None,
+    }
+
+    // Op j+11: Int _ = 4
+    match &ops[j + 11] {
+        Opcode::Int { .. } => {}
+        _ => return None,
+    }
+
+    // Op j+12: Add newPos = pos + 4
+    let new_pos_reg = match &ops[j + 12] {
+        Opcode::Add { dst, .. } => *dst,
+        _ => return None,
+    };
+
+    // Op j+13: SetField bufReg.pos = newPosReg
+    match &ops[j + 13] {
+        Opcode::SetField { obj, src, .. } if *obj == buf_reg && *src == new_pos_reg => {}
+        _ => return None,
+    }
+
+    Some(InlineExpansion {
+        start_op: start,
+        end_op: j + 13,
+        kind: InlineExpansionKind::AddInt32,
+        obj_reg: buf_reg,
+        value_reg,
+        value_const: None,
+    })
+}
+
+/// Try to detect Std.downcast(value, Class) inline expansion at position `i`.
+///
+/// Pattern (7 ops):
+/// ```text
+/// GetGlobal   classReg = global@N
+/// Call2       boolReg = check(classReg, valueReg)
+/// JFalse      if boolReg == false → NULL_LABEL (+3)
+/// ToVirtual   resultReg = cast valueReg   (or SafeCast/UnsafeCast)
+/// JAlways     → END_LABEL (+1)
+/// Null        resultReg = null
+/// ```
+fn try_detect_downcast_at(code: &Bytecode, func: &Function, i: usize) -> Option<InlineExpansion> {
+    let ops = &func.ops;
+
+    // Need at least 6 ops from i
+    if i + 5 >= ops.len() {
+        return None;
+    }
+
+    // Op i+0: GetGlobal classReg = global@N
+    let (class_reg, class_global) = match &ops[i] {
+        Opcode::GetGlobal { dst, global } => (*dst, *global),
+        _ => return None,
+    };
+
+    // Verify the global is a $-prefixed class companion type
+    // The global's type should be an Obj type with a $ prefix in its name
+    let global_type_ref = if let Some(ty) = code.globals.get(class_global.0) {
+        *ty
+    } else {
+        return None;
+    };
+    if let Some(Type::Obj(obj)) = code.types.get(global_type_ref.0) {
+        let name = code.get(obj.name);
+        if !name.contains(".$") && !name.starts_with('$') {
+            return None; // Not a class companion
+        }
+    } else {
+        return None;
+    }
+
+    // Op i+1: Call2 boolReg = check(classReg, valueReg)
+    let (bool_reg, value_reg) = match &ops[i + 1] {
+        Opcode::Call2 { dst, fun, arg0, arg1 } if *arg0 == class_reg => {
+            // Verify function is named "check" (hl.BaseType.check)
+            if let Some(f) = fun.as_fn(code) {
+                if let Some(name) = code.strings.get(f.name.0) {
+                    if name != "check" {
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+            (*dst, *arg1)
+        }
+        _ => return None,
+    };
+
+    // Op i+2: JFalse if boolReg == false → NULL_LABEL (offset=2, target = i+2+2+1 = i+5)
+    match &ops[i + 2] {
+        Opcode::JFalse { cond, offset } if *cond == bool_reg && *offset == 2 => {}
+        _ => return None,
+    }
+
+    // Op i+3: ToVirtual or SafeCast or UnsafeCast
+    let result_reg = match &ops[i + 3] {
+        Opcode::ToVirtual { dst, src } if *src == value_reg => *dst,
+        Opcode::SafeCast { dst, src } if *src == value_reg => *dst,
+        Opcode::UnsafeCast { dst, src } if *src == value_reg => *dst,
+        _ => return None,
+    };
+
+    // Op i+4: JAlways → END_LABEL (offset=1, target = i+4+1+1 = i+6, past the Null at i+5)
+    match &ops[i + 4] {
+        Opcode::JAlways { offset } if *offset == 1 => {}
+        _ => return None,
+    }
+
+    // Op i+5: Null resultReg = null
+    match &ops[i + 5] {
+        Opcode::Null { dst } if *dst == result_reg => {}
+        _ => return None,
+    }
+
+    Some(InlineExpansion {
+        start_op: i,
+        end_op: i + 5,
+        kind: InlineExpansionKind::Downcast {
+            class_global,
+            result_reg,
+        },
+        obj_reg: class_reg, // The class companion register
+        value_reg,
+        value_const: None,
+    })
 }

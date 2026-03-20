@@ -79,6 +79,12 @@ impl Cfg {
         Self::from_ops(&f.ops)
     }
 
+    /// Build a CFG, ignoring jump instructions at the specified opcode indices.
+    /// Used to prevent inline expansion capacity checks from creating block splits.
+    pub fn build_with_ignored_jumps(f: &Function, ignored_jumps: &HashSet<usize>) -> Self {
+        Self::from_ops_with_ignored_jumps(&f.ops, ignored_jumps)
+    }
+
     /// Build a CFG from an opcode slice
     pub fn from_ops(ops: &[Opcode]) -> Self {
         if ops.is_empty() {
@@ -104,6 +110,31 @@ impl Cfg {
         let (graph, _block_map, entry) = create_blocks(ops, &leaders);
 
         // Step 3: Build op_to_block mapping
+        let mut op_to_block = HashMap::new();
+        for (node_idx, block) in graph.node_indices().zip(graph.node_weights()) {
+            for op_idx in block.start..=block.end {
+                op_to_block.insert(op_idx, node_idx);
+            }
+        }
+
+        Cfg {
+            graph,
+            entry,
+            op_to_block,
+            num_ops: ops.len(),
+        }
+    }
+
+    /// Build a CFG from an opcode slice, ignoring jumps at specified indices.
+    /// Jump instructions in `ignored_jumps` are treated as linear (non-branching) ops.
+    pub fn from_ops_with_ignored_jumps(ops: &[Opcode], ignored_jumps: &HashSet<usize>) -> Self {
+        if ops.is_empty() {
+            return Self::from_ops(ops);
+        }
+
+        let leaders = find_leaders_with_ignored_jumps(ops, ignored_jumps);
+        let (graph, _block_map, entry) = create_blocks(ops, &leaders);
+
         let mut op_to_block = HashMap::new();
         for (node_idx, block) in graph.node_indices().zip(graph.node_weights()) {
             for op_idx in block.start..=block.end {
@@ -168,6 +199,92 @@ impl Cfg {
     pub fn num_blocks(&self) -> usize {
         self.graph.node_count()
     }
+}
+
+/// Find leaders, ignoring jumps at specified opcode indices.
+/// Jumps in `ignored_jumps` are treated as linear ops and don't create block splits.
+fn find_leaders_with_ignored_jumps(ops: &[Opcode], ignored_jumps: &HashSet<usize>) -> HashSet<usize> {
+    let mut leaders = HashSet::new();
+    leaders.insert(0);
+
+    for (i, op) in ops.iter().enumerate() {
+        // Skip jumps that are inside inline expansions
+        if ignored_jumps.contains(&i) {
+            continue;
+        }
+
+        match op {
+            Opcode::JTrue { offset, .. }
+            | Opcode::JFalse { offset, .. }
+            | Opcode::JNull { offset, .. }
+            | Opcode::JNotNull { offset, .. }
+            | Opcode::JSLt { offset, .. }
+            | Opcode::JSGte { offset, .. }
+            | Opcode::JSGt { offset, .. }
+            | Opcode::JSLte { offset, .. }
+            | Opcode::JULt { offset, .. }
+            | Opcode::JUGte { offset, .. }
+            | Opcode::JNotLt { offset, .. }
+            | Opcode::JNotGte { offset, .. }
+            | Opcode::JEq { offset, .. }
+            | Opcode::JNotEq { offset, .. }
+            | Opcode::JAlways { offset } => {
+                let target = compute_target(i, *offset, ops.len());
+                // Only create leaders for jump targets that aren't inside ignored ranges
+                if let Some(t) = target {
+                    if !ignored_jumps.contains(&t) {
+                        leaders.insert(t);
+                    }
+                }
+                if i + 1 < ops.len() {
+                    leaders.insert(i + 1);
+                }
+            }
+
+            Opcode::Switch { offsets, .. } => {
+                for &offset in offsets.iter() {
+                    if let Some(t) = compute_target(i, offset, ops.len()) {
+                        leaders.insert(t);
+                    }
+                }
+                if let Some(end) = compute_target(i, offsets.len() as i32, ops.len()) {
+                    leaders.insert(end);
+                }
+                if i + 1 < ops.len() {
+                    leaders.insert(i + 1);
+                }
+            }
+
+            Opcode::Ret { .. } | Opcode::Throw { .. } | Opcode::Rethrow { .. } => {
+                if i + 1 < ops.len() {
+                    leaders.insert(i + 1);
+                }
+            }
+
+            Opcode::Label => {
+                leaders.insert(i);
+            }
+
+            Opcode::Trap { offset, .. } => {
+                if let Some(t) = compute_target(i, *offset, ops.len()) {
+                    leaders.insert(t);
+                }
+                if i + 1 < ops.len() {
+                    leaders.insert(i + 1);
+                }
+            }
+
+            Opcode::EndTrap { .. } => {
+                if i + 1 < ops.len() {
+                    leaders.insert(i + 1);
+                }
+            }
+
+            _ => {}
+        }
+    }
+
+    leaders
 }
 
 /// Find all leader instructions (block start points)

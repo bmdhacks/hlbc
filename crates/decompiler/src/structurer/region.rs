@@ -178,6 +178,9 @@ pub enum Region {
         condition_blocks: Vec<NodeIndex>,
         /// The region executed when any condition is true.
         then_region: Box<Region>,
+        /// Optional else region (for non-terminating if-else OR chains).
+        /// When present, this is executed when all conditions are false.
+        else_region: Option<Box<Region>>,
         /// Where control goes when all conditions are false.
         continuation: NodeIndex,
         /// Whether the last condition is inverted (needs negation in compound OR).
@@ -342,13 +345,16 @@ impl Region {
                 try_body.collect_nodes(nodes);
                 catch_body.collect_nodes(nodes);
             }
-            Region::OrChain { condition_blocks, then_region, nested_and_chains, .. } => {
+            Region::OrChain { condition_blocks, then_region, else_region, nested_and_chains, .. } => {
                 nodes.extend(condition_blocks.iter().copied());
                 // Also include nodes from nested AND chains
                 for and_chain in nested_and_chains.values() {
                     nodes.extend(and_chain.iter().copied());
                 }
                 then_region.collect_nodes(nodes);
+                if let Some(else_r) = else_region {
+                    else_r.collect_nodes(nodes);
+                }
             }
             Region::Goto { .. } | Region::Empty => {}
         }
@@ -386,11 +392,12 @@ impl Region {
             Region::TryCatch { try_body, catch_body, .. } => {
                 try_body.block_count() + catch_body.block_count()
             }
-            Region::OrChain { condition_blocks, then_region, nested_and_chains, .. } => {
+            Region::OrChain { condition_blocks, then_region, else_region, nested_and_chains, .. } => {
                 let nested_count: usize = nested_and_chains.values()
                     .map(|chain| chain.len().saturating_sub(1)) // First block already counted
                     .sum();
-                condition_blocks.len() + nested_count + then_region.block_count()
+                let else_count = else_region.as_ref().map_or(0, |r| r.block_count());
+                condition_blocks.len() + nested_count + then_region.block_count() + else_count
             }
             Region::Goto { .. } | Region::Empty => 0,
         }

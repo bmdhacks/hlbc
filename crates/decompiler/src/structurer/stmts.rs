@@ -790,6 +790,25 @@ impl<'a> Structurer<'a> {
                     return stmts;
                 }
 
+                // Remap private fields to their public property equivalents.
+                // BytesBuffer.pos is private; the public property is .length
+                // (backed by inline get_length() which returns pos).
+                let field_name = if field_name == "pos" {
+                    let obj_type = self.get_type_ref(*obj);
+                    if let Some(Type::Obj(obj_ty)) = self.code.types.get(obj_type.0) {
+                        let type_name = self.code.get(obj_ty.name);
+                        if type_name.as_ref() == "haxe.io.BytesBuffer" {
+                            "length".into()
+                        } else {
+                            field_name
+                        }
+                    } else {
+                        field_name
+                    }
+                } else {
+                    field_name
+                };
+
                 let obj_expr = self.reg_to_expr(*obj);
                 let expr = Expr::Field(Box::new(obj_expr), field_name);
                 // Use try_inline_or_assign for potential inlining of field accesses
@@ -1461,9 +1480,28 @@ impl<'a> Structurer<'a> {
             }
 
             Opcode::SafeCast { dst, src } | Opcode::UnsafeCast { dst, src } => {
-                // Cast to destination type - emit as simple assignment for now
                 let var = self.reg_to_expr_dst(*dst);
                 let expr = self.reg_to_expr(*src);
+
+                // When casting null to a basic type, emit the type's default value
+                // instead of null. On static platforms, null can't be used as Int/Float/Bool.
+                // At runtime, SafeCast(null → basic_type) produces the zero value.
+                let expr = if matches!(expr, Expr::Constant(Constant::Null)) {
+                    let dst_type_ref = self.get_type_ref(*dst);
+                    match self.code.types.get(dst_type_ref.0) {
+                        Some(Type::I32) | Some(Type::UI8) | Some(Type::UI16) | Some(Type::I64)
+                        | Some(Type::F64) | Some(Type::F32) => {
+                            Expr::Constant(Constant::InlineInt(0))
+                        }
+                        Some(Type::Bool) => {
+                            Expr::Constant(Constant::Bool(false))
+                        }
+                        _ => expr,
+                    }
+                } else {
+                    expr
+                };
+
                 Some(self.make_assign(var, expr))
             }
 
@@ -2013,10 +2051,29 @@ impl<'a> Structurer<'a> {
                 Some(self.make_assign(var, expr))
             }
 
-            Opcode::GetTID { dst, .. } => {
-                // GetTID returns a type ID - just emit as unknown for now
+            Opcode::GetType { dst, src } => {
+                // GetType extracts runtime type from a dynamic value.
+                // In Haxe: hl.Type.getDynamic(x) or untyped $tdyntype(x)
                 let var = self.reg_to_expr_dst(*dst);
-                Some(self.make_assign(var, Expr::Unknown("tid".into())))
+                let src_expr = self.reg_to_expr(*src);
+                let fun_expr = Expr::Field(
+                    Box::new(Expr::Ident("hl.Type".into())),
+                    "getDynamic".into(),
+                );
+                let call = Call { fun: fun_expr, args: vec![src_expr] };
+                Some(self.make_assign(var, Expr::Call(Box::new(call))))
+            }
+
+            Opcode::GetTID { dst, src } => {
+                // GetTID extracts the type kind discriminant from a hl.Type as i32.
+                // In Haxe: cast(t.kind, Int) — t.kind returns hl.TypeKind (abstract over Int),
+                // but bytecode types this as raw i32, so we cast to avoid type errors
+                // when comparing with int literals.
+                let var = self.reg_to_expr_dst(*dst);
+                let src_expr = self.reg_to_expr(*src);
+                let kind_expr = Expr::Field(Box::new(src_expr), "kind".into());
+                let expr = Expr::Cast(Box::new(kind_expr), "Int".into());
+                Some(self.make_assign(var, expr))
             }
 
             Opcode::Switch { .. } => {

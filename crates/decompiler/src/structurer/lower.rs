@@ -83,10 +83,11 @@ fn lower_region_inner(region: &Region, ctx: &mut LoweringContext<'_>) -> Vec<Sta
         Region::OrChain {
             condition_blocks,
             then_region,
+            else_region,
             continuation,
             last_condition_inverted,
             nested_and_chains,
-        } => lower_or_chain(condition_blocks, then_region, *continuation, *last_condition_inverted, nested_and_chains, ctx),
+        } => lower_or_chain(condition_blocks, then_region, else_region.as_deref(), *continuation, *last_condition_inverted, nested_and_chains, ctx),
         Region::Goto { target } => lower_goto(*target, ctx),
         Region::Empty => Vec::new(),
     }
@@ -129,6 +130,21 @@ impl<'a> LoweringContext<'a> {
 
             // Skip string switch pattern opcodes - they're handled by the Switch region
             if self.structurer.string_switch_opcodes.contains(&op_idx) {
+                continue;
+            }
+
+            // Skip inline expansion opcodes - emit synthetic call at start of each expansion
+            if self.structurer.inline_expansion_opcodes.contains(&op_idx) {
+                // At the start of an expansion, emit the synthetic method call.
+                // Set SSA context from the END of the expansion (the SetI8/SetMem op)
+                // where all relevant registers are used, so reg_to_expr resolves correctly.
+                let exp_clone = self.structurer.inline_expansions.iter()
+                    .find(|e| e.start_op == op_idx)
+                    .cloned();
+                if let Some(exp) = exp_clone {
+                    let synthetic = self.structurer.emit_inline_expansion_call(&exp);
+                    stmts.extend(synthetic);
+                }
                 continue;
             }
 
@@ -818,6 +834,7 @@ fn lower_try_catch(
 fn lower_or_chain(
     condition_blocks: &[NodeIndex],
     then_region: &Region,
+    else_region: Option<&Region>,
     _continuation: NodeIndex,
     last_condition_inverted: bool,
     nested_and_chains: &std::collections::HashMap<usize, Vec<NodeIndex>>,
@@ -865,11 +882,18 @@ fn lower_or_chain(
     // Lower the then region
     let then_stmts = lower_region_inner(then_region, ctx);
 
+    // Lower the else region if present
+    let else_stmts = if let Some(else_r) = else_region {
+        lower_region_inner(else_r, ctx)
+    } else {
+        Vec::new()
+    };
+
     // Create the if statement
     stmts.push(Statement::IfElse {
         cond: compound_cond,
         if_: then_stmts,
-        else_: Vec::new(),
+        else_: else_stmts,
     });
 
     stmts

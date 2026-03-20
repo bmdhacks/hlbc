@@ -68,6 +68,7 @@ pub fn expand_module_path(path: &str) -> Option<&'static str> {
         "haxe.rtti.TypeParams" => Some("haxe.rtti.CType.TypeParams"),
         "haxe.rtti.TypeRoot" => Some("haxe.rtti.CType.TypeRoot"),
         "haxe.rtti.Typedef" => Some("haxe.rtti.CType.Typedef"),
+        "ValueType" => Some("Type.ValueType"),
         "hl.Class" => Some("hl.BaseType.Class"),
         "hl.CoreEnum" => Some("hl.BaseType.CoreEnum"),
         "hl.CoreType" => Some("hl.BaseType.CoreType"),

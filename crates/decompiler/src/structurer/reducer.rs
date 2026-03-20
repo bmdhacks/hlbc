@@ -25,7 +25,7 @@ use crate::structurer::patterns::{
     IfPattern, LoopPattern, OrChainPattern, PatternContext, SwitchPattern,
 };
 use crate::structurer::region::{Region, SwitchCase};
-use crate::structurer::StringSwitchCfgMapping;
+use crate::structurer::{InlineExpansionCfgMapping, StringSwitchCfgMapping};
 use hlbc::types::RefInt;
 use crate::structurer::region_graph::{RegionGraph, RegionNode};
 
@@ -56,32 +56,35 @@ pub fn reduce_to_region_with_string_switches(
     ctx: Option<&PatternContext<'_>>,
     string_switches: &[StringSwitchCfgMapping],
 ) -> Region {
-    reduce_to_region_with_exceptions(cfg, analysis, ctx, string_switches, None)
+    reduce_to_region_with_exceptions(cfg, analysis, ctx, string_switches, &[], None)
 }
 
-/// Reduce a CFG to a single Region, with support for exceptions and string switches.
+/// Reduce a CFG to a single Region, with support for exceptions, string switches,
+/// and inline expansion pre-collapse.
 ///
 /// This is the most complete variant of the reduction function.
-/// If `exception_analysis` is provided, enables detection and collapsing of try-catch patterns.
 pub fn reduce_to_region_with_exceptions(
     cfg: &Cfg,
     analysis: &CfgAnalysis,
     ctx: Option<&PatternContext<'_>>,
     string_switches: &[StringSwitchCfgMapping],
+    _inline_expansions: &[InlineExpansionCfgMapping],
     exception_analysis: Option<&ExceptionAnalysis>,
 ) -> Region {
     let mut graph = RegionGraph::from_cfg(cfg);
     let mut iterations = 0;
 
     // Phase -1: Remove unreachable (dead code) nodes before reduction.
-    // These can occur when compiler generates unreachable code after Ret/Throw,
-    // e.g., EndTrap opcodes that appear after a Ret.
     remove_unreachable_nodes(&mut graph);
 
-    // Phase 0: Pre-collapse string switches before the main reduction loop
+    // Phase 0a: Pre-collapse string switches before the main reduction loop
     for ss in string_switches {
         collapse_string_switch(&mut graph, cfg, ss);
     }
+
+    // Note: Inline expansion pre-collapse is handled at the lifter level —
+    // expansion-internal jumps are ignored during CFG construction, so the
+    // structurer never sees the capacity-check branches.
 
     while !graph.is_fully_reduced() && iterations < MAX_ITERATIONS {
         iterations += 1;
@@ -469,68 +472,161 @@ fn collapse_if(graph: &mut RegionGraph, _cfg: &Cfg, pattern: &IfPattern) -> bool
 ///
 /// Returns true if progress was made (nodes were reduced).
 fn collapse_or_chain(graph: &mut RegionGraph, cfg: &Cfg, pattern: &OrChainPattern) -> bool {
-    // Build the then region from the body nodes
-    let then_region = if !pattern.body_cfg_nodes.is_empty() {
-        // Non-terminating body with nested control flow
-        // Create a subgraph for the body and reduce it recursively
-        structure_body_subgraph(graph, cfg, &pattern.body_cfg_nodes)
-    } else if let Some(node) = graph.get_node(pattern.shared_target) {
-        // Terminating body (single block)
-        match node {
-            RegionNode::Block(cfg_idx) => Region::Block(*cfg_idx),
-            RegionNode::Collapsed(r) => r.clone(),
-        }
-    } else {
-        Region::Empty
-    };
+    // If-else OR: non-terminating shared target with no body nodes collected
+    // (i.e., shared_target can't reach continuation — they're sibling branches)
+    let is_if_else_or = !pattern.shared_target_terminates && pattern.body_cfg_nodes.is_empty();
 
     // Build a special region that captures all the condition nodes for compound OR generation
-    // We encode this as a Sequence of the condition blocks, which will be processed during lowering
     let condition_cfg_nodes: Vec<NodeIndex> = pattern.condition_nodes.iter()
         .filter_map(|&node| graph.get_node(node).and_then(|n| n.as_block()))
         .collect();
 
-    // Convert nested_and_chains from pattern indices to use CFG nodes directly
-    // The pattern uses indices into condition_nodes, but we need the actual CFG nodes
     let nested_and_chains = pattern.nested_and_chains.clone();
 
-    let if_region = Region::OrChain {
-        condition_blocks: condition_cfg_nodes,
-        then_region: Box::new(then_region),
-        continuation: pattern.continuation,
-        last_condition_inverted: pattern.last_condition_inverted,
-        nested_and_chains,
-    };
+    if is_if_else_or {
+        // Non-terminating if-else OR chain: `if (a || b) { THEN } else { ELSE }; MERGE`
+        //
+        // Find the merge point (common descendant of shared_target and continuation),
+        // collect then/else branch nodes, and produce an IfThenElse with compound condition.
+        // This avoids edge-leaking problems from collapsing just conditions or body.
+        let shared_target_cfg = graph.get_node(pattern.shared_target)
+            .and_then(|n| n.as_block());
+        let continuation_cfg = graph.get_node(pattern.continuation)
+            .and_then(|n| n.as_block());
 
-    // Collect all nodes to collapse: all condition nodes + shared target + nested AND blocks + body
-    let mut nodes_to_collapse = HashSet::new();
-    nodes_to_collapse.extend(pattern.condition_nodes.iter().copied());
-    nodes_to_collapse.insert(pattern.shared_target);
+        let (shared_target_cfg, continuation_cfg) = match (shared_target_cfg, continuation_cfg) {
+            (Some(s), Some(c)) => (s, c),
+            _ => return false,
+        };
 
-    // Include all body CFG nodes
-    for &cfg_node in &pattern.body_cfg_nodes {
-        if let Some(region_node) = graph.get_region_node(cfg_node) {
-            nodes_to_collapse.insert(region_node);
+        // Find merge point: BFS from both, first intersection
+        let mut shared_reachable = HashSet::new();
+        let mut queue = vec![shared_target_cfg];
+        shared_reachable.insert(shared_target_cfg);
+        while let Some(node) = queue.pop() {
+            for succ in cfg.successors(node) {
+                if shared_reachable.insert(succ) {
+                    queue.push(succ);
+                }
+            }
         }
-    }
 
-    // Also include all nested AND chain nodes
-    for and_chain in pattern.nested_and_chains.values() {
-        for &cfg_node in and_chain {
+        let mut merge_cfg = None;
+        let mut queue = vec![continuation_cfg];
+        let mut visited = HashSet::new();
+        visited.insert(continuation_cfg);
+        while let Some(node) = queue.pop() {
+            if shared_reachable.contains(&node) {
+                merge_cfg = Some(node);
+                break;
+            }
+            for succ in cfg.successors(node) {
+                if visited.insert(succ) {
+                    queue.push(succ);
+                }
+            }
+        }
+
+        let merge_cfg = match merge_cfg {
+            Some(m) => m,
+            None => return false,
+        };
+
+        // Build then region (shared_target to merge)
+        let then_region = match graph.get_node(pattern.shared_target) {
+            Some(RegionNode::Block(cfg_idx)) => Region::Block(*cfg_idx),
+            Some(RegionNode::Collapsed(r)) => r.clone(),
+            None => Region::Empty,
+        };
+
+        // Build else region (continuation to merge)
+        let else_region = match graph.get_node(pattern.continuation) {
+            Some(RegionNode::Block(cfg_idx)) => Region::Block(*cfg_idx),
+            Some(RegionNode::Collapsed(r)) => r.clone(),
+            None => Region::Empty,
+        };
+
+        let merge = merge_cfg;
+
+        let if_region = Region::OrChain {
+            condition_blocks: condition_cfg_nodes,
+            then_region: Box::new(then_region),
+            else_region: Some(Box::new(else_region)),
+            continuation: pattern.continuation,
+            last_condition_inverted: pattern.last_condition_inverted,
+            nested_and_chains,
+        };
+
+        // Collapse: conditions + shared_target + continuation + merge
+        let mut nodes_to_collapse = HashSet::new();
+        nodes_to_collapse.extend(pattern.condition_nodes.iter().copied());
+        nodes_to_collapse.insert(pattern.shared_target);
+        nodes_to_collapse.insert(pattern.continuation);
+        if let Some(merge_region) = graph.get_region_node(merge) {
+            nodes_to_collapse.insert(merge_region);
+        }
+
+        // Include nested AND chain nodes
+        for and_chain in pattern.nested_and_chains.values() {
+            for &cfg_node in and_chain {
+                if let Some(region_node) = graph.get_region_node(cfg_node) {
+                    nodes_to_collapse.insert(region_node);
+                }
+            }
+        }
+
+        if nodes_to_collapse.len() >= 2 {
+            graph.collapse(&nodes_to_collapse, if_region);
+            true
+        } else {
+            false
+        }
+    } else {
+        // Terminating body: standard OR chain collapse
+        let then_region = if !pattern.body_cfg_nodes.is_empty() {
+            structure_body_subgraph(graph, cfg, &pattern.body_cfg_nodes)
+        } else if let Some(node) = graph.get_node(pattern.shared_target) {
+            match node {
+                RegionNode::Block(cfg_idx) => Region::Block(*cfg_idx),
+                RegionNode::Collapsed(r) => r.clone(),
+            }
+        } else {
+            Region::Empty
+        };
+
+        let if_region = Region::OrChain {
+            condition_blocks: condition_cfg_nodes,
+            then_region: Box::new(then_region),
+            else_region: None,
+            continuation: pattern.continuation,
+            last_condition_inverted: pattern.last_condition_inverted,
+            nested_and_chains,
+        };
+
+        let mut nodes_to_collapse = HashSet::new();
+        nodes_to_collapse.extend(pattern.condition_nodes.iter().copied());
+        nodes_to_collapse.insert(pattern.shared_target);
+
+        for &cfg_node in &pattern.body_cfg_nodes {
             if let Some(region_node) = graph.get_region_node(cfg_node) {
                 nodes_to_collapse.insert(region_node);
             }
         }
-    }
 
-    // Don't include continuation - that's where control goes after the OR chain
+        for and_chain in pattern.nested_and_chains.values() {
+            for &cfg_node in and_chain {
+                if let Some(region_node) = graph.get_region_node(cfg_node) {
+                    nodes_to_collapse.insert(region_node);
+                }
+            }
+        }
 
-    // Only collapse if we have 2+ nodes
-    if nodes_to_collapse.len() >= 2 {
-        graph.collapse(&nodes_to_collapse, if_region);
-        true
-    } else {
-        false
+        if nodes_to_collapse.len() >= 2 {
+            graph.collapse(&nodes_to_collapse, if_region);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -778,6 +874,46 @@ fn collapse_string_switch(graph: &mut RegionGraph, _cfg: &Cfg, ss: &StringSwitch
     if !nodes_to_collapse.is_empty() {
         graph.collapse(&nodes_to_collapse, switch_region);
     }
+}
+
+/// Collapse an inline expansion's CFG nodes into a single Sequence region.
+///
+/// Inline expansions (like BytesBuffer.addByte) create multiple basic blocks
+/// due to capacity checks. Pre-collapsing them removes these internal
+/// conditionals from the structurer's view.
+fn collapse_inline_expansion(graph: &mut RegionGraph, cfg_nodes: &HashSet<NodeIndex>) {
+    if cfg_nodes.len() < 2 {
+        return; // Nothing to collapse
+    }
+
+    // Map CFG nodes to region nodes
+    let region_nodes: HashSet<NodeIndex> = cfg_nodes.iter()
+        .filter_map(|&cfg_node| graph.get_region_node(cfg_node))
+        .collect();
+
+    if region_nodes.len() < 2 {
+        return;
+    }
+
+    // Build a sequence of the blocks in opcode order
+    let mut ordered: Vec<(NodeIndex, Option<NodeIndex>)> = region_nodes.iter()
+        .filter_map(|&node| {
+            graph.get_node(node).and_then(|n| n.as_block()).map(|cfg_idx| (node, Some(cfg_idx)))
+        })
+        .collect();
+    ordered.sort_by_key(|(_, cfg_idx)| cfg_idx.map(|n| n.index()));
+
+    let regions: Vec<Region> = ordered.iter()
+        .filter_map(|&(node, _)| {
+            graph.get_node(node).map(|n| match n {
+                RegionNode::Block(cfg_idx) => Region::Block(*cfg_idx),
+                RegionNode::Collapsed(r) => r.clone(),
+            })
+        })
+        .collect();
+
+    let sequence = Region::sequence(regions);
+    graph.collapse(&region_nodes, sequence);
 }
 
 /// Collapse any linear sequences in the graph.

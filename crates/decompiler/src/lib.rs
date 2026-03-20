@@ -204,8 +204,26 @@ pub fn decompile_code_with_options(
         set.borrow_mut().insert(findex);
     });
 
-    // Pass 1: Build CFG
-    let cfg = Cfg::build(f);
+    // Pass 0: Detect inline expansions (before CFG build) so we can tell the
+    // lifter to ignore capacity-check jumps inside expansions like addByte().
+    let early_expansions = crate::structurer::idioms::detect_inline_expansions(code, f);
+    let ignored_jumps: std::collections::HashSet<usize> = early_expansions.iter()
+        .flat_map(|exp| {
+            // Find all jump opcodes inside each expansion
+            (exp.start_op..=exp.end_op).filter(|&op_idx| {
+                matches!(f.ops.get(op_idx),
+                    Some(Opcode::JNotEq { .. } | Opcode::JSGte { .. } | Opcode::JULt { .. }
+                        | Opcode::JFalse { .. } | Opcode::JAlways { .. }))
+            })
+        })
+        .collect();
+
+    // Pass 1: Build CFG (with ignored jumps from inline expansions)
+    let cfg = if ignored_jumps.is_empty() {
+        Cfg::build(f)
+    } else {
+        Cfg::build_with_ignored_jumps(f, &ignored_jumps)
+    };
 
     // Pass 2: Analyze for loops and dominators
     let analysis = CfgAnalysis::analyze(&cfg);
@@ -239,6 +257,8 @@ pub fn decompile_code_with_options(
 
     // Get string switch mappings for pre-collapse
     let string_switch_mappings = &structurer.string_switch_cfg_mappings;
+    // Build inline expansion CFG mappings for pre-collapse
+    let inline_expansion_mappings = structurer.build_inline_expansion_cfg_mappings();
     // Pass exception_analysis to enable try-catch pattern detection
     let exception_analysis = &structurer.exception_analysis;
     let region = reduce_to_region_with_exceptions(
@@ -246,6 +266,7 @@ pub fn decompile_code_with_options(
         &analysis,
         Some(&pattern_ctx),
         string_switch_mappings,
+        &inline_expansion_mappings,
         Some(exception_analysis),
     );
 
