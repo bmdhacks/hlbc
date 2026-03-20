@@ -198,8 +198,20 @@ impl<'a> PatternMatcher<'a> {
             if region_succs.len() != 2 {
                 return None;
             }
-            let (then_target, else_target, negated) = identify_branches(&region_succs)?;
-            (then_target, else_target, negated, None)
+            // Try standard branch identification first. If edge kinds are missing or
+            // duplicated (e.g., both ConditionalTrue after multiple collapses), fall back
+            // to using successors directly with first=then, second=else.
+            match identify_branches(&region_succs) {
+                Some((then_target, else_target, negated)) => {
+                    (then_target, else_target, negated, None)
+                }
+                None => {
+                    // Fallback: treat the two successors as then/else
+                    let (target_a, _) = region_succs[0];
+                    let (target_b, _) = region_succs[1];
+                    (target_a, target_b, false, None)
+                }
+            }
         };
 
         // Check termination using RegionGraph nodes
@@ -278,17 +290,30 @@ impl<'a> PatternMatcher<'a> {
         // Reject patterns with cross-branch edges: a node in one branch has a
         // successor in the other branch. This indicates an OR/AND chain pattern
         // that should be handled by the OR chain detector instead.
+        //
+        // Exception: allow cross-branch edges when the target is a terminating
+        // region (throw/return). This handles inlined AND chains like
+        // `if (x != b.x) { handler } if (y != b.y) { handler }` where both
+        // condition failures jump to the same terminating handler.
         for &else_node in &else_region_nodes {
             for succ in self.region_graph.successors(else_node) {
                 if then_region_nodes.contains(&succ) {
-                    return None;
+                    let succ_terminates = self.region_graph.get_node(succ)
+                        .map_or(false, |n| n.terminates(self.cfg));
+                    if !succ_terminates {
+                        return None;
+                    }
                 }
             }
         }
         for &then_node in &then_region_nodes {
             for succ in self.region_graph.successors(then_node) {
                 if else_region_nodes.contains(&succ) {
-                    return None;
+                    let succ_terminates = self.region_graph.get_node(succ)
+                        .map_or(false, |n| n.terminates(self.cfg));
+                    if !succ_terminates {
+                        return None;
+                    }
                 }
             }
         }
@@ -954,7 +979,7 @@ fn identify_branches(succs: &[(NodeIndex, EdgeKind)]) -> Option<(NodeIndex, Node
 pub fn find_or_chain_patterns(
     region_graph: &RegionGraph,
     cfg: &Cfg,
-    _analysis: &CfgAnalysis,
+    analysis: &CfgAnalysis,
     ctx: Option<&PatternContext<'_>>,
 ) -> Vec<OrChainPattern> {
     let mut patterns = Vec::new();
@@ -971,7 +996,7 @@ pub fn find_or_chain_patterns(
         }
 
         // Try to build an OR chain starting from this node
-        if let Some(pattern) = try_build_or_chain(region_graph, cfg, start_node, &used_nodes, ctx) {
+        if let Some(pattern) = try_build_or_chain(region_graph, cfg, analysis, start_node, &used_nodes, ctx) {
             // Only accept chains with 2+ conditions (otherwise regular if pattern handles it)
             if pattern.condition_nodes.len() >= 2 {
                 // Mark all condition nodes as used
@@ -1067,6 +1092,7 @@ fn try_detect_nested_and(
 fn try_build_or_chain(
     region_graph: &RegionGraph,
     cfg: &Cfg,
+    analysis: &CfgAnalysis,
     start_node: NodeIndex,
     used_nodes: &HashSet<NodeIndex>,
     _ctx: Option<&PatternContext<'_>>,
@@ -1172,6 +1198,17 @@ fn try_build_or_chain(
 
     // Need at least 2 conditions for an OR chain
     if condition_nodes.len() < 2 {
+        return None;
+    }
+
+    // Reject OR chains where shared_target is a loop back-edge source.
+    // This prevents absorbing loop structural nodes (continue blocks) into
+    // OR chain collapses, which would destroy the loop structure and prevent
+    // loop detection at a later priority.
+    let back_edge_sources: HashSet<NodeIndex> = analysis.loops.iter()
+        .flat_map(|l| l.back_edge_sources.iter().copied())
+        .collect();
+    if back_edge_sources.contains(&shared_target_cfg) {
         return None;
     }
 

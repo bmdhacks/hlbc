@@ -1936,7 +1936,17 @@ impl Statement {
                     }
                 }
                 Statement::VarDecl { name, type_hint } => {
-                    "var "{name}if let Some(t) = type_hint { ":"{t} }";"
+                    // For non-primitive typed declarations, initialize to null to
+                    // satisfy Haxe's definite assignment checker when the first
+                    // assignment is inside a loop body.
+                    let needs_null_init = type_hint.as_ref()
+                        .map(|t| !matches!(t.as_ref(), "Int" | "Float" | "Bool" | "Dynamic" | "Void"))
+                        .unwrap_or(false);
+                    if needs_null_init {
+                        "var "{name}":"{type_hint.as_ref().unwrap()}" = null;"
+                    } else {
+                        "var "{name}if let Some(t) = type_hint { ":"{t} }";"
+                    }
                 }
             }
         }

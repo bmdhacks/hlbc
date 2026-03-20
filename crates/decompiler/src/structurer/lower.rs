@@ -315,23 +315,18 @@ impl<'a> LoweringContext<'a> {
 fn lower_block(node: NodeIndex, ctx: &mut LoweringContext<'_>) -> Vec<Statement> {
     let mut stmts = ctx.lower_block_opcodes(node);
 
-    // Check if this block ends with a JAlways that represents break/continue
+    // Check if this block ends with a jump that represents break/continue
     if let Some(header) = ctx.structurer.current_loop_header {
         let block = &ctx.structurer.cfg.graph[node];
         let last_op = &ctx.structurer.func.ops[block.end];
 
         if let Opcode::JAlways { offset } = last_op {
-            // Compute target address
+            // Unconditional break/continue
             let target_addr = (block.end as i64 + *offset as i64 + 1) as usize;
-
-            // Find the target CFG node
             if let Some(&target_node) = ctx.structurer.cfg.op_to_block.get(&target_addr) {
-                // Check if target is the loop header → continue
                 if target_node == header {
                     stmts.push(Statement::Continue);
-                }
-                // Check if target is outside the loop → break
-                else if let Some(loop_info) = ctx
+                } else if let Some(loop_info) = ctx
                     .structurer
                     .analysis
                     .loops
@@ -343,10 +338,69 @@ fn lower_block(node: NodeIndex, ctx: &mut LoweringContext<'_>) -> Vec<Statement>
                     }
                 }
             }
+        } else if let Some(offset) = get_conditional_jump_offset(last_op) {
+            // Conditional break/continue: the TRUE branch of a conditional jump
+            // targets the loop header (continue) or outside the loop (break).
+            // Also detect indirect continue: TRUE → back-edge source that only
+            // jumps to the header (e.g., JNotEq → JAlways → header).
+            let target_addr = (block.end as i64 + offset as i64 + 1) as usize;
+            if let Some(&target_node) = ctx.structurer.cfg.op_to_block.get(&target_addr) {
+                let is_continue = target_node == header || {
+                    // Check for indirect continue: target is a back-edge source
+                    // (a block that unconditionally jumps to the header)
+                    let target_succs = ctx.structurer.cfg.successors(target_node);
+                    target_succs.len() == 1 && target_succs[0] == header
+                };
+
+                if is_continue {
+                    let cond = ctx.extract_condition(node);
+                    stmts.push(Statement::IfElse {
+                        cond,
+                        if_: vec![Statement::Continue],
+                        else_: vec![],
+                    });
+                } else if let Some(loop_info) = ctx
+                    .structurer
+                    .analysis
+                    .loops
+                    .iter()
+                    .find(|l| l.header == header)
+                {
+                    if !loop_info.body.contains(&target_node) {
+                        let cond = ctx.extract_condition(node);
+                        stmts.push(Statement::IfElse {
+                            cond,
+                            if_: vec![Statement::Break],
+                            else_: vec![],
+                        });
+                    }
+                }
+            }
         }
     }
 
     stmts
+}
+
+/// Extract the jump offset from a conditional jump opcode, if any.
+fn get_conditional_jump_offset(op: &Opcode) -> Option<i32> {
+    match op {
+        Opcode::JTrue { offset, .. }
+        | Opcode::JFalse { offset, .. }
+        | Opcode::JNull { offset, .. }
+        | Opcode::JNotNull { offset, .. }
+        | Opcode::JEq { offset, .. }
+        | Opcode::JNotEq { offset, .. }
+        | Opcode::JSLt { offset, .. }
+        | Opcode::JSGte { offset, .. }
+        | Opcode::JSLte { offset, .. }
+        | Opcode::JSGt { offset, .. }
+        | Opcode::JULt { offset, .. }
+        | Opcode::JUGte { offset, .. }
+        | Opcode::JNotLt { offset, .. }
+        | Opcode::JNotGte { offset, .. } => Some(*offset),
+        _ => None,
+    }
 }
 
 /// Lower a sequence of regions to statements.
@@ -540,13 +594,29 @@ fn lower_loop(
 
     // Note on loop condition semantics:
     // extract_condition() returns the condition for the TRUE branch (jump taken).
-    // For while loops, the TRUE branch typically goes to EXIT (when exit condition is true).
-    // So loop_cond is the EXIT condition, and the CONTINUE condition is !loop_cond.
+    // For most loops (JSGte, JSLt), the TRUE branch goes to EXIT.
+    // But for JNotNull loops (while-assign-null), the TRUE branch goes INTO the
+    // loop body, and the FALSE branch exits. We detect this and negate accordingly.
     //
     // For `while (continue_cond) { body }`: use !exit_cond (negate to get continue condition)
     // For `while (true) { if (exit_cond) break; body }`: use exit_cond directly
-    let continue_cond = not(loop_cond.clone());
-    let exit_cond = loop_cond;
+    let true_branch_exits = ctx.structurer.cfg.successors_with_edges(header)
+        .iter()
+        .any(|(target, kind)| {
+            matches!(kind, crate::lifter::EdgeKind::ConditionalTrue)
+                && !ctx.structurer.analysis.loops.iter()
+                    .find(|l| l.header == header)
+                    .map(|l| l.body.contains(target))
+                    .unwrap_or(true)
+        });
+
+    let (continue_cond, exit_cond) = if true_branch_exits {
+        // Standard: TRUE exits the loop
+        (not(loop_cond.clone()), loop_cond)
+    } else {
+        // Inverted: TRUE stays in loop (e.g., JNotNull loops)
+        (loop_cond.clone(), not(loop_cond))
+    };
 
     match kind {
         LoopKind::While => {
